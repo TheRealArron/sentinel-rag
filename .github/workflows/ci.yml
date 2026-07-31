@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go ingestor
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ingestor
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          # The module has no external dependencies, so there is no go.sum to
+          # key a cache on. Enable this if a dependency is ever added.
+          cache: false
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed for:"; echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Test with the race detector
+        # The pipeline fans out across goroutines and restores order in a
+        # collector; -race is the only thing that reliably catches a regression
+        # in that hand-off.
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      - name: Build
+        run: go build -trimpath -ldflags "-s -w" -o /tmp/sentinel-ingestor ./cmd/sentinel-ingestor
+
+      - name: Smoke test against the sample log
+        env:
+          # RFC 3164 timestamps carry no timezone, so the ingestor reads them in
+          # the host's local zone. Pinning TZ keeps this output identical to the
+          # committed fixture regardless of where it runs.
+          TZ: UTC
+        run: |
+          /tmp/sentinel-ingestor -in ../data/samples/sample_syslog.log -out /tmp/events.jsonl -stats
+          lines=$(wc -l < /tmp/events.jsonl)
+          echo "emitted $lines events"
+          # 21 parsed lines + 2 correlated incidents
+          [ "$lines" -eq 23 ] || { echo "::error::expected 23 events, got $lines"; exit 1; }
+          grep -q correlated_brute_force /tmp/events.jsonl || { echo "::error::brute-force incident missing"; exit 1; }
+          grep -q correlated_successful_login_after_bruteforce /tmp/events.jsonl || { echo "::error::compromise incident missing"; exit 1; }
+
+      - name: Committed fixture matches the ingestor
+        # data/samples/events.sample.jsonl is the Python suite's fixture and the
+        # demo's data source. If the Go rules change, this catches the drift.
+        # `ingested_at` is wall-clock and is expected to differ on every run.
+        run: |
+          jq -Sc 'del(.ingested_at)' ../data/samples/events.sample.jsonl > /tmp/fixture.norm
+          jq -Sc 'del(.ingested_at)' /tmp/events.jsonl                   > /tmp/actual.norm
+          if ! diff -u /tmp/fixture.norm /tmp/actual.norm > /tmp/fixture.diff; then
+            echo "::error::the committed fixture differs from ingestor output"
+            echo "::error::regenerate with 'make sample' and commit the result"
+            head -60 /tmp/fixture.diff
+            exit 1
+          fi
+          echo "fixture matches the ingestor"
+
+  python:
+    name: Python engine (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the dev toolchain only
+        # Deliberately NOT installing requirements.txt: the engine must pass its
+        # whole test suite with zero third-party runtime dependencies. If a test
+        # starts needing torch, the fallback path has quietly rotted.
+        run: python -m pip install --upgrade pip pytest pytest-cov ruff
+
+      - name: Lint
+        run: ruff check engine/sentinel engine/tests
+
+      - name: Test
+        working-directory: engine
+        run: python -m pytest tests/ -q --cov=sentinel --cov-report=term-missing
+
+      - name: CLI smoke test
+        env:
+          PYTHONPATH: ${{ github.workspace }}/engine
+        run: |
+          python -m sentinel demo --min-score 40
+          python -m sentinel stats --json > /tmp/stats.json
+          python -c "import json;s=json.load(open('/tmp/stats.json'));assert s['events']['events']==23, s['events']"
+
+      - name: Bilingual retrieval check
+        env:
+          PYTHONPATH: ${{ github.workspace }}/engine
+        run: |
+          python -m sentinel index
+          python - <<'PY'
+          from sentinel.engine import SentinelEngine
+          engine = SentinelEngine()
+          for query in ("SSH brute force from the internet", "SSH ブルートフォース 攻撃 対策"):
+              results = engine.search(query, k=6)
+              mix = engine.retriever.language_mix(results)
+              print(f"{query!r} -> {mix}")
+              assert mix.get("en", 0) >= 1 and mix.get("ja", 0) >= 1, f"not bilingual: {mix}"
+          PY
+
+  docker:
+    name: Docker images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the ingestor image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./ingestor
+          push: false
+          load: true
+          tags: sentinel-rag/ingestor:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Ingestor image runs
+        run: |
+          docker run --rm sentinel-rag/ingestor:ci -version
+          docker run --rm -i sentinel-rag/ingestor:ci -in - -out - \
+            < data/samples/sample_syslog.log | head -3
+
+      - name: Validate the compose file
+        run: docker compose config --quiet

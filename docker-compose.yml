@@ -1,0 +1,118 @@
+# Sentinel RAG — home server deployment.
+#
+#   cp .env.example .env      # add your Gemini key
+#   docker compose up --build -d
+#   xdg-open http://127.0.0.1:8000/
+#
+# Two services, isolated on purpose. The Go ingestor is the only thing that reads
+# host logs, and it is the only thing with access to /var/log — read-only, in a
+# scratch container, as a non-root user. The Python engine never sees the host
+# filesystem; it reads the ingestor's JSONL through a shared named volume. A
+# compromise of the AI engine (the component with a network listener, an LLM API
+# client, and by far the most code) therefore cannot read your logs directly,
+# cannot write to /var/log, and cannot reach the firewall.
+
+name: sentinel-rag
+
+services:
+  # ---------------------------------------------------------------- ingestor
+  ingestor:
+    build:
+      context: ./ingestor
+      args:
+        VERSION: ${SENTINEL_VERSION:-dev}
+    image: sentinel-rag/ingestor:${SENTINEL_VERSION:-dev}
+    container_name: sentinel-ingestor
+    restart: unless-stopped
+    command:
+      - "-in=/hostlogs/auth.log"
+      - "-out=/data/events.jsonl"
+      - "-follow"
+      - "-min-score=${SENTINEL_MIN_SCORE:-0}"
+      - "-brute-threshold=${SENTINEL_BRUTE_THRESHOLD:-5}"
+      - "-brute-window=${SENTINEL_BRUTE_WINDOW:-1m}"
+      - "-stats"
+    volumes:
+      # Host logs, read-only. The ingestor never needs to write here, and :ro
+      # means a bug in it cannot destroy the evidence it is reading.
+      - /var/log/auth.log:/hostlogs/auth.log:ro
+      - /var/log/syslog:/hostlogs/syslog:ro
+      - sentinel-data:/data
+    # Everything a log parser needs and nothing else.
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    # No network at all: the ingestor reads a file and writes a file.
+    network_mode: none
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: "1.0" }
+
+  # ------------------------------------------------------------------ engine
+  engine:
+    build:
+      context: ./engine
+    image: sentinel-rag/engine:${SENTINEL_VERSION:-dev}
+    container_name: sentinel-engine
+    restart: unless-stopped
+    depends_on: [ingestor]
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      SENTINEL_LLM_PROVIDER: ${SENTINEL_LLM_PROVIDER:-auto}
+      SENTINEL_LLM_MODEL: ${SENTINEL_LLM_MODEL:-gemini-2.0-flash}
+      SENTINEL_EMBEDDING_MODEL: ${SENTINEL_EMBEDDING_MODEL:-intfloat/multilingual-e5-large}
+      SENTINEL_EMBEDDING_BACKEND: ${SENTINEL_EMBEDDING_BACKEND:-auto}
+      SENTINEL_VECTOR_BACKEND: ${SENTINEL_VECTOR_BACKEND:-auto}
+      SENTINEL_ANONYMIZE: ${SENTINEL_ANONYMIZE:-1}
+      SENTINEL_API_TOKEN: ${SENTINEL_API_TOKEN:-}
+      # Active response cannot work from inside this container by design — see
+      # the note below and scripts/sentinel-responder.sh.
+      SENTINEL_RESPONSE_MODE: ${SENTINEL_RESPONSE_MODE:-dry-run}
+    volumes:
+      - sentinel-data:/data
+      # Advisories are bind-mounted rather than baked in, so you can drop a new
+      # JPCERT or NVD document in and re-index without rebuilding the image.
+      - ./data/advisories:/app/data/advisories:ro
+    ports:
+      # Bound to localhost. This dashboard shows your security posture and can
+      # trigger firewall changes; exposing it on 0.0.0.0 would put it on your
+      # LAN. Put it behind a reverse proxy with TLS and auth if you need remote
+      # access, and set SENTINEL_API_TOKEN.
+      - "127.0.0.1:${SENTINEL_API_PORT:-8000}:8000"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    deploy:
+      resources:
+        # multilingual-e5-large needs roughly 2.5 GB resident during inference.
+        # Lower this to 1G and switch to multilingual-e5-small if your server is
+        # tight on memory.
+        limits: { memory: ${SENTINEL_MEMORY_LIMIT:-4G} }
+
+volumes:
+  sentinel-data:
+    driver: local
+
+# ---------------------------------------------------------------------------
+# A note on Phase 4 (active response)
+#
+# Nothing here grants the engine NET_ADMIN or mounts the Docker socket, and that
+# is intentional. Giving a container that talks to an LLM the ability to rewrite
+# the host firewall is a straight line from prompt injection to lockout.
+#
+# The supported pattern is to run the responder on the host, reading the audit
+# log the engine writes:
+#
+#     sudo cp scripts/sentinel-responder.sh /usr/local/bin/
+#     sudo systemctl enable --now sentinel-responder.timer
+#
+# That keeps the privileged action on the host, under systemd, with its own
+# allowlist — so the blast radius of a compromised engine stops at "writes a
+# suggestion nobody has to take".
+# ---------------------------------------------------------------------------

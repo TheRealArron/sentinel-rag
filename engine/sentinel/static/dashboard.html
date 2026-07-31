@@ -1,0 +1,799 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentinel RAG — Threat Dashboard</title>
+<style>
+/* ---------------------------------------------------------------------------
+   Design tokens.
+
+   Severity uses the reserved STATUS palette (state, not identity), mapped onto
+   the SOC ladder: info=neutral, notice=good, warning=warning, high=serious,
+   critical=critical. Yellow/orange/red are hue neighbours by construction, so
+   adjacent segments cannot clear a large normal-vision separation; the relief is
+   secondary encoding, applied everywhere severity appears — a text label on
+   every chip, 2px surface gaps between stacked segments, counts in the legend,
+   and a full table view underneath. Colour never carries severity alone.
+
+   Ranked bars are ONE colour (categorical slot 1). Bar length is the encoding;
+   ramping hue by value would double-encode it.
+--------------------------------------------------------------------------- */
+:root {
+  color-scheme: dark;
+  --page:            #0d0d0d;
+  --surface-1:       #1a1a19;
+  --surface-2:       #202020;
+  --text-primary:    #ffffff;
+  --text-secondary:  #c3c2b7;
+  --text-muted:      #898781;
+  --gridline:        #2c2c2a;
+  --baseline:        #383835;
+  --border:          rgba(255, 255, 255, 0.10);
+
+  --series-1:        #3987e5;
+  --sev-info:        #898781;
+  --sev-notice:      #0ca30c;
+  --sev-warning:     #fab219;
+  --sev-high:        #ec835a;
+  --sev-critical:    #d03b3b;
+
+  --radius:          10px;
+  --mark-radius:     4px;
+  --gap:             2px;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --page:           #f9f9f7;
+    --surface-1:      #fcfcfb;
+    --surface-2:      #f2f1ee;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --gridline:       #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11, 11, 11, 0.10);
+    --series-1:       #2a78d6;
+  }
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --page:           #f9f9f7;
+  --surface-1:      #fcfcfb;
+  --surface-2:      #f2f1ee;
+  --text-primary:   #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted:     #898781;
+  --gridline:       #e1e0d9;
+  --baseline:       #c3c2b7;
+  --border:         rgba(11, 11, 11, 0.10);
+  --series-1:       #2a78d6;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--page);
+  color: var(--text-primary);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1360px; margin: 0 auto; padding: 20px 20px 56px; }
+
+/* --- header ------------------------------------------------------------- */
+header {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+  padding-bottom: 16px; margin-bottom: 20px;
+  border-bottom: 1px solid var(--gridline);
+}
+.brand { display: flex; align-items: baseline; gap: 10px; margin-right: auto; }
+.brand h1 { font-size: 19px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+.brand .sub { color: var(--text-muted); font-size: 12.5px; }
+.controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+button, .seg {
+  font-family: inherit; font-size: 12.5px; color: var(--text-secondary);
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 11px; cursor: pointer;
+  min-height: 32px; /* hit target larger than the label */
+}
+button:hover { color: var(--text-primary); border-color: var(--baseline); }
+button:focus-visible, .seg button:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+button.primary { background: var(--series-1); border-color: var(--series-1); color: #fff; font-weight: 600; }
+button.primary:hover { filter: brightness(1.08); }
+button[disabled] { opacity: 0.5; cursor: default; }
+.seg { display: inline-flex; padding: 2px; gap: 2px; }
+.seg button { border: 0; background: transparent; min-height: 26px; padding: 4px 10px; border-radius: 6px; }
+.seg button[aria-pressed="true"] { background: var(--surface-2); color: var(--text-primary); font-weight: 600; }
+
+.live { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-muted); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--sev-notice); }
+.dot.stale { background: var(--sev-warning); }
+.dot.down { background: var(--sev-critical); }
+
+/* --- layout ------------------------------------------------------------- */
+.grid { display: grid; gap: 16px; }
+.tiles { grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); margin-bottom: 16px; }
+.two-col { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); margin-bottom: 16px; }
+@media (max-width: 900px) { .two-col { grid-template-columns: minmax(0, 1fr); } }
+
+.card {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 16px 18px; min-width: 0;
+}
+.card h2 {
+  font-size: 12px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--text-muted); margin: 0 0 14px;
+}
+.card .head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 14px; }
+.card .head h2 { margin: 0; }
+.card .head .note { margin-left: auto; font-size: 11.5px; color: var(--text-muted); }
+
+/* --- stat tiles --------------------------------------------------------- */
+.tile .label { font-size: 12px; color: var(--text-muted); margin-bottom: 6px; }
+.tile .value { font-size: 27px; font-weight: 650; letter-spacing: -0.02em; line-height: 1.1; }
+.tile .value.small { font-size: 17px; font-weight: 600; }
+.tile .meta { font-size: 11.5px; color: var(--text-muted); margin-top: 5px; }
+
+/* --- severity stacked bar ---------------------------------------------- */
+.stack { display: flex; gap: var(--gap); height: 24px; margin-bottom: 14px; }
+.stack .seg-fill {
+  min-width: 3px; overflow: hidden; position: relative;
+  display: flex; align-items: center; justify-content: center;
+}
+.stack .seg-fill:first-child { border-radius: var(--mark-radius) 0 0 var(--mark-radius); }
+.stack .seg-fill:last-child  { border-radius: 0 var(--mark-radius) var(--mark-radius) 0; }
+.stack .seg-fill:only-child  { border-radius: var(--mark-radius); }
+/* Labels render inside a segment only when they fit; JS decides. In-segment ink
+   is fixed dark/light against the fill it sits on, not themed — the fill colour
+   is the same in both modes, so the readable ink is too. */
+.stack .seg-label { font-size: 11px; font-weight: 650; color: #0b0b0b; padding: 0 6px; white-space: nowrap; }
+.stack .seg-fill.light-ink .seg-label { color: #ffffff; }
+.stack-empty {
+  height: 24px; border-radius: var(--mark-radius); background: var(--surface-2);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text-muted); font-size: 12px;
+}
+
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.legend-item { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-secondary); }
+.swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+.legend-item .n { font-variant-numeric: tabular-nums; color: var(--text-primary); font-weight: 600; }
+
+/* --- ranked bars -------------------------------------------------------- */
+.ranked { display: flex; flex-direction: column; gap: 10px; }
+.ranked-row { display: grid; grid-template-columns: minmax(96px, 132px) 1fr auto; gap: 10px; align-items: center; }
+.ranked-row .name {
+  font-family: var(--mono); font-size: 12px; color: var(--text-secondary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ranked-row .track { height: 14px; background: transparent; }
+.ranked-row .fill {
+  height: 14px; background: var(--series-1);
+  border-radius: 0 var(--mark-radius) var(--mark-radius) 0; min-width: 2px;
+}
+.ranked-row .n { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--text-primary); font-weight: 600; }
+
+/* --- table -------------------------------------------------------------- */
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th {
+  text-align: left; font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--text-muted); font-weight: 600; padding: 0 10px 8px 0;
+  border-bottom: 1px solid var(--gridline); white-space: nowrap;
+}
+td { padding: 9px 10px 9px 0; border-bottom: 1px solid var(--gridline); vertical-align: top; }
+tbody tr:hover { background: var(--surface-2); }
+tbody tr.selected { background: var(--surface-2); box-shadow: inset 2px 0 0 var(--series-1); }
+td.ts, td.src { font-family: var(--mono); font-size: 11.5px; color: var(--text-secondary); white-space: nowrap; }
+td.msg { color: var(--text-secondary); max-width: 620px; word-break: break-word; }
+td.rule { font-family: var(--mono); font-size: 11.5px; white-space: nowrap; }
+
+/* Severity chip: a coloured swatch carries identity, the text stays in an ink
+   token. Colour never encodes severity on its own, and text never wears the
+   status colour. */
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  font-size: 11px; font-weight: 650; letter-spacing: 0.02em; text-transform: uppercase;
+  color: var(--text-secondary);
+}
+.chip.lg { font-size: 12px; color: var(--text-primary); }
+.chip .swatch { width: 8px; height: 8px; border-radius: 2px; }
+.badge {
+  display: inline-block; font-size: 10.5px; font-weight: 650; padding: 1px 6px;
+  border-radius: 5px; background: var(--surface-2); color: var(--text-secondary);
+  border: 1px solid var(--border); margin-left: 6px; white-space: nowrap;
+}
+.score { font-variant-numeric: tabular-nums; font-weight: 600; }
+
+/* --- alert panel -------------------------------------------------------- */
+.alert-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 12px; }
+.alert-title { font-size: 16px; font-weight: 650; margin: 0; flex: 1 1 260px; min-width: 0; }
+.alert-body { color: var(--text-secondary); white-space: pre-wrap; margin-bottom: 14px; }
+.alert-section { margin-top: 16px; }
+.alert-section h3 {
+  font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--text-muted); margin: 0 0 8px; font-weight: 650;
+}
+.alert-section ol, .alert-section ul { margin: 0; padding-left: 20px; color: var(--text-secondary); }
+.alert-section li { margin-bottom: 6px; }
+.alert-section li code, code {
+  font-family: var(--mono); font-size: 11.5px; background: var(--surface-2);
+  padding: 1px 5px; border-radius: 4px; color: var(--text-primary);
+}
+.cite { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--gridline); font-size: 12.5px; }
+.cite:last-child { border-bottom: 0; }
+.cite .lang {
+  font-family: var(--mono); font-size: 10.5px; padding: 1px 5px; border-radius: 4px;
+  background: var(--surface-2); color: var(--text-secondary); flex: none; height: fit-content;
+}
+.cite .sim { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--text-muted); flex: none; }
+.pill-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.pill {
+  font-family: var(--mono); font-size: 11px; padding: 2px 7px; border-radius: 5px;
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text-secondary);
+}
+.notice {
+  font-size: 12px; padding: 9px 12px; border-radius: 8px; margin-bottom: 12px;
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text-secondary);
+}
+.notice.warn { border-color: var(--sev-warning); }
+.notice.err  { border-color: var(--sev-critical); }
+.muted { color: var(--text-muted); }
+.empty { color: var(--text-muted); font-size: 12.5px; padding: 18px 0; text-align: center; }
+.spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--border); border-top-color: var(--series-1); border-radius: 50%; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
+.filters input, .filters select {
+  font-family: inherit; font-size: 12.5px; padding: 6px 9px; min-height: 32px;
+  background: var(--surface-1); color: var(--text-primary);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+.filters input { min-width: 190px; }
+[hidden] { display: none !important; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="brand">
+    <h1>Sentinel RAG</h1>
+    <span class="sub" data-i18n="tagline"></span>
+  </div>
+  <div class="controls">
+    <span class="live"><span class="dot" id="liveDot"></span><span id="liveText"></span></span>
+    <div class="seg" role="group" aria-label="Language">
+      <button type="button" id="langEn" aria-pressed="true">EN</button>
+      <button type="button" id="langJa" aria-pressed="false">日本語</button>
+    </div>
+    <button type="button" id="themeBtn" data-i18n="theme"></button>
+    <button type="button" id="refreshBtn" data-i18n="refresh"></button>
+  </div>
+</header>
+
+<section class="grid tiles" id="tiles" aria-label="Key figures"></section>
+
+<div class="grid two-col">
+  <section class="card">
+    <div class="head">
+      <h2 data-i18n="severityTitle"></h2>
+      <span class="note" id="severityNote"></span>
+    </div>
+    <div id="severityStack"></div>
+    <div class="legend" id="severityLegend"></div>
+  </section>
+
+  <section class="card">
+    <div class="head">
+      <h2 data-i18n="sourcesTitle"></h2>
+      <span class="note" data-i18n="sourcesNote"></span>
+    </div>
+    <div class="ranked" id="topSources"></div>
+  </section>
+</div>
+
+<section class="card" style="margin-bottom:16px">
+  <div class="head">
+    <h2 data-i18n="analysisTitle"></h2>
+    <span class="note" id="analysisNote"></span>
+  </div>
+  <div class="filters">
+    <button type="button" class="primary" id="triageBtn" data-i18n="triage"></button>
+    <button type="button" id="analyzeSelectedBtn" data-i18n="analyzeSelected" disabled></button>
+    <input type="text" id="askInput" data-i18n-placeholder="askPlaceholder">
+    <button type="button" id="askBtn" data-i18n="ask"></button>
+  </div>
+  <div id="alertPanel"><div class="empty" data-i18n="noAlert"></div></div>
+</section>
+
+<section class="card">
+  <div class="head">
+    <h2 data-i18n="feedTitle"></h2>
+    <span class="note" id="feedNote"></span>
+  </div>
+  <div class="filters">
+    <input type="text" id="searchInput" data-i18n-placeholder="searchPlaceholder">
+    <select id="severityFilter"></select>
+    <select id="categoryFilter"></select>
+    <label class="legend-item" style="gap:6px;cursor:pointer">
+      <input type="checkbox" id="incidentsOnly" style="min-height:auto">
+      <span data-i18n="incidentsOnly"></span>
+    </label>
+  </div>
+  <div class="table-scroll">
+    <table>
+      <caption class="sr-only" data-i18n="feedTitle"></caption>
+      <thead><tr id="feedHead"></tr></thead>
+      <tbody id="feedBody"></tbody>
+    </table>
+  </div>
+</section>
+
+</div>
+
+<script>
+"use strict";
+
+/* =========================================================================
+   i18n. Every user-facing string exists in both languages. The dashboard is
+   the operator-facing half of a bilingual tool, so an English-only UI would
+   undercut the whole premise.
+   ========================================================================= */
+const I18N = {
+  tagline: { en: "Bilingual AI-powered SecOps engine", ja: "バイリンガルAI搭載セキュリティ運用エンジン" },
+  theme: { en: "Theme", ja: "テーマ" },
+  refresh: { en: "Refresh", ja: "更新" },
+  live: { en: "live", ja: "ライブ" },
+  stale: { en: "stale", ja: "停滞" },
+  offline: { en: "offline", ja: "オフライン" },
+  severityTitle: { en: "Severity distribution", ja: "深刻度の分布" },
+  sourcesTitle: { en: "Top source addresses", ja: "上位の送信元アドレス" },
+  sourcesNote: { en: "events per source", ja: "送信元ごとのイベント数" },
+  analysisTitle: { en: "AI analysis", ja: "AI分析" },
+  feedTitle: { en: "Event feed", ja: "イベントフィード" },
+  triage: { en: "Triage now", ja: "今すぐトリアージ" },
+  analyzeSelected: { en: "Analyse selected", ja: "選択項目を分析" },
+  ask: { en: "Ask", ja: "質問" },
+  askPlaceholder: { en: "Ask the corpus, in English or 日本語…", ja: "コーパスに質問（英語・日本語）…" },
+  searchPlaceholder: { en: "Filter messages and rules…", ja: "メッセージ・ルールを絞り込み…" },
+  incidentsOnly: { en: "Correlated incidents only", ja: "相関インシデントのみ" },
+  noAlert: { en: "No analysis yet. Triage the most severe recent events, or ask a question.", ja: "分析はまだありません。直近の重大イベントをトリアージするか、質問してください。" },
+  analysing: { en: "Analysing — retrieving bilingual sources and reasoning…", ja: "分析中 — バイリンガル情報源を検索し推論しています…" },
+  events: { en: "Events buffered", ja: "バッファ内イベント" },
+  incidents: { en: "Correlated incidents", ja: "相関インシデント" },
+  peak: { en: "Peak severity", ja: "最大深刻度" },
+  sources: { en: "Distinct sources", ja: "個別送信元数" },
+  reasoning: { en: "Reasoning model", ja: "推論モデル" },
+  retrieval: { en: "Retrieval backend", ja: "検索バックエンド" },
+  none: { en: "none", ja: "なし" },
+  time: { en: "Time", ja: "時刻" },
+  severity: { en: "Severity", ja: "深刻度" },
+  score: { en: "Score", ja: "スコア" },
+  rule: { en: "Detection", ja: "検知ルール" },
+  source: { en: "Source", ja: "送信元" },
+  user: { en: "User", ja: "ユーザー" },
+  message: { en: "Message", ja: "メッセージ" },
+  allSeverities: { en: "All severities", ja: "すべての深刻度" },
+  allCategories: { en: "All categories", ja: "すべてのカテゴリ" },
+  noEvents: { en: "No events. Run the ingestor to populate data/events.jsonl.", ja: "イベントがありません。インジェスターを実行して data/events.jsonl を生成してください。" },
+  noSources: { en: "No source addresses observed yet.", ja: "送信元アドレスはまだ観測されていません。" },
+  noSeverity: { en: "No events to distribute.", ja: "分布を表示するイベントがありません。" },
+  summary: { en: "Summary", ja: "概要" },
+  narrative: { en: "Attack narrative", ja: "攻撃の経緯" },
+  actions: { en: "Recommended actions", ja: "推奨対応" },
+  citations: { en: "Cited sources", ja: "引用した情報源" },
+  mitre: { en: "MITRE ATT&CK", ja: "MITRE ATT&CK" },
+  indicators: { en: "Indicators", ja: "指標" },
+  notes: { en: "Analyst notes", ja: "分析メモ" },
+  confidence: { en: "confidence", ja: "確信度" },
+  degraded: { en: "Rule-based only — no LLM configured", ja: "ルールベースのみ — LLM未設定" },
+  anonymized: { en: "pseudonymised before leaving the host", ja: "ホスト外送信前に仮名化済み" },
+  block: { en: "Block", ja: "遮断" },
+  blocking: { en: "Blocking…", ja: "遮断中…" },
+  selected: { en: "selected", ja: "件選択中" },
+  requestFailed: { en: "Request failed", ja: "リクエストに失敗しました" },
+  ofEvents: { en: "of {n} events", ja: "全 {n} 件中" }
+};
+
+const SEVERITIES = ["critical", "high", "warning", "notice", "info"];
+const SEV_LABEL = {
+  critical: { en: "Critical", ja: "緊急" },
+  high:     { en: "High",     ja: "高" },
+  warning:  { en: "Warning",  ja: "警告" },
+  notice:   { en: "Notice",   ja: "注意" },
+  info:     { en: "Info",     ja: "情報" }
+};
+// Fills dark enough that white ink is the readable choice inside the segment.
+// Everything else takes the default dark ink.
+const SEV_LIGHT_INK = new Set(["critical"]);
+
+let lang = localStorage.getItem("sentinel.lang") === "ja" ? "ja" : "en";
+let theme = localStorage.getItem("sentinel.theme") || "";
+let selected = new Set();
+let lastStats = null;
+let lastEvents = [];
+let categories = [];
+let pollTimer = null;
+let inFlight = false;
+
+/* --- helpers ----------------------------------------------------------- */
+const $ = (id) => document.getElementById(id);
+const t = (key) => (I18N[key] ? I18N[key][lang] : key);
+const sevLabel = (s) => (SEV_LABEL[s] ? SEV_LABEL[s][lang] : s);
+const sevColor = (s) => `var(--sev-${SEVERITIES.includes(s) ? s : "info"})`;
+
+function esc(value) {
+  // Log lines are attacker-controlled. The ingestor already strips control and
+  // escape sequences, but everything rendered here goes through textContent or
+  // this escaper — never innerHTML with raw log text.
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function compact(n) {
+  const v = Number(n) || 0;
+  if (v >= 1e6) return (v / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+  if (v >= 1e4) return (v / 1e3).toFixed(1).replace(/\.0$/, "") + "K";
+  return v.toLocaleString();
+}
+function shortTime(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso).slice(0, 19);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+async function api(path, options) {
+  const res = await fetch(path, Object.assign({ headers: { "Content-Type": "application/json" } }, options || {}));
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = { error: text.slice(0, 300) }; }
+  if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
+  return data;
+}
+
+/* --- static text ------------------------------------------------------- */
+function applyStaticText() {
+  document.documentElement.lang = lang;
+  document.querySelectorAll("[data-i18n]").forEach((el) => { el.textContent = t(el.dataset.i18n); });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => { el.placeholder = t(el.dataset.i18nPlaceholder); });
+  $("langEn").setAttribute("aria-pressed", String(lang === "en"));
+  $("langJa").setAttribute("aria-pressed", String(lang === "ja"));
+
+  const sevSel = $("severityFilter");
+  const keepSev = sevSel.value;
+  sevSel.innerHTML = `<option value="">${esc(t("allSeverities"))}</option>` +
+    SEVERITIES.map((s) => `<option value="${s}">${esc(sevLabel(s))}</option>`).join("");
+  sevSel.value = keepSev;
+
+  renderCategoryFilter();
+  $("feedHead").innerHTML = ["time", "severity", "score", "rule", "source", "user", "message"]
+    .map((k) => `<th scope="col">${esc(t(k))}</th>`).join("");
+}
+
+function renderCategoryFilter() {
+  const sel = $("categoryFilter");
+  const keep = sel.value;
+  sel.innerHTML = `<option value="">${esc(t("allCategories"))}</option>` +
+    categories.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  sel.value = keep;
+}
+
+/* --- stat tiles -------------------------------------------------------- */
+function renderTiles(stats) {
+  const ev = stats.events || {};
+  const bySev = ev.by_severity || {};
+  const peak = SEVERITIES.find((s) => (bySev[s] || 0) > 0) || "info";
+  const llm = stats.llm || {};
+  const index = stats.index || {};
+  const corpusInfo = stats.corpus || {};
+
+  const tiles = [
+    { label: t("events"), value: compact(ev.events || 0),
+      meta: `${compact(ev.sanitised_lines || 0)} sanitised` },
+    { label: t("incidents"), value: compact(ev.incidents || 0),
+      meta: (stats.response || {}).mode || "" },
+    { label: t("peak"), value: sevLabel(peak), small: true, swatch: sevColor(peak),
+      meta: `${compact(bySev[peak] || 0)} ${lang === "ja" ? "件" : "events"}` },
+    { label: t("sources"), value: compact((ev.top_sources || []).length),
+      meta: `${compact(corpusInfo.advisories || 0)} advisories` },
+    { label: t("reasoning"), value: llm.model || "—", small: true,
+      meta: llm.available === false ? t("degraded") : (llm.provider || "") },
+    { label: t("retrieval"), value: index.backend || (index.loaded === false ? "lazy" : "—"), small: true,
+      meta: index.vectors != null ? `${compact(index.vectors)} vectors` : "" }
+  ];
+
+  $("tiles").innerHTML = tiles.map((tile) => `
+    <div class="card tile">
+      <div class="label">${esc(tile.label)}</div>
+      <div class="value${tile.small ? " small" : ""}">${
+        tile.swatch ? `<span class="swatch" style="background:${tile.swatch};width:9px;height:9px;display:inline-block;margin-right:7px"></span>` : ""
+      }${esc(tile.value)}</div>
+      <div class="meta">${esc(tile.meta || "")}</div>
+    </div>`).join("");
+}
+
+/* --- severity stacked bar ---------------------------------------------- */
+function renderSeverity(stats) {
+  const bySev = (stats.events || {}).by_severity || {};
+  const rows = SEVERITIES.map((s) => ({ key: s, n: bySev[s] || 0 })).filter((r) => r.n > 0);
+  const total = rows.reduce((sum, r) => sum + r.n, 0);
+  const stack = $("severityStack");
+  const legend = $("severityLegend");
+  $("severityNote").textContent = total ? t("ofEvents").replace("{n}", compact(total)) : "";
+
+  if (!total) {
+    stack.innerHTML = `<div class="stack-empty">${esc(t("noSeverity"))}</div>`;
+    legend.innerHTML = "";
+    return;
+  }
+
+  stack.innerHTML = `<div class="stack" role="img" aria-label="${esc(rows.map((r) => `${sevLabel(r.key)}: ${r.n}`).join(", "))}">` +
+    rows.map((r) => {
+      const pct = (r.n / total) * 100;
+      // Only label a segment when the text actually fits: a clipped label is
+      // worse than none, and the legend carries every count regardless.
+      const label = pct >= 11 ? `<span class="seg-label">${esc(String(r.n))}</span>` : "";
+      const inkClass = SEV_LIGHT_INK.has(r.key) ? " light-ink" : "";
+      return `<div class="seg-fill${inkClass}" style="width:${pct.toFixed(2)}%;background:${sevColor(r.key)}" title="${esc(sevLabel(r.key))}: ${r.n} (${pct.toFixed(1)}%)">${label}</div>`;
+    }).join("") + `</div>`;
+
+  legend.innerHTML = rows.map((r) => `
+    <span class="legend-item">
+      <span class="swatch" style="background:${sevColor(r.key)}"></span>
+      ${esc(sevLabel(r.key))} <span class="n">${esc(compact(r.n))}</span>
+      <span class="muted">${((r.n / total) * 100).toFixed(0)}%</span>
+    </span>`).join("");
+}
+
+/* --- ranked source bars ------------------------------------------------ */
+function renderSources(stats) {
+  const rows = ((stats.events || {}).top_sources || []).slice(0, 8);
+  const host = $("topSources");
+  if (!rows.length) {
+    host.innerHTML = `<div class="empty">${esc(t("noSources"))}</div>`;
+    return;
+  }
+  const max = Math.max.apply(null, rows.map((r) => r.count)) || 1;
+  host.innerHTML = rows.map((r) => `
+    <div class="ranked-row">
+      <span class="name" title="${esc(r.source_ip)}">${esc(r.source_ip)}</span>
+      <div class="track"><div class="fill" style="width:${((r.count / max) * 100).toFixed(2)}%" title="${esc(r.source_ip)}: ${r.count}"></div></div>
+      <span class="n">${esc(compact(r.count))}</span>
+    </div>`).join("");
+}
+
+/* --- event feed -------------------------------------------------------- */
+function renderFeed(events) {
+  const body = $("feedBody");
+  $("feedNote").textContent = `${compact(events.length)}${selected.size ? ` · ${selected.size} ${t("selected")}` : ""}`;
+  if (!events.length) {
+    body.innerHTML = `<tr><td colspan="7"><div class="empty">${esc(t("noEvents"))}</div></td></tr>`;
+    return;
+  }
+  body.innerHTML = events.map((ev) => {
+    const incident = ev.process === "sentinel-correlator" || (ev.rule || "").indexOf("correlated_") === 0;
+    return `<tr data-id="${esc(ev.raw_sha256)}" class="${selected.has(ev.raw_sha256) ? "selected" : ""}">
+      <td class="ts">${esc(shortTime(ev.timestamp))}</td>
+      <td><span class="chip"><span class="swatch" style="background:${sevColor(ev.severity)}"></span>${esc(sevLabel(ev.severity))}</span></td>
+      <td><span class="score">${esc(ev.score)}</span></td>
+      <td class="rule">${esc(ev.rule || "—")}${incident ? `<span class="badge">${lang === "ja" ? "相関" : "CORR"}</span>` : ""}</td>
+      <td class="src">${esc(ev.source_ip || "—")}</td>
+      <td class="src">${esc(ev.user || "—")}</td>
+      <td class="msg">${esc((ev.message || "").slice(0, 400))}</td>
+    </tr>`;
+  }).join("");
+
+  body.querySelectorAll("tr[data-id]").forEach((row) => {
+    row.addEventListener("click", () => {
+      const id = row.dataset.id;
+      if (selected.has(id)) { selected.delete(id); } else { selected.add(id); }
+      row.classList.toggle("selected", selected.has(id));
+      $("analyzeSelectedBtn").disabled = selected.size === 0;
+      $("feedNote").textContent = `${compact(events.length)}${selected.size ? ` · ${selected.size} ${t("selected")}` : ""}`;
+    });
+  });
+}
+
+/* --- alert panel ------------------------------------------------------- */
+function renderAlert(alert) {
+  const panel = $("alertPanel");
+  const title = (lang === "ja" ? alert.title.ja : alert.title.en) || alert.title.en || alert.title.ja || "—";
+  const summary = (lang === "ja" ? alert.summary.ja : alert.summary.en) || alert.summary.en || alert.summary.ja || "";
+  const sev = alert.severity || "info";
+  const ind = alert.indicators || {};
+
+  let html = `<div class="alert-head">
+    <span class="chip lg">
+      <span class="swatch" style="background:${sevColor(sev)}"></span>${esc(sevLabel(sev))}
+    </span>
+    <h3 class="alert-title">${esc(title)}</h3>
+    <span class="muted" style="font-size:12px">${(alert.confidence * 100).toFixed(0)}% ${esc(t("confidence"))}</span>
+  </div>`;
+
+  if (alert.degraded) html += `<div class="notice warn">${esc(t("degraded"))}</div>`;
+  if (alert.anonymized) html += `<div class="notice">${esc(t("anonymized"))} · ${esc(alert.provider)} / ${esc(alert.model)}</div>`;
+
+  html += `<div class="alert-section"><h3>${esc(t("summary"))}</h3><div class="alert-body">${esc(summary)}</div></div>`;
+
+  if (alert.attack_narrative) {
+    html += `<div class="alert-section"><h3>${esc(t("narrative"))}</h3><div class="alert-body">${esc(alert.attack_narrative)}</div></div>`;
+  }
+  if ((alert.recommended_actions || []).length) {
+    html += `<div class="alert-section"><h3>${esc(t("actions"))}</h3><ol>` +
+      alert.recommended_actions.map((a) => `<li>${esc(a)}</li>`).join("") + `</ol></div>`;
+  }
+  if ((alert.mitre || []).length) {
+    html += `<div class="alert-section"><h3>${esc(t("mitre"))}</h3><div class="pill-row">` +
+      alert.mitre.map((m) => `<span class="pill">${esc(m)}</span>`).join("") + `</div></div>`;
+  }
+  if ((alert.citations || []).length) {
+    html += `<div class="alert-section"><h3>${esc(t("citations"))}</h3>` +
+      alert.citations.map((c, i) => `<div class="cite">
+        <span class="lang">S${i + 1} · ${esc(c.lang)}</span>
+        <span>${esc(c.title)}<br><span class="muted" style="font-size:11.5px">${esc(c.source)}</span></span>
+        <span class="sim">${(c.similarity).toFixed(3)}</span>
+      </div>`).join("") + `</div>`;
+  }
+  const ips = ind.source_ips || [];
+  if (ips.length) {
+    html += `<div class="alert-section"><h3>${esc(t("indicators"))}</h3><div class="pill-row">` +
+      ips.map((ip) => `<span class="pill">${esc(ip)}</span>
+        <button type="button" class="block-btn" data-ip="${esc(ip)}" data-score="${esc(ind.peak_score || 0)}">${esc(t("block"))}</button>`).join("") +
+      `</div><div id="blockResult"></div></div>`;
+  }
+  if ((alert.notes || []).length) {
+    html += `<div class="alert-section"><h3>${esc(t("notes"))}</h3><ul>` +
+      alert.notes.map((n) => `<li>${esc(n)}</li>`).join("") + `</ul></div>`;
+  }
+
+  panel.innerHTML = html;
+  panel.querySelectorAll(".block-btn").forEach((btn) => {
+    btn.addEventListener("click", () => blockAddress(btn));
+  });
+}
+
+async function blockAddress(btn) {
+  const ip = btn.dataset.ip;
+  btn.disabled = true;
+  btn.textContent = t("blocking");
+  try {
+    const result = await api("/api/response/block", {
+      method: "POST",
+      body: JSON.stringify({ ip: ip, score: Number(btn.dataset.score) || 0, reason: "operator action from dashboard" })
+    });
+    const cls = result.executed ? "" : (result.allowed ? "warn" : "err");
+    $("blockResult").innerHTML =
+      `<div class="notice ${cls}">${esc(ip)} — ${esc(result.reason)}${result.detail ? ` · ${esc(result.detail)}` : ""}` +
+      (result.command && result.command.length ? `<br><code>${esc(result.command.join(" "))}</code>` : "") + `</div>`;
+  } catch (err) {
+    $("blockResult").innerHTML = `<div class="notice err">${esc(t("requestFailed"))}: ${esc(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = t("block");
+  }
+}
+
+async function runAnalysis(payload) {
+  const panel = $("alertPanel");
+  panel.innerHTML = `<div class="empty"><span class="spinner"></span> ${esc(t("analysing"))}</div>`;
+  try {
+    renderAlert(await api("/api/analyze", { method: "POST", body: JSON.stringify(payload) }));
+  } catch (err) {
+    panel.innerHTML = `<div class="notice err">${esc(t("requestFailed"))}: ${esc(err.message)}</div>`;
+  }
+}
+
+/* --- data loading ------------------------------------------------------ */
+function feedQuery() {
+  const params = new URLSearchParams({ limit: "200" });
+  const search = $("searchInput").value.trim();
+  if (search) params.set("q", search);
+  if ($("severityFilter").value) params.set("severity", $("severityFilter").value);
+  if ($("categoryFilter").value) params.set("category", $("categoryFilter").value);
+  if ($("incidentsOnly").checked) params.set("incidents_only", "1");
+  return params.toString();
+}
+
+function setLive(state) {
+  const dot = $("liveDot");
+  dot.className = "dot" + (state === "ok" ? "" : state === "stale" ? " stale" : " down");
+  $("liveText").textContent = state === "ok" ? t("live") : state === "stale" ? t("stale") : t("offline");
+}
+
+async function refresh() {
+  if (inFlight) return;
+  inFlight = true;
+  try {
+    const [stats, feed] = await Promise.all([api("/api/stats"), api("/api/events?" + feedQuery())]);
+    lastStats = stats;
+    lastEvents = feed.events || [];
+    const seen = Object.keys((stats.events || {}).by_category || {});
+    if (seen.join("|") !== categories.join("|")) {
+      categories = seen.sort();
+      renderCategoryFilter();
+    }
+    renderTiles(stats);
+    renderSeverity(stats);
+    renderSources(stats);
+    renderFeed(lastEvents);
+    setLive((stats.events || {}).events > 0 ? "ok" : "stale");
+  } catch (err) {
+    setLive("down");
+    $("feedNote").textContent = `${t("requestFailed")}: ${err.message}`;
+  } finally {
+    inFlight = false;
+  }
+}
+
+function rerenderAll() {
+  applyStaticText();
+  if (lastStats) {
+    renderTiles(lastStats);
+    renderSeverity(lastStats);
+    renderSources(lastStats);
+  }
+  renderFeed(lastEvents);
+}
+
+/* --- wiring ------------------------------------------------------------ */
+function setLang(next) {
+  lang = next;
+  localStorage.setItem("sentinel.lang", next);
+  rerenderAll();
+}
+function setTheme(next) {
+  theme = next;
+  if (next) { document.documentElement.setAttribute("data-theme", next); }
+  else { document.documentElement.removeAttribute("data-theme"); }
+  localStorage.setItem("sentinel.theme", next);
+}
+
+$("langEn").addEventListener("click", () => setLang("en"));
+$("langJa").addEventListener("click", () => setLang("ja"));
+$("themeBtn").addEventListener("click", () => {
+  const isDark = theme === "dark" || (!theme && matchMedia("(prefers-color-scheme: dark)").matches);
+  setTheme(isDark ? "light" : "dark");
+});
+$("refreshBtn").addEventListener("click", refresh);
+$("triageBtn").addEventListener("click", () => runAnalysis({ triage: true, limit: 25, min_score: 60 }));
+$("analyzeSelectedBtn").addEventListener("click", () => runAnalysis({ event_ids: Array.from(selected) }));
+$("askBtn").addEventListener("click", () => {
+  const question = $("askInput").value.trim();
+  if (question) runAnalysis({ question: question });
+});
+$("askInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("askBtn").click(); });
+["searchInput", "severityFilter", "categoryFilter", "incidentsOnly"].forEach((id) => {
+  const el = $(id);
+  el.addEventListener(id === "searchInput" ? "input" : "change", debounce(refresh, 250));
+});
+
+function debounce(fn, ms) {
+  let handle = null;
+  return function () { clearTimeout(handle); handle = setTimeout(fn, ms); };
+}
+
+if (theme) document.documentElement.setAttribute("data-theme", theme);
+applyStaticText();
+refresh();
+// Poll rather than stream: the event source is a file the ingestor appends to,
+// so a 5s poll of a cheap endpoint is simpler and more robust than holding a
+// websocket open through a laptop's sleep/wake cycles.
+pollTimer = setInterval(refresh, 5000);
+document.addEventListener("visibilitychange", () => {
+  clearInterval(pollTimer);
+  if (!document.hidden) { refresh(); pollTimer = setInterval(refresh, 5000); }
+});
+</script>
+</body>
+</html>

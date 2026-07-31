@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the Sentinel RAG host responder every 2 minutes
+Documentation=https://github.com/TheRealArron/sentinel-rag
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+# Spread the wake-up so it does not land on the same tick as every other timer.
+RandomizedDelaySec=20
+AccuracySec=10s
+Persistent=false
+Unit=sentinel-responder.service
+
+[Install]
+WantedBy=timers.target

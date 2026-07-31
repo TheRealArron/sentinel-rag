@@ -1,3 +1,45 @@
-__pycache__/
+# Secrets — never commit
 .env
+*.pem
+*.key
+
+# The original project brief. Kept locally; it is working notes, not a
+# deliverable. Delete this line if you want it published.
+claude.md
+
+# Ingestor output and derived data. The corpus under data/advisories/ and the
+# fixtures under data/samples/ ARE tracked; everything else in data/ is derived
+# and can be rebuilt with `make ingest && make reindex`.
+data/events.jsonl
+data/audit.log
+data/index/
+data/chroma/
+data/models/
+data/*.jsonl
+!data/samples/*.jsonl
+
+# Go
+ingestor/bin/
+coverage.out
+*.test
+
+# Python
+__pycache__/
+*.py[cod]
 .venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

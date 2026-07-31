@@ -1,0 +1,47 @@
+[Unit]
+Description=Sentinel RAG — apply approved firewall blocks on the host
+Documentation=https://github.com/TheRealArron/sentinel-rag
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Enforcement is OFF here. Run in dry-run for at least a week, read the journal,
+# and only then flip this to 1.
+Environment=SENTINEL_RESPONDER_ENFORCE=0
+Environment=SENTINEL_RESPONDER_MIN_SCORE=90
+Environment=SENTINEL_RESPONDER_MAX_PER_RUN=5
+Environment=SENTINEL_AUDIT_LOG=/var/lib/docker/volumes/sentinel-rag_sentinel-data/_data/audit.log
+Environment=SENTINEL_RESPONDER_STATE=/var/lib/sentinel/responder.state
+
+ExecStart=/usr/local/bin/sentinel-responder.sh
+
+# Root is required for ufw, but nothing else is. CAP_NET_ADMIN and CAP_NET_RAW
+# are what ufw actually needs; everything else is dropped.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
+AmbientCapabilities=
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+# The only paths it may write.
+ReadWritePaths=/var/lib/sentinel /etc/ufw /lib/ufw
+
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

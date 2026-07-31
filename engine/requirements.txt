@@ -1,0 +1,42 @@
+# Sentinel RAG — Python engine dependencies.
+#
+# Every one of these is OPTIONAL. The engine runs with zero third-party packages
+# installed: it degrades to a lexical hashing embedder, a pure-Python exact
+# vector index, the stdlib HTTP server, and rule-based alerts. Installing this
+# file upgrades each of those to the real thing. `python -m sentinel stats`
+# reports which backends are actually live, so a degraded deployment is visible
+# rather than silent.
+#
+#   pip install -r engine/requirements.txt
+#
+# Upper bounds are pinned to the next major version only. Tighter pinning on a
+# self-hosted security tool trades away security patches for reproducibility,
+# which is the wrong trade here; `pip freeze > requirements.lock` if you need it.
+
+# --- retrieval ------------------------------------------------------------
+# Vector store with a persistent HNSW index.
+chromadb>=0.5.0,<2.0.0
+
+# multilingual-e5-large: the cross-lingual embedding model the EN/JA retrieval
+# claim depends on. Pulls in torch and transformers (~2.5 GB installed, and the
+# model weights are a further ~2.2 GB on first use). On an 8 GB home server this
+# is the memory-hungry component; SENTINEL_EMBEDDING_MODEL=intfloat/multilingual-e5-small
+# cuts it to ~470 MB with a modest quality cost.
+sentence-transformers>=3.0.0,<6.0.0
+
+# Hierarchical retrieval orchestration. sentinel.chunking implements the
+# splitter itself (see that module for why), so LangChain is used for chain
+# composition rather than text splitting.
+langchain>=0.3.0,<1.0.0
+langchain-community>=0.3.0,<1.0.0
+
+# --- reasoning ------------------------------------------------------------
+# Google Gemini — the default provider, chosen for multilingual reasoning.
+google-generativeai>=0.8.0,<2.0.0
+
+# OpenAI — the alternate provider, kept so the engine is not single-sourced.
+openai>=1.40.0,<3.0.0
+
+# --- API ------------------------------------------------------------------
+fastapi>=0.115.0,<1.0.0
+uvicorn[standard]>=0.30.0,<1.0.0
