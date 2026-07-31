@@ -1,6 +1,6 @@
 # Sentinel RAG: Bilingual AI-Powered SecOps Engine
 
-**Author:** Arron — Waseda University, Computer Science
+**Author:** Arron Regin, Waseda University, Computer Science
 **Architecture:** Hybrid Go (performance) + Python (intelligence)
 **Deployment:** Private Ubuntu home server, on-premise
 
