@@ -38,6 +38,7 @@ const (
 	CatSystem    = "system"
 	CatPolicy    = "policy"
 	CatChange    = "configuration-change"
+	CatDeception = "deception"
 	CatIncident  = "incident"
 	CatUnknown   = "uncategorised"
 )

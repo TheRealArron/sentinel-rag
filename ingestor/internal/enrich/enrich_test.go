@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/event"
+	"github.com/TheRealArron/sentinel-rag/ingestor/internal/honeytoken"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/parser"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sanitize"
 )
@@ -20,7 +21,7 @@ func enrichLine(t *testing.T, line string) *event.Event {
 		PID:     env.PID,
 		Message: env.Message,
 	}
-	Apply(ev, env, san)
+	Apply(ev, env, san, nil)
 	return ev
 }
 
@@ -181,4 +182,115 @@ func hasMITRE(ev *event.Event, id string) bool {
 		}
 	}
 	return false
+}
+
+// --- honeytokens (Phase 5) --------------------------------------------------
+
+func honeySet(t *testing.T) *honeytoken.Set {
+	t.Helper()
+	set, err := honeytoken.New(honeytoken.Config{
+		Users: []honeytoken.Entry{{Value: "admin_backup", Note: "canary"}},
+		Paths: []honeytoken.Entry{{Value: "/etc/.backup_credentials"}},
+	})
+	if err != nil {
+		t.Fatalf("honeytoken.New: %v", err)
+	}
+	return set
+}
+
+func enrichWithHoney(t *testing.T, line string) *event.Event {
+	t.Helper()
+	san := sanitize.Line(line, 0)
+	env := parser.Parse(san.Clean)
+	ev := &event.Event{Host: env.Host, Process: env.Process, PID: env.PID, Message: env.Message}
+	Apply(ev, env, san, honeySet(t))
+	return ev
+}
+
+func TestHoneytokenForcesScore100(t *testing.T) {
+	// A failed password normally scores 54. Against a canary it is 100 — the
+	// only single event in the system that clears the score-90 firewall
+	// threshold without correlation.
+	ev := enrichWithHoney(t, "Jul 30 05:30:12 h sshd[1]: Failed password for invalid user admin_backup from 203.0.113.45 port 51001 ssh2")
+
+	if ev.Score != 100 {
+		t.Fatalf("Score = %d, want 100", ev.Score)
+	}
+	if ev.Severity != event.SeverityCritical {
+		t.Errorf("Severity = %q, want critical", ev.Severity)
+	}
+	if ev.Rule != "honeytoken_referenced" || ev.Category != CatDeception {
+		t.Errorf("rule/category = %q/%q", ev.Rule, ev.Category)
+	}
+	if ev.Fields["honeytoken"] != "admin_backup" {
+		t.Errorf("honeytoken field = %q", ev.Fields["honeytoken"])
+	}
+	if ev.Fields["honeytoken_note"] != "canary" {
+		t.Errorf("note = %q", ev.Fields["honeytoken_note"])
+	}
+}
+
+func TestHoneytokenPreservesHowTheCanaryWasTouched(t *testing.T) {
+	// The rules still run, so the alert says the canary was hit via an SSH
+	// password failure rather than merely that it was hit.
+	ev := enrichWithHoney(t, "Jul 30 05:30:12 h sshd[1]: Failed password for invalid user admin_backup from 203.0.113.45 port 51001 ssh2")
+
+	if ev.Fields["trigger_rule"] != "ssh_failed_password" {
+		t.Errorf("trigger_rule = %q, want ssh_failed_password", ev.Fields["trigger_rule"])
+	}
+	if ev.SourceIP != "203.0.113.45" || ev.SourcePort != 51001 {
+		t.Errorf("entities lost: ip=%q port=%d", ev.SourceIP, ev.SourcePort)
+	}
+	if !hasTag(ev, "brute-force") {
+		t.Error("rule tags were discarded")
+	}
+}
+
+func TestHoneytokenTagsAreBilingual(t *testing.T) {
+	ev := enrichWithHoney(t, "Jul 30 05:30:12 h sshd[1]: Failed password for admin_backup from 203.0.113.45 port 22 ssh2")
+	for _, tag := range []string{"honeytoken", "ハニートークン", "deception", "canary", "カナリア"} {
+		if !hasTag(ev, tag) {
+			t.Errorf("missing tag %q in %v", tag, ev.Tags)
+		}
+	}
+	if !hasMITRE(ev, "T1087.001") {
+		t.Errorf("MITRE = %v, want T1087.001", ev.MITRE)
+	}
+}
+
+func TestHoneytokenPathAddsFileDiscoveryTechnique(t *testing.T) {
+	ev := enrichWithHoney(t, "Jul 30 05:30:12 h sudo[1]: arron : TTY=pts/0 ; PWD=/tmp ; USER=root ; COMMAND=/bin/cat /etc/.backup_credentials")
+	if ev.Score != 100 {
+		t.Fatalf("Score = %d, want 100", ev.Score)
+	}
+	if !hasMITRE(ev, "T1083") {
+		t.Errorf("MITRE = %v, want T1083 for a path canary", ev.MITRE)
+	}
+}
+
+func TestHoneytokenScoreIsExplainable(t *testing.T) {
+	ev := enrichWithHoney(t, "Jul 30 05:30:12 h sshd[1]: Failed password for admin_backup from 203.0.113.45 port 22 ssh2")
+	if ev.Fields["score_honeytoken"] != "=100" {
+		t.Errorf("score_honeytoken = %q, want =100 (a set, not an increment)", ev.Fields["score_honeytoken"])
+	}
+}
+
+func TestOrdinaryTrafficIsUnaffectedByAnArmedSet(t *testing.T) {
+	// Arming honeytokens must not change the verdict on anything else.
+	line := "Jul 30 05:30:12 h sshd[1]: Failed password for root from 203.0.113.45 port 22 ssh2"
+	withSet := enrichWithHoney(t, line)
+	without := enrichLine(t, line)
+
+	if withSet.Score != without.Score || withSet.Rule != without.Rule || withSet.Category != without.Category {
+		t.Errorf("armed set changed a non-canary event: %d/%q/%q vs %d/%q/%q",
+			withSet.Score, withSet.Rule, withSet.Category,
+			without.Score, without.Rule, without.Category)
+	}
+}
+
+func TestNilHoneytokenSetIsInert(t *testing.T) {
+	ev := enrichLine(t, "Jul 30 05:30:12 h sshd[1]: Failed password for admin_backup from 203.0.113.45 port 22 ssh2")
+	if ev.Rule == "honeytoken_referenced" {
+		t.Error("honeytoken fired with a nil set")
+	}
 }

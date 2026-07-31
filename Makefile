@@ -99,6 +99,10 @@ sample: build ## Regenerate the committed sample fixture from the ingestor
 	@echo "regenerated data/samples/events.sample.jsonl ($$(wc -l < data/samples/events.sample.jsonl) events)"
 	@git diff --stat data/samples/events.sample.jsonl 2>/dev/null || true
 
+.PHONY: honeytokens-verify
+honeytokens-verify: build ## Check canaries do not collide with real accounts (run on the host)
+	./$(BIN) -honeytokens-verify /etc/passwd
+
 .PHONY: index
 index: ## Build the hierarchical index
 	$(PYTHON) -m sentinel index

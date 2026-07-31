@@ -1,0 +1,22 @@
+{
+  "users": [
+    { "value": "admin_backup", "note": "Canary. Looks like a real service account; exists nowhere. Common wordlist shape." },
+    { "value": "svc_deploy", "note": "Canary. Plausible CI/CD account name." },
+    { "value": "backup_operator", "note": "Canary. Windows-flavoured name, appears in cross-platform wordlists." },
+    { "value": "sentinel_canary", "note": "Canary. Obvious by name; catches anyone reading this file who should not be." }
+  ],
+
+  "paths": [
+    { "value": "/etc/.backup_credentials", "note": "Canary file. Nothing legitimate reads a dotfile in /etc." },
+    { "value": "/root/.aws/credentials.bak", "note": "Canary file. Classic post-exploitation target." },
+    { "value": "/opt/sentinel/vault_key.pem", "note": "Canary file. Named to attract key hunting." }
+  ],
+
+  "hosts": [
+    { "value": "vault-internal.lan", "note": "Canary hostname. Never resolves; a reference means recon of internal naming." }
+  ],
+
+  "processes": [
+    { "value": "sentinel-decoy-agent", "note": "Canary process name. Never executed by anything real." }
+  ]
+}

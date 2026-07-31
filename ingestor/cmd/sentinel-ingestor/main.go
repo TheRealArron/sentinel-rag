@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/correlate"
+	"github.com/TheRealArron/sentinel-rag/ingestor/internal/honeytoken"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/pipeline"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sink"
 )
@@ -60,6 +61,8 @@ func run() error {
 		bfThresh   = flag.Int("brute-threshold", 5, "auth failures from one source that trigger a brute-force incident")
 		bfWindow   = flag.Duration("brute-window", time.Minute, "sliding window for the brute-force threshold")
 		bfCooldown = flag.Duration("brute-cooldown", 5*time.Minute, "minimum gap between repeat incidents for one source")
+		honeyPath  = flag.String("honeytokens", defaultHoneytokenPath, "canary username/path config (JSON); see config/honeytokens.json")
+		honeyCheck = flag.String("honeytokens-verify", "", "verify canaries against a passwd file (use /etc/passwd, on the host) and exit")
 		stats      = flag.Bool("stats", false, "print a run summary to stderr as JSON")
 		showVer    = flag.Bool("version", false, "print version and exit")
 	)
@@ -71,6 +74,22 @@ func run() error {
 	}
 	if *minScore < 0 || *minScore > 100 {
 		return fmt.Errorf("-min-score must be between 0 and 100, got %d", *minScore)
+	}
+
+	tokens, err := loadHoneytokens(*honeyPath, flagWasSet("honeytokens"))
+	if err != nil {
+		return err
+	}
+	if *honeyCheck != "" {
+		return verifyHoneytokens(tokens, *honeyCheck)
+	}
+	// The armed-canaries banner goes to stderr, which is also where -stats writes
+	// its JSON report. Printing both would make `2>report.json` unparseable, so
+	// in -stats mode the same facts are carried inside the JSON instead. stderr
+	// stays machine-readable in exactly the mode meant for machines.
+	if tokens.Len() > 0 && !*stats {
+		fmt.Fprintf(os.Stderr, "sentinel-ingestor: %d honeytoken(s) armed from %s: %s\n",
+			tokens.Len(), tokens.Path(), tokens.Summary())
 	}
 
 	// SIGINT/SIGTERM cancel the context so -follow shuts down cleanly and the
@@ -119,6 +138,7 @@ func run() error {
 		MinScore:           *minScore,
 		IncludeRaw:         *keepRaw,
 		DisableCorrelation: *noCorr,
+		Honeytokens:        tokens,
 		Correlation: correlate.Config{
 			FailureThreshold: *bfThresh,
 			Window:           *bfWindow,
@@ -131,9 +151,11 @@ func run() error {
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(struct {
 			pipeline.Stats
-			Version string `json:"version"`
-			Workers int    `json:"workers"`
-		}{st, version, *workers})
+			Version          string `json:"version"`
+			Workers          int    `json:"workers"`
+			HoneytokensArmed int    `json:"honeytokens_armed"`
+			HoneytokensPath  string `json:"honeytokens_path,omitempty"`
+		}{st, version, *workers, tokens.Len(), tokens.Path()})
 	}
 	return runErr
 }
@@ -170,4 +192,57 @@ func openOutput(path string) (io.Writer, func(), error) {
 		return nil, nil, fmt.Errorf("open %s for write: %w", path, err)
 	}
 	return f, func() { _ = f.Close() }, nil
+}
+
+// defaultHoneytokenPath is looked for relative to the working directory. When the
+// flag is left at this default and the file is absent, deception detection is
+// simply off — a fresh clone should not fail to start over an optional feature.
+// When the flag is set explicitly and the file is missing, that is an error: the
+// operator asked for canaries and must not be left believing they are armed.
+// Same auto-versus-explicit contract the Python engine uses for its backends.
+const defaultHoneytokenPath = "config/honeytokens.json"
+
+func flagWasSet(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
+func loadHoneytokens(path string, explicit bool) (*honeytoken.Set, error) {
+	if path == "" {
+		return nil, nil
+	}
+	set, err := honeytoken.Load(path)
+	if err != nil {
+		if !explicit && errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return set, nil
+}
+
+// verifyHoneytokens refuses to let a canary that collides with a real account go
+// unnoticed. A colliding canary fires on every legitimate login, trains the
+// operator to ignore it, and -- because this detector is wired to the firewall --
+// can get a real user blocked.
+func verifyHoneytokens(set *honeytoken.Set, passwdPath string) error {
+	if set.Len() == 0 {
+		fmt.Fprintln(os.Stderr, "no honeytokens configured")
+		return nil
+	}
+	collisions, err := set.VerifyAgainstPasswd(passwdPath)
+	if err != nil {
+		return err
+	}
+	if len(collisions) > 0 {
+		return fmt.Errorf("%d honeytoken(s) collide with real accounts in %s: %v -- "+
+			"these would fire on legitimate logins; rename them", len(collisions), passwdPath, collisions)
+	}
+	fmt.Fprintf(os.Stderr, "ok: none of the %d honeytoken(s) exist in %s\n", set.Len(), passwdPath)
+	return nil
 }

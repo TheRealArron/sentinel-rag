@@ -31,12 +31,17 @@ services:
       - "-min-score=${SENTINEL_MIN_SCORE:-0}"
       - "-brute-threshold=${SENTINEL_BRUTE_THRESHOLD:-5}"
       - "-brute-window=${SENTINEL_BRUTE_WINDOW:-1m}"
+      - "-honeytokens=/config/honeytokens.json"
       - "-stats"
     volumes:
       # Host logs, read-only. The ingestor never needs to write here, and :ro
       # means a bug in it cannot destroy the evidence it is reading.
       - /var/log/auth.log:/hostlogs/auth.log:ro
       - /var/log/syslog:/hostlogs/syslog:ro
+      # Canary config, read-only. Bind-mounted rather than baked in so tokens can
+      # be rotated without a rebuild. Named explicitly in the command above, so a
+      # missing file is a startup error rather than silently unarmed canaries.
+      - ./config:/config:ro
       - sentinel-data:/data
     # Everything a log parser needs and nothing else.
     read_only: true

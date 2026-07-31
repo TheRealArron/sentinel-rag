@@ -31,6 +31,7 @@ import (
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/correlate"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/enrich"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/event"
+	"github.com/TheRealArron/sentinel-rag/ingestor/internal/honeytoken"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/parser"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sanitize"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sink"
@@ -50,6 +51,8 @@ type Options struct {
 	IncludeRaw         bool
 	DisableCorrelation bool
 	Correlation        correlate.Config
+	// Honeytokens may be nil, which disables deception detection.
+	Honeytokens *honeytoken.Set
 }
 
 // Stats is the run summary printed with -stats.
@@ -61,6 +64,7 @@ type Stats struct {
 	Incidents     int64         `json:"incidents"`
 	Sanitised     int64         `json:"lines_sanitised"`
 	Unparsed      int64         `json:"lines_unparsed"`
+	Honeytokens   int64         `json:"honeytoken_hits"`
 	Duration      time.Duration `json:"duration_ns"`
 	LinesPerSec   float64       `json:"lines_per_sec"`
 	MaxReorderGap int           `json:"max_reorder_gap"`
@@ -168,6 +172,9 @@ func Run(ctx context.Context, r io.Reader, out sink.Sink, opts Options) (Stats, 
 		if !res.ev.ParseOK {
 			st.Unparsed++
 		}
+		if res.ev.Rule == "honeytoken_referenced" {
+			st.Honeytokens++
+		}
 		if res.ev.Score >= opts.MinScore {
 			if err := out.Write(res.ev); err != nil && sinkErr == nil {
 				sinkErr = err
@@ -263,7 +270,7 @@ func process(j job, opts Options) result {
 	ev.Timestamp = ts.UTC().Format(time.RFC3339Nano)
 	ev.Stamp()
 
-	enrich.Apply(ev, env, san)
+	enrich.Apply(ev, env, san, opts.Honeytokens)
 	return result{seq: j.seq, ev: ev, ts: ts}
 }
 

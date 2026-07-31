@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/event"
+	"github.com/TheRealArron/sentinel-rag/ingestor/internal/honeytoken"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/parser"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sanitize"
 )
@@ -25,7 +26,8 @@ var (
 )
 
 // Apply enriches ev in place using the parsed envelope and the sanitised message.
-func Apply(ev *event.Event, env parser.Envelope, san sanitize.Result) {
+// tokens may be nil, in which case honeytoken detection is disabled.
+func Apply(ev *event.Event, env parser.Envelope, san sanitize.Result, tokens *honeytoken.Set) {
 	ev.Category = CatUnknown
 	ev.Score = 5
 
@@ -58,6 +60,7 @@ func Apply(ev *event.Event, env parser.Envelope, san sanitize.Result) {
 	}
 
 	applyModifiers(ev, env, san)
+	applyHoneytokens(ev, env, tokens)
 
 	ev.Score = clamp(ev.Score, 0, 100)
 	ev.Severity = event.SeverityFor(ev.Score)
@@ -65,6 +68,94 @@ func Apply(ev *event.Event, env parser.Envelope, san sanitize.Result) {
 	if ev.SourceIP != "" {
 		ev.AddTags("scope:" + scopeOf(ev.SourceIP))
 	}
+}
+
+// applyHoneytokens overrides the rule verdict when a canary is referenced.
+//
+// This runs *after* the rule engine rather than short-circuiting it, which is
+// worth justifying because the obvious design is to check first and skip the
+// regexes. Two reasons not to:
+//
+//  1. The saving is irrelevant. Measured: the honeytoken check is ~500 ns/line
+//     (BenchmarkMatch) against ~65,000 ns/line for the 33-rule sweep
+//     (benchmarks/), so it is 0.8% of the cost either way — and honeytoken hits
+//     are rare by definition, so short-circuiting would optimise the path that
+//     almost never runs.
+//  2. The context is worth more than the microseconds. Running the rules first
+//     means the alert still says *how* the canary was touched — a failed SSH
+//     password, a sudo command, a useradd — instead of only that it was. That
+//     detail is what an analyst triages on.
+//
+// So the rules run, then their verdict is overridden.
+func applyHoneytokens(ev *event.Event, env parser.Envelope, tokens *honeytoken.Set) {
+	if tokens == nil || tokens.Len() == 0 {
+		return
+	}
+	hits := tokens.Match([]string{ev.User, ev.Fields["target_user"]}, env.Message)
+	if len(hits) == 0 {
+		return
+	}
+
+	values := make([]string, 0, len(hits))
+	kinds := make([]string, 0, len(hits))
+	fields := make([]string, 0, len(hits))
+	for _, hit := range hits {
+		values = append(values, hit.Token.Value)
+		kinds = append(kinds, string(hit.Token.Kind))
+		fields = append(fields, hit.Field)
+		if hit.Token.Note != "" {
+			ev.SetField("honeytoken_note", hit.Token.Note)
+		}
+	}
+
+	// 100, unconditionally. Not "+40 and hope it clears the threshold": a
+	// honeytoken is the one signal in this system with no benign explanation, so
+	// it does not compete with the scoring model, it replaces it.
+	ev.SetField("score_honeytoken", "=100")
+	ev.Score = 100
+	ev.Category = CatDeception
+	// The matched rule is preserved under trigger_rule so the alert can still say
+	// how the canary was touched.
+	if ev.Rule != "" {
+		ev.SetField("trigger_rule", ev.Rule)
+	}
+	ev.Rule = "honeytoken_referenced"
+	ev.Outcome = "attempt"
+	ev.SetField("honeytoken", strings.Join(values, ", "))
+	ev.SetField("honeytoken_kind", strings.Join(kinds, ", "))
+	ev.SetField("honeytoken_field", strings.Join(fields, ", "))
+
+	// T1087.001 (Account Discovery: Local Account) is the attacker behaviour a
+	// username canary catches; T1083 (File and Directory Discovery) is its
+	// filesystem equivalent.
+	ev.MITRE = append(ev.MITRE, "T1087.001")
+	for _, hit := range hits {
+		if hit.Token.Kind == honeytoken.KindPath {
+			ev.MITRE = append(ev.MITRE, "T1083")
+			break
+		}
+	}
+	ev.MITRE = dedupe(ev.MITRE)
+
+	ev.AddTags(
+		"honeytoken", "ハニートークン",
+		"deception", "デセプション",
+		"canary", "カナリア",
+		"high-confidence", "高信頼度",
+	)
+}
+
+func dedupe(items []string) []string {
+	seen := make(map[string]struct{}, len(items))
+	out := items[:0]
+	for _, item := range items {
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
 }
 
 // appliesTo enforces a rule's optional process filter, case-insensitively.

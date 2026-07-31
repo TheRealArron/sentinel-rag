@@ -434,6 +434,55 @@ the dashboard works without one.
 
 ---
 
+### 9. Deception: the only detector that earns a score of 100
+
+Every other rule here infers intent from behaviour, and behaviour is ambiguous —
+five failed passwords might be an attack or a backup script with a stale
+credential. A honeytoken has no such ambiguity. Nothing on the host references
+`admin_backup`; no legitimate process reads `/etc/.backup_credentials`. A log
+line containing one is attacker activity by construction.
+
+That is what makes it **the only single event in the system that clears the
+firewall-response threshold** without correlation:
+
+```
+score=100  ->  block allowed=True   (honeytoken admin_backup)
+score=54   ->  block allowed=False  (score below threshold)
+```
+
+Both lines are the same `ssh_failed_password` rule. The only difference is which
+username was tried.
+
+Three design decisions worth reading:
+
+**A hash set, not a Bloom filter.** A Bloom filter buys memory at the cost of
+false positives; this set is 5–50 entries, a few hundred bytes. False positives
+are exactly what cannot be tolerated at the one position wired to the firewall —
+"probably a honeytoken" is not a basis for cutting off a network. The Bloom
+filter is kept for Phase 10's IOC matching, where the set is millions of
+indicators and a positive can afford a confirmation lookup.
+
+**The rule engine still runs first.** The obvious design short-circuits the
+regexes on a canary hit. Measured, the check is ~500 ns/line against ~65,000
+ns/line for the rule sweep — 0.8%, on a path that by definition almost never
+fires. Running the rules first means the alert says the canary was hit *via an
+SSH password failure* rather than merely that it was hit, and `trigger_rule`
+preserves it. Context beat microseconds.
+
+**Canaries are verified before they are trusted.** A canary colliding with a real
+account fires on every legitimate login, trains you to ignore the highest-severity
+alert in the system, and — since this is wired to active response — can get a
+real user firewalled:
+
+```bash
+make honeytokens-verify     # exits non-zero on a collision, so it can gate a deploy
+```
+
+Run it on the host: a container has its own `/etc/passwd`, so the check would
+pass vacuously there and prove nothing.
+
+---
+
 <a name="performance"></a>
 ## 📊 Performance
 
@@ -503,10 +552,10 @@ quietly rotted, and that is worth failing a build over.
 - [x] **Phase 2** — Hierarchical indexing with bilingual metadata
 - [x] **Phase 3** — FastAPI dashboard for real-time threat visualisation
 - [x] **Phase 4** — Automated active response (UFW), with host-side isolation
-- [ ] **Phase 5: Deceptive defence (honeytokens)** — canary usernames and file
-      paths that exist nowhere on the host, so any reference to one is a
-      zero-false-positive score-100 event. Checked in the Go layer ahead of the
-      rule engine.
+- [x] **Phase 5: Deceptive defence (honeytokens)** — canary usernames, paths,
+      hostnames and process names that exist nowhere on the host, so any
+      reference is a zero-false-positive score-100 event. See
+      [`config/`](config/).
 - [ ] **Phase 6: Shadow Search** — a daily background worker that summarises the
       previous 24 hours' most anomalous patterns and proactively queries the
       JPCERT/CC RSS and NVD feeds for them, without being asked. Turns the system
