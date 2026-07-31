@@ -93,7 +93,11 @@ services:
         # multilingual-e5-large needs roughly 2.5 GB resident during inference.
         # Lower this to 1G and switch to multilingual-e5-small if your server is
         # tight on memory.
-        limits: { memory: ${SENTINEL_MEMORY_LIMIT:-4G} }
+        #
+        # Quoted deliberately: in YAML flow style the closing brace of
+        # ${VAR:-default} is parsed as the end of the mapping, so the unquoted
+        # form is a syntax error rather than a substitution.
+        limits: { memory: "${SENTINEL_MEMORY_LIMIT:-4G}" }
 
 volumes:
   sentinel-data:

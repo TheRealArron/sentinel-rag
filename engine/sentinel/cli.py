@@ -162,7 +162,7 @@ def cmd_search(args, engine: SentinelEngine, printer: Printer) -> int:
     results = engine.search(
         args.query,
         k=args.k,
-        languages=args.lang.split(",") if args.lang else None,
+        languages=args.languages.split(",") if args.languages else None,
         doc_types=args.types.split(",") if args.types else None,
     )
     if args.json:
@@ -324,14 +324,38 @@ def cmd_demo(args, engine: SentinelEngine, printer: Printer) -> int:
 # parser
 # --------------------------------------------------------------------------- #
 
+def _add_global_flags(target: argparse.ArgumentParser, suppress: bool) -> None:
+    """Attach the global flags to a parser or subparser.
+
+    They are declared in both places so that ``sentinel stats --json`` and
+    ``sentinel --json stats`` both work — users reach for the first form and
+    argparse only accepts flags declared on the parser that is currently
+    consuming arguments.
+
+    The subparser copies use ``default=SUPPRESS`` so that omitting the flag after
+    the subcommand leaves the attribute unset, and the value parsed by the main
+    parser survives. With an ordinary ``store_true`` default the subparser would
+    write False over an earlier ``--json``, silently discarding it.
+    """
+    kwargs: dict[str, object] = {"default": argparse.SUPPRESS} if suppress else {}
+    target.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON", **kwargs
+    )
+    target.add_argument(
+        "--lang",
+        choices=["both", "en", "ja"],
+        help="alert output language",
+        **({"default": argparse.SUPPRESS} if suppress else {"default": "both"}),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m sentinel",
         description="Sentinel RAG — bilingual AI-powered SecOps engine",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
-    parser.add_argument("--lang", default="both", choices=["both", "en", "ja"], help="alert output language")
+    _add_global_flags(parser, suppress=False)
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("index", help="build or refresh the hierarchical index")
@@ -342,7 +366,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("search", help="bilingual retrieval over the corpus")
     p.add_argument("query")
     p.add_argument("-k", type=int, default=None, help="number of parents to return")
-    p.add_argument("--lang", dest="lang", default="", help="comma-separated: en,ja")
+    # Named --languages, not --lang: --lang is the global "output language" flag,
+    # and having the same name mean "filter the corpus" on one subcommand and
+    # "render the alert" everywhere else is a trap.
+    p.add_argument("--languages", default="", help="restrict the corpus to these: en,ja")
     p.add_argument("--types", default="", help="comma-separated: advisory,log_window")
     p.set_defaults(func=cmd_search)
 
@@ -382,6 +409,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-score", type=int, default=40)
     p.set_defaults(func=cmd_demo)
 
+    for subparser in sub.choices.values():
+        _add_global_flags(subparser, suppress=True)
+
     return parser
 
 
@@ -389,12 +419,6 @@ def main(argv: list[str] | None = None, settings: Settings | None = None) -> int
     parser = build_parser()
     args = parser.parse_args(argv)
     printer = Printer()
-
-    # The subcommand's own --lang (search has none, analyze does) must not be
-    # shadowed by the global one; argparse resolves this by declaration order, so
-    # normalise here rather than relying on it.
-    if not hasattr(args, "lang") or args.lang is None:
-        args.lang = "both"
 
     try:
         engine = SentinelEngine(settings or get_settings())
