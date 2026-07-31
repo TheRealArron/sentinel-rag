@@ -60,7 +60,7 @@ ChromaDB/HNSW, uvicorn, Gemini.
   /var/log/auth.log  │            GO INGESTOR (stdlib only)     │
   /var/log/syslog ──►│                                          │
                      │  sanitize ─► parse ─► enrich ─► correlate │
-                     │  CWE-117    RFC3164   32 rules  stateful  │
+                     │  CWE-117    RFC3164   33 rules  stateful  │
                      │  Trojan-    RFC5424   MITRE     sliding   │
                      │  Source     ISO-8601  scoring   window    │
                      │        └── N workers ──┘   └── ordered ──┘│
@@ -111,13 +111,40 @@ ChromaDB/HNSW, uvicorn, Gemini.
 
 ## 🧠 Why this isn't "just another AI project"
 
-### 1. The Python bottleneck is real, so the parser is in Go
+### 1. The parser is in Go — but not for the reason you'd expect
 
-Python's GIL makes it a poor fit for high-velocity line processing. The ingestor
-is Go, uses one worker goroutine per core, and has **no external dependencies at
-all** — the entire hot path is standard library.
+I benchmarked this instead of asserting it, and **the result contradicted my own
+assumption**: Python's `re` is **1.8× faster** than Go's `regexp` on this
+project's actual 33 detection patterns.
 
-Two details in there are worth more than the language choice:
+The clincher is that Go's `regexp` and Python's `google-re2` — the same RE2
+algorithm, one compiled, one behind a CPython binding — cost **the same to within
+measurement error (1.00×)**. So the gap is the *algorithm*, not the language: RE2
+trades average-case speed for a worst-case guarantee, and charges the same for it
+everywhere.
+
+That guarantee is the real reason:
+
+> `^(a+)+$` against 26 a's and a `b` takes Python **5.2 seconds**; Go takes
+> **1 microsecond** and is provably linear. Extrapolated to 40 characters:
+> ~10 hours versus 2 µs.
+
+This is a log parser. **The input is chosen by a remote attacker** — they pick
+the SSH username. One backtracking-vulnerable rule turns a crafted username into
+a denial of service against the entire monitoring pipeline, taking the monitoring
+down exactly when it is needed. RE2 makes that class of bug *unrepresentable*
+rather than something to re-audit on every new rule.
+
+Parallelism then more than covers the per-match deficit: **10,268 → 52,986
+lines/s from 1 to 16 workers (5.2×)**, measured end-to-end. Net throughput win
+over single-threaded Python is ~2.9×, which is real but modest. Add a `FROM scratch` container
+with no shell and no supply chain, and the case holds — it is just a different
+case than "Go is fast."
+
+Full methodology, per-pattern costs, and threats to validity:
+**[`benchmarks/`](benchmarks/)**.
+
+Two implementation details are worth more than the language choice:
 
 **Order is restored before correlation.** Workers finish out of order, which is
 harmless for independent lines and fatal for stateful detection: a "successful
@@ -427,7 +454,7 @@ That is the property that lets it run under a 128 MB container limit against a
 log file of any size.
 
 **Scaling is 5.2× across 16 workers**, not 16×. The bottleneck is the detection
-rule set: 32 regexes evaluated per line, and RE2 has no backtracking to skip
+rule set: 33 regexes evaluated per line, and RE2 has no backtracking to skip
 cheap non-matches. The obvious next optimisation is a required-literal
 pre-filter per rule (a `strings.Contains` guard before the regex), which would
 skip most rules on most lines. It is not implemented — 53k lines/s already
@@ -476,9 +503,50 @@ quietly rotted, and that is worth failing a build over.
 - [x] **Phase 2** — Hierarchical indexing with bilingual metadata
 - [x] **Phase 3** — FastAPI dashboard for real-time threat visualisation
 - [x] **Phase 4** — Automated active response (UFW), with host-side isolation
-- [ ] **Phase 5** — Multi-host aggregation over mTLS
-- [ ] **Phase 6** — Local inference (Llama / Qwen via llama.cpp) so nothing leaves the LAN at all
-- [ ] **Phase 7** — Sigma rule import, so the detection set is not hand-maintained
+- [ ] **Phase 5: Deceptive defence (honeytokens)** — canary usernames and file
+      paths that exist nowhere on the host, so any reference to one is a
+      zero-false-positive score-100 event. Checked in the Go layer ahead of the
+      rule engine.
+- [ ] **Phase 6: Shadow Search** — a daily background worker that summarises the
+      previous 24 hours' most anomalous patterns and proactively queries the
+      JPCERT/CC RSS and NVD feeds for them, without being asked. Turns the system
+      from a search engine into a standing watch.
+- [ ] **Phase 7: Air-gap mode** — Ollama / vLLM for fully local inference, with
+      graceful fallback to Gemini (pseudonymised) when local inference is
+      unavailable or too slow. Removes the last external dependency.
+- [ ] **Phase 8: Blast-radius graphing** — NetworkX graph over IPs, users, and
+      files, so lateral movement is visible as shape: one IP fanning out to many
+      users is a star, credential reuse across hosts is a bridge.
+- [ ] **Phase 9** — Multi-host aggregation over mTLS
+- [ ] **Phase 10** — Sigma rule import, so the detection set is not hand-maintained
+
+<details>
+<summary><b>Design note on Phase 5: why a hash set, not a Bloom filter</b></summary>
+
+The obvious pitch for honeytokens is "use a Bloom filter — O(1) membership,
+cache-efficient." It is the wrong data structure here, and picking it would
+demonstrate the opposite of what it is meant to.
+
+A Bloom filter buys **memory** at the cost of **false positives** and an extra
+hash round. It wins when the set is large enough that storing it outright hurts:
+millions of breached-password hashes, a full IOC feed. A honeytoken list is
+5–50 usernames — a few hundred bytes. A Go `map[string]struct{}` is a single
+hash and a pointer chase, has **zero** false positives, and needs no secondary
+confirmation step.
+
+False positives matter more than the memory here: this event is scored 100 and
+is the one thing on the system permitted to trigger a firewall block. "Probably
+a honeytoken" is not a basis for that.
+
+So Phase 5 uses a plain hash set. The Bloom filter idea is kept and moved to
+where it actually pays — Phase 10's IOC matching, where the candidate set is
+millions of indicators pulled from threat feeds, memory is the binding
+constraint, and a positive can afford a confirmation lookup before it means
+anything.
+
+Choosing the fancier structure where the simple one is strictly better is a
+tell. Knowing which one the problem calls for is the actual skill.
+</details>
 
 ---
 
