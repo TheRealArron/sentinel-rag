@@ -115,6 +115,23 @@ reindex: ## Drop and rebuild the index
 analyze: ## Triage the most severe recent events
 	$(PYTHON) -m sentinel analyze --min-score 60
 
+.PHONY: shadow
+shadow: ## Run Shadow Search over the last 24h (Phase 6)
+	$(PYTHON) -m sentinel shadow
+
+.PHONY: shadow-demo
+shadow-demo: build ## Shadow Search against a synthetic week of history
+	@# The committed sample is 5 minutes of intrusion with no "before", so every
+	@# value in it is novel and -- correctly -- yields zero surprise. Anomaly
+	@# detection needs the boring week that precedes the interesting day.
+	@mkdir -p data
+	$(PYTHON) scripts/generate-baseline-log.py --days 7 --out data/baseline.log
+	cat data/baseline.log $(SAMPLE) > data/full.log
+	@rm -f $(EVENTS) data/index/shadow_state.json
+	TZ=UTC ./$(BIN) -in data/full.log -out $(EVENTS)
+	$(PYTHON) -m sentinel index
+	$(PYTHON) -m sentinel shadow --as-of 2026-07-30T06:00:00Z
+
 .PHONY: stats
 stats: ## Show engine statistics
 	$(PYTHON) -m sentinel stats
@@ -172,7 +189,7 @@ docker-build: ## Build both images without starting them
 clean: ## Remove build output and generated data (keeps the corpus)
 	rm -rf ingestor/bin ingestor/coverage.out
 	rm -rf data/index data/chroma data/models
-	rm -f data/events.jsonl data/audit.log
+	rm -f data/events.jsonl data/audit.log data/baseline.log data/full.log
 	find . -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .pytest_cache -prune -exec rm -rf {} + 2>/dev/null || true
 	@echo "cleaned"

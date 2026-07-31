@@ -31,6 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 PROTECTED: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/api/index"),
+        ("POST", "/api/shadow/run"),
         ("POST", "/api/response/block"),
         ("POST", "/api/response/unblock"),
         ("POST", "/api/analyze"),
@@ -116,6 +117,8 @@ class Router:
             ("POST", "/api/search"): Router.search,
             ("POST", "/api/analyze"): Router.analyze,
             ("POST", "/api/index"): Router.index,
+            ("GET", "/api/shadow"): Router.shadow_latest,
+            ("POST", "/api/shadow/run"): Router.shadow_run,
             ("GET", "/api/response/status"): Router.response_status,
             ("GET", "/api/response/history"): Router.response_history,
             ("POST", "/api/response/block"): Router.response_block,
@@ -259,6 +262,36 @@ class Router:
         rebuild = bool(request.body.get("rebuild")) or request.q_bool("rebuild")
         stats = self.engine.index_all(rebuild=rebuild)
         return Response(200, {"rebuild": rebuild, **stats.to_dict(), "index": self.engine.indexer.stats()})
+
+    def shadow_latest(self, request: Request) -> Response:
+        """The most recent report, read from disk. Cheap: never runs a search.
+
+        The dashboard polls this every few seconds; running a full baseline build
+        on each poll would make the panel the most expensive thing in the system.
+        """
+        return Response(200, self.engine.shadow_latest())
+
+    def shadow_run(self, request: Request) -> Response:
+        """Execute a Shadow Search pass now. Protected: it costs retrieval and,
+        with a provider configured, LLM calls."""
+        as_of = None
+        if request.body.get("as_of"):
+            from datetime import datetime, timezone
+
+            try:
+                as_of = datetime.fromisoformat(str(request.body["as_of"]).replace("Z", "+00:00"))
+            except ValueError:
+                raise BadRequest("'as_of' must be an ISO timestamp") from None
+            if as_of.tzinfo is None:
+                as_of = as_of.replace(tzinfo=timezone.utc)
+
+        report = self.engine.shadow_search(
+            window_hours=_as_int(request.body.get("window_hours"), 0) or None,
+            limit=_as_int(request.body.get("limit"), 0) or None,
+            ignore_cooldown=bool(request.body.get("ignore_cooldown")),
+            now=as_of,
+        )
+        return Response(200, report.to_dict())
 
     def response_status(self, request: Request) -> Response:
         return Response(200, self.engine.responder.status())

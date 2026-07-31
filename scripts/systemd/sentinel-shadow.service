@@ -1,0 +1,48 @@
+[Unit]
+Description=Sentinel RAG — Shadow Search (proactive threat correlation)
+Documentation=https://github.com/TheRealArron/sentinel-rag
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Adjust to your checkout.
+WorkingDirectory=/opt/sentinel-rag
+Environment=PYTHONPATH=/opt/sentinel-rag/engine
+EnvironmentFile=-/opt/sentinel-rag/.env
+
+# Runs unattended, so the result has to go somewhere a human will see it. The
+# report is persisted to the index directory and rendered by the dashboard; this
+# also logs it to the journal so `journalctl -u sentinel-shadow` is a full record.
+ExecStart=/usr/bin/python3 -m sentinel shadow
+
+# Unprivileged: Shadow Search only reads the event log and the index. It has no
+# business touching anything else, and unlike the responder it never needs root.
+User=sentinel
+Group=sentinel
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+ReadWritePaths=/opt/sentinel-rag/data
+
+# A hung LLM call must not leave this running until the next timer firing.
+TimeoutStartSec=15min
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

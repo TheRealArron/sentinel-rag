@@ -317,6 +317,17 @@ td.rule { font-family: var(--mono); font-size: 11.5px; white-space: nowrap; }
   <div id="alertPanel"><div class="empty" data-i18n="noAlert"></div></div>
 </section>
 
+<section class="card" style="margin-bottom:16px">
+  <div class="head">
+    <h2 data-i18n="shadowTitle"></h2>
+    <span class="note" id="shadowNote"></span>
+  </div>
+  <div class="filters">
+    <button type="button" id="shadowBtn" data-i18n="shadowRun"></button>
+  </div>
+  <div id="shadowPanel"></div>
+</section>
+
 <section class="card">
   <div class="head">
     <h2 data-i18n="feedTitle"></h2>
@@ -403,7 +414,18 @@ const I18N = {
   blocking: { en: "Blocking…", ja: "遮断中…" },
   selected: { en: "selected", ja: "件選択中" },
   requestFailed: { en: "Request failed", ja: "リクエストに失敗しました" },
-  ofEvents: { en: "of {n} events", ja: "全 {n} 件中" }
+  ofEvents: { en: "of {n} events", ja: "全 {n} 件中" },
+  shadowTitle: { en: "Shadow Search — proactive findings", ja: "シャドウサーチ — 能動的検知" },
+  shadowRun: { en: "Run now", ja: "今すぐ実行" },
+  shadowRunning: { en: "Searching…", ja: "検索中…" },
+  shadowNever: { en: "Shadow Search has not run yet.", ja: "シャドウサーチは未実行です。" },
+  shadowNone: { en: "Nothing unusual against the baseline. A quiet result is a real result.", ja: "ベースラインに対する異常はありません。静かな結果も結果です。" },
+  shadowLowConf: { en: "Low confidence — baseline too thin", ja: "信頼度低 — ベースライン不足" },
+  bits: { en: "bits", ja: "ビット" },
+  baselineLabel: { en: "baseline", ja: "ベースライン" },
+  novel: { en: "never seen before", ja: "初出現" },
+  rare: { en: "rare", ja: "まれ" },
+  spike: { en: "rate spike", ja: "急増" }
 };
 
 const SEVERITIES = ["critical", "high", "warning", "notice", "info"];
@@ -694,6 +716,80 @@ async function runAnalysis(payload) {
   }
 }
 
+/* --- shadow search ------------------------------------------------------ */
+const KIND_LABEL = { novel: "novel", rare: "rare", spike: "spike" };
+
+function renderShadow(report) {
+  const panel = $("shadowPanel");
+  const note = $("shadowNote");
+  const anomalies = report.anomalies || [];
+  const advisories = report.advisories || [];
+
+  note.textContent = report.created_at ? shortTime(report.created_at) : "";
+
+  if (report.never_run) {
+    panel.innerHTML = `<div class="empty">${esc(t("shadowNever"))}</div>`;
+    return;
+  }
+  if (!anomalies.length) {
+    const notes = (report.notes || []).map((n) => `<div class="notice">${esc(n)}</div>`).join("");
+    panel.innerHTML = notes || `<div class="empty">${esc(t("shadowNone"))}</div>`;
+    return;
+  }
+
+  let html = "";
+  if (report.low_confidence) html += `<div class="notice warn">${esc(t("shadowLowConf"))}</div>`;
+
+  // Surprise is plotted as a proportion of the largest finding: the bar encodes
+  // relative rank, and the exact bit value sits beside it in text.
+  const maxBits = Math.max.apply(null, anomalies.map((a) => a.surprise_bits)) || 1;
+
+  html += `<div class="ranked">` + anomalies.map((a) => {
+    const label = t(KIND_LABEL[a.kind] || "novel");
+    const reason = lang === "ja" ? a.reason.ja : a.reason.en;
+    return `<div class="ranked-row" style="grid-template-columns:minmax(150px,220px) 1fr auto">
+      <span class="name" title="${esc(a.dimension + "=" + a.value)}">${esc(a.dimension)}=<b>${esc(a.value)}</b></span>
+      <div class="track"><div class="fill" style="width:${((a.surprise_bits / maxBits) * 100).toFixed(1)}%"
+        title="${esc(reason)}"></div></div>
+      <span class="n">${a.surprise_bits.toFixed(1)} ${esc(t("bits"))}</span>
+    </div>
+    <div style="margin:-4px 0 8px 0;font-size:11.5px" class="muted">
+      ${esc(label)} · ${esc(reason)} · ${a.count} ${lang === "ja" ? "件" : "event(s)"}
+    </div>`;
+  }).join("") + `</div>`;
+
+  advisories.forEach((adv, i) => {
+    const title = (lang === "ja" ? adv.title.ja : adv.title.en) || adv.title.en;
+    const summary = (lang === "ja" ? adv.summary.ja : adv.summary.en) || adv.summary.en;
+    html += `<div class="alert-section">
+      <h3>${esc(t("citations"))} — ${esc(title)}</h3>
+      <div class="alert-body">${esc(summary)}</div>` +
+      (adv.citations || []).map((c, j) => `<div class="cite">
+        <span class="lang">S${j + 1} · ${esc(c.lang)}</span>
+        <span>${esc(c.title)}</span>
+        <span class="sim">${c.similarity.toFixed(3)}</span>
+      </div>`).join("") + `</div>`;
+  });
+
+  (report.notes || []).forEach((n) => { html += `<div class="notice">${esc(n)}</div>`; });
+  panel.innerHTML = html;
+}
+
+async function loadShadow() {
+  try { renderShadow(await api("/api/shadow")); }
+  catch (err) { $("shadowPanel").innerHTML = `<div class="notice err">${esc(err.message)}</div>`; }
+}
+
+async function runShadow() {
+  const btn = $("shadowBtn");
+  btn.disabled = true;
+  btn.textContent = t("shadowRunning");
+  $("shadowPanel").innerHTML = `<div class="empty"><span class="spinner"></span> ${esc(t("shadowRunning"))}</div>`;
+  try { renderShadow(await api("/api/shadow/run", { method: "POST", body: JSON.stringify({}) })); }
+  catch (err) { $("shadowPanel").innerHTML = `<div class="notice err">${esc(t("requestFailed"))}: ${esc(err.message)}</div>`; }
+  finally { btn.disabled = false; btn.textContent = t("shadowRun"); }
+}
+
 /* --- data loading ------------------------------------------------------ */
 function feedQuery() {
   const params = new URLSearchParams({ limit: "200" });
@@ -728,6 +824,7 @@ async function refresh() {
     renderSources(stats);
     renderFeed(lastEvents);
     setLive((stats.events || {}).events > 0 ? "ok" : "stale");
+    loadShadow();
   } catch (err) {
     setLive("down");
     $("feedNote").textContent = `${t("requestFailed")}: ${err.message}`;
@@ -766,6 +863,7 @@ $("themeBtn").addEventListener("click", () => {
   setTheme(isDark ? "light" : "dark");
 });
 $("refreshBtn").addEventListener("click", refresh);
+$("shadowBtn").addEventListener("click", runShadow);
 $("triageBtn").addEventListener("click", () => runAnalysis({ triage: true, limit: 25, min_score: 60 }));
 $("analyzeSelectedBtn").addEventListener("click", () => runAnalysis({ event_ids: Array.from(selected) }));
 $("askBtn").addEventListener("click", () => {

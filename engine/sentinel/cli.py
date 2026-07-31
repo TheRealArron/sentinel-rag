@@ -203,6 +203,71 @@ def cmd_analyze(args, engine: SentinelEngine, printer: Printer) -> int:
     return 0
 
 
+def cmd_shadow(args, engine: SentinelEngine, printer: Printer) -> int:
+    as_of = None
+    if args.as_of:
+        from datetime import datetime, timezone
+
+        try:
+            as_of = datetime.fromisoformat(args.as_of.replace("Z", "+00:00"))
+        except ValueError:
+            print(f"--as-of must be an ISO timestamp, got {args.as_of!r}", file=sys.stderr)
+            return 2
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=timezone.utc)
+
+    report = engine.shadow_search(
+        window_hours=args.window, limit=args.top,
+        ignore_cooldown=args.ignore_cooldown, now=as_of,
+    )
+    if args.json:
+        print(report.to_json())
+        return 0
+
+    printer.header("Shadow Search")
+    printer.kv("window", f"last {report.window_hours}h")
+    printer.kv("events in window", report.window_events)
+    printer.kv("baseline", f"{report.baseline_events} events over {report.baseline_span_hours:.1f}h")
+    if report.low_confidence:
+        printer.kv("confidence", "LOW — see notes")
+
+    if report.anomalies:
+        printer.header(f"Top {len(report.anomalies)} anomalies by surprise")
+        for i, anomaly in enumerate(report.anomalies, 1):
+            printer.line(
+                f"  {i}. {printer.bold(f'{anomaly.dimension}={anomaly.value}')} "
+                f"{printer.dim(f'[{anomaly.kind}]')}  {anomaly.surprise:.1f} bits, {anomaly.count} event(s)"
+            )
+            printer.line(f"     {printer.dim(anomaly.reason_en)}")
+            if anomaly.example:
+                printer.line(f"     {printer.dim(anomaly.example[:100])}")
+
+    if report.advisories:
+        printer.header(f"{len(report.advisories)} proactive advisory(ies)")
+        for advisory in report.advisories:
+            printer.line()
+            printer.line(f"  {printer.bold(advisory.title_en)}")
+            if args.lang in {"both", "ja"}:
+                printer.line(f"  {printer.dim('JA')} {advisory.title_ja}")
+            printer.line(_wrap(advisory.summary_en))
+            if args.lang in {"both", "ja"} and advisory.summary_ja:
+                printer.line(_wrap(advisory.summary_ja))
+            for i, citation in enumerate(advisory.citations, 1):
+                printer.line(f"     [S{i}] ({citation.lang}) {citation.title}  sim={citation.similarity:.3f}")
+            for action in advisory.recommended_actions:
+                printer.line(f"     -> {action}")
+    elif report.anomalies:
+        printer.line()
+        printer.line("  No anomaly had supporting intelligence above the similarity floor.")
+
+    if report.notes:
+        printer.header("Notes")
+        for note in report.notes:
+            printer.line(f"  · {_wrap(note, indent='    ').lstrip()}")
+    printer.line()
+    return 0
+
+
 def cmd_serve(args, engine: SentinelEngine, printer: Printer) -> int:
     host = args.host or engine.settings.api_host
     port = args.port or engine.settings.api_port
@@ -379,6 +444,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=25, help="max events to analyse")
     p.add_argument("--min-score", type=int, default=60, help="ignore events below this score")
     p.set_defaults(func=cmd_analyze)
+
+    p = sub.add_parser("shadow", help="proactive correlation over the last window (Phase 6)")
+    p.add_argument("--window", type=int, default=None, help="hours to review (default 24)")
+    p.add_argument("--top", type=int, default=None, help="max anomalies to report (default 5)")
+    p.add_argument("--ignore-cooldown", action="store_true", help="re-advise findings already seen")
+    p.add_argument("--as-of", default="", metavar="ISO",
+                   help="treat this timestamp as 'now' — replays a historical window")
+    p.set_defaults(func=cmd_shadow)
 
     p = sub.add_parser("serve", help="run the dashboard and JSON API")
     p.add_argument("--host", default="")

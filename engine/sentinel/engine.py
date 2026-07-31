@@ -12,6 +12,8 @@ for it. The first search or analysis triggers the load.
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 from collections import deque
 from collections.abc import Iterable, Sequence
@@ -161,8 +163,6 @@ class EventBuffer:
 
 
 def _safe_event(line: str) -> LogEvent | None:
-    import json
-
     try:
         obj = json.loads(line)
     except json.JSONDecodeError:
@@ -191,6 +191,7 @@ class SentinelEngine:
         self._llm: LLM | None = None
         self._analyst: Analyst | None = None
         self._indexer: Indexer | None = None
+        self._shadow: Any = None
         self.events.refresh()
 
     # -- lazy components ---------------------------------------------------
@@ -246,6 +247,16 @@ class SentinelEngine:
                 self._indexer = Indexer(self.settings, self.embedder, self.vectors, self.parents)
             return self._indexer
 
+    @property
+    def shadow(self):
+        """Phase 6 proactive correlation. Lazy: it pulls in the retriever."""
+        with self._lock:
+            if self._shadow is None:
+                from .shadow import ShadowSearch
+
+                self._shadow = ShadowSearch(self, self.settings)
+            return self._shadow
+
     # -- operations --------------------------------------------------------
 
     def search(
@@ -283,6 +294,58 @@ class SentinelEngine:
                 question=question or "No events above the score threshold are present."
             )
         return self.analyst.analyze(events=candidates, question=question)
+
+    def shadow_search(self, window_hours: int | None = None, limit: int | None = None,
+                      ignore_cooldown: bool = False, now: Any = None):
+        """Run one Shadow Search pass, persist the report, and return it.
+
+        ``now`` overrides the window anchor, which is how a historical window is
+        replayed — useful for incident review, and the only way to analyse an
+        archived log whose events are older than the window.
+        """
+        report = self.shadow.run(window_hours=window_hours, limit=limit,
+                                 ignore_cooldown=ignore_cooldown, now=now)
+        self._write_shadow_report(report)
+        return report
+
+    def _write_shadow_report(self, report) -> None:
+        """Persist atomically so a dashboard poll never reads a half-written file."""
+        import tempfile
+
+        path = self.settings.index_dir / "shadow_report.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".shadow-report-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(report.to_json(indent=None))
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+
+    def shadow_latest(self) -> dict[str, Any]:
+        """Last persisted report, or an empty shell if Shadow Search never ran.
+
+        Deliberately does not trigger a run: the dashboard polls this, and a poll
+        that silently rebuilt the baseline would be the most expensive request in
+        the system.
+        """
+        path = self.settings.index_dir / "shadow_report.json"
+        if not path.exists():
+            return {
+                "created_at": "",
+                "never_run": True,
+                "anomalies": [],
+                "advisories": [],
+                "notes": ["Shadow Search has not run yet. Try: python -m sentinel shadow"],
+            }
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            return {"created_at": "", "never_run": True, "anomalies": [], "advisories": [],
+                    "notes": [f"Could not read the stored report: {exc}"]}
+        data["never_run"] = False
+        return data
 
     def index_all(self, rebuild: bool = False) -> IndexStats:
         if rebuild:

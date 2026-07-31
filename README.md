@@ -483,6 +483,62 @@ pass vacuously there and prove nothing.
 
 ---
 
+### 10. Shadow Search: the system asks its own questions
+
+Everything else here is reactive — it answers when asked. Shadow Search runs on a
+timer, decides for itself what was unusual, and goes looking through the
+bilingual corpus for an explanation with nobody watching.
+
+**"Weirdest" is not "highest score."** Ranking the last day by risk and
+summarising the top five would be worthless: that is what triage already does,
+and those events already alerted. Re-reporting your loudest alarms is not
+intelligence. What matters is what the rule engine did *not* shout about — a
+process never seen before today, an account logging in at 04:00 when it has only
+ever logged in at 09:00, a category that normally produces two events producing
+two hundred. None of those trip a threshold; all of them are how an intrusion
+looks before anyone notices.
+
+**Surprise is measured as self-information.** For a value with baseline
+probability *p*, seeing it costs `-log2(p)` bits. That gives one comparable
+number across dimensions with wildly different cardinalities — a handful of
+processes, thousands of addresses — and "10.1 bits surprising" survives an
+operator asking what it means in a way a hand-tuned 0-100 score does not.
+Probabilities are Jeffreys-smoothed, so a never-seen value scores high but
+**finite** instead of dividing by zero. Volume spikes are scored separately as
+`log2(observed / expected)`, because a known value arriving 200× too often is a
+different phenomenon from an unknown value arriving once.
+
+Three restraints do most of the work:
+
+| Restraint | Why |
+|---|---|
+| Refuses to be confident below 200 baseline events | An anomaly detector with no history is a random number generator. It reports findings as *unranked observations* and says so. |
+| Collapses findings sharing >80% of their events | One intrusion lights up a novel rule, category, *and* process. Reported separately, a five-item report says one thing. |
+| 24h cooldown per finding | A standing anomaly re-reported nightly is how alerting systems get ignored. |
+
+Retrieval is restricted to **advisories only**. The index also holds log windows,
+and without that filter the "supporting intelligence" for an anomaly is other log
+lines from the same host — circular, and it crowds out the JPCERT/CVE documents
+that are the whole point.
+
+```
+$ make shadow-demo
+  1. rule=honeytoken_referenced [novel]  10.1 bits, 2 event(s)
+     never seen in the previous 148h of history
+  ...
+     [S1] (en) sim=0.335  SSH credential brute forcing and password spraying…
+     [S2] (ja) sim=0.306  SSHサーバに対するブルートフォース攻撃の増加に関する注意喚起
+```
+
+Both languages, unprompted, for a finding nobody asked about.
+
+Scheduled with a systemd timer (`scripts/systemd/sentinel-shadow.*`) rather than
+an in-process scheduler — the engine restarts, and `Persistent=true` catches up
+after the laptop wakes, which matters because a missed night is exactly the night
+worth looking at. `--as-of` replays any historical window for incident review.
+
+---
+
 <a name="performance"></a>
 ## 📊 Performance
 
@@ -535,7 +591,7 @@ Measured, not asserted: a 4 MiB single log line is consumed in full
 (`bytes_read=4194387`) at **5.9 MB peak RSS** with `-max-line 1024`, and
 `-follow` survives a rename-and-create logrotate cycle without losing an event.
 
-**Python:** 259 tests covering language detection on ASCII-heavy Japanese,
+**Python:** 290 tests covering language detection on ASCII-heavy Japanese,
 script-aware chunking, the hashing embedder's persistence-safe determinism,
 storage, the bilingual retrieval floor, pseudonymisation round-trips, every
 analyst guard rail, every response guard rail, and the full HTTP surface.
@@ -556,10 +612,10 @@ quietly rotted, and that is worth failing a build over.
       hostnames and process names that exist nowhere on the host, so any
       reference is a zero-false-positive score-100 event. See
       [`config/`](config/).
-- [ ] **Phase 6: Shadow Search** — a daily background worker that summarises the
-      previous 24 hours' most anomalous patterns and proactively queries the
-      JPCERT/CC RSS and NVD feeds for them, without being asked. Turns the system
-      from a search engine into a standing watch.
+- [x] **Phase 6: Shadow Search** — a daily unattended worker that ranks the last
+      24 hours by *statistical surprise* against a learned baseline and
+      proactively correlates the findings against the bilingual corpus. See
+      `make shadow-demo`.
 - [ ] **Phase 7: Air-gap mode** — Ollama / vLLM for fully local inference, with
       graceful fallback to Gemini (pseudonymised) when local inference is
       unavailable or too slow. Removes the last external dependency.

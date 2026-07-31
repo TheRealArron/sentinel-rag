@@ -121,6 +121,20 @@ class Settings:
     anonymize: bool = field(default_factory=lambda: _env_bool("SENTINEL_ANONYMIZE", True))
     anonymize_public_ips: bool = field(default_factory=lambda: _env_bool("SENTINEL_ANONYMIZE_PUBLIC_IPS", False))
 
+    # --- Shadow Search (Phase 6) ------------------------------------------
+    # Proactive correlation runs unattended, so its thresholds decide what a
+    # sleeping operator is woken for. shadow_min_baseline is the important one:
+    # below it the engine reports findings as unranked observations rather than
+    # anomalies, because on a short history everything looks novel.
+    shadow_window_hours: int = field(default_factory=lambda: _env_int("SENTINEL_SHADOW_WINDOW_HOURS", 24))
+    shadow_top_n: int = field(default_factory=lambda: _env_int("SENTINEL_SHADOW_TOP_N", 5))
+    shadow_min_baseline: int = field(default_factory=lambda: _env_int("SENTINEL_SHADOW_MIN_BASELINE", 200))
+    shadow_min_surprise: float = field(default_factory=lambda: _env_float("SENTINEL_SHADOW_MIN_SURPRISE", 4.0))
+    shadow_min_count: int = field(default_factory=lambda: _env_int("SENTINEL_SHADOW_MIN_COUNT", 1))
+    shadow_min_similarity: float = field(default_factory=lambda: _env_float("SENTINEL_SHADOW_MIN_SIMILARITY", 0.05))
+    shadow_k: int = field(default_factory=lambda: _env_int("SENTINEL_SHADOW_K", 4))
+    shadow_cooldown_hours: int = field(default_factory=lambda: _env_int("SENTINEL_SHADOW_COOLDOWN_HOURS", 24))
+
     # --- active response (Phase 4) ----------------------------------------
     response_mode: str = field(default_factory=lambda: _env("SENTINEL_RESPONSE_MODE", "dry-run"))
     response_min_score: int = field(default_factory=lambda: _env_int("SENTINEL_RESPONSE_MIN_SCORE", 90))
@@ -159,6 +173,12 @@ class Settings:
             )
         if self.child_overlap >= self.child_tokens:
             raise ValueError(f"child_overlap ({self.child_overlap}) must be smaller than child_tokens ({self.child_tokens})")
+        if self.shadow_window_hours <= 0:
+            raise ValueError("SENTINEL_SHADOW_WINDOW_HOURS must be positive")
+        if self.shadow_top_n <= 0:
+            raise ValueError("SENTINEL_SHADOW_TOP_N must be positive")
+        if self.shadow_min_surprise < 0:
+            raise ValueError("SENTINEL_SHADOW_MIN_SURPRISE must not be negative")
         if self.top_k <= 0 or self.candidate_k <= 0:
             raise ValueError("top_k and candidate_k must be positive")
         if self.candidate_k < self.top_k:

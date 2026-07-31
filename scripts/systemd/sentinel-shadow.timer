@@ -1,0 +1,21 @@
+[Unit]
+Description=Run Sentinel RAG Shadow Search daily
+Documentation=https://github.com/TheRealArron/sentinel-rag
+
+[Timer]
+# 06:00 local: after the night's logs have accumulated and before the operator
+# starts work, so the findings are waiting rather than arriving mid-morning.
+OnCalendar=*-*-* 06:00:00
+
+# Spread the start so this does not contend with logrotate, unattended-upgrades,
+# and every other 06:00 timer on the box.
+RandomizedDelaySec=15min
+
+# Catch up after downtime. A laptop-based home server is asleep more often than
+# not, and a missed night is exactly the night worth looking at.
+Persistent=true
+
+Unit=sentinel-shadow.service
+
+[Install]
+WantedBy=timers.target
