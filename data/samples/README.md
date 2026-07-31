@@ -2,33 +2,41 @@
 
 ## `sample_syslog.log`
 
-21 lines of synthetic RFC 3164 syslog telling one complete intrusion story, in
+23 lines of synthetic RFC 3164 syslog telling one complete intrusion story, in
 order:
 
 | Lines | What happens |
 |---|---|
 | 1–3 | Background noise: a cron job, a pre-auth disconnect, a firewall-blocked telnet probe |
-| 4–8 | Five SSH password failures from `203.0.113.45` inside 8 seconds, across five usernames |
-| 9–10 | **A successful login for `arron` from the same address** — the guessing stopped because it worked |
-| 11–12 | `sudo` to root, then a `curl … \| bash` dropper |
-| 13–16 | Persistence: a new `svc-backup` account, added to `sudo`, key-based re-entry, a backdoor key written to `/root/.ssh/authorized_keys` |
-| 17–18 | Anti-forensics (`journalctl --vacuum-time=1s`) and a cryptominer service |
-| 19 | A `sudo` command containing **U+202E** (Trojan Source) so the displayed path differs from the executed one |
-| 20 | The same `Failed password for root` rule from an *internal* address — scores lower, on purpose |
-| 21 | A line no rule matches — kept at `info` rather than dropped |
+| 4 | **A second scanner tries the canary username `admin_backup`** — score 100, the only single event that clears the firewall threshold |
+| 5–9 | Five SSH password failures from `203.0.113.45` inside 8 seconds, across five usernames |
+| 10–11 | **A successful login for `arron` from the same address** — the guessing stopped because it worked |
+| 12–13 | `sudo` to root, then a `curl … \| bash` dropper |
+| 14–17 | Persistence: a new `svc-backup` account, added to `sudo`, key-based re-entry, a backdoor key written to `/root/.ssh/authorized_keys` |
+| 18 | **Credential hunting trips the canary *file* `/etc/.backup_credentials`** — score 100 again, this time a path token |
+| 19–20 | Anti-forensics (`journalctl --vacuum-time=1s`) and a cryptominer service |
+| 21 | A `sudo` command containing **U+202E** (Trojan Source) so the displayed path differs from the executed one |
+| 22 | The same `Failed password for root` rule from an *internal* address — scores lower, on purpose |
+| 23 | A line no rule matches — kept at `info` rather than dropped |
 
-Line 19 is the interesting one for testing the sanitiser: run
+The two canary lines (4 and 18) are placed deliberately. Line 4 uses a **different
+source address** from the brute-force campaign, and line 18 carries **no address
+at all**, so neither perturbs the five-failure correlation window that the rest of
+the fixture and its tests depend on. A test asserts that window is still
+`failure_count=5` with the same five usernames.
+
+Line 21 is the interesting one for testing the sanitiser: run
 `grep -aP '[\x{202a}-\x{202e}]' sample_syslog.log` to confirm the bidi override
 is really in the file. The ingestor strips it, scores the *attempt* at +25, and
 reclassifies the event as `defense-evasion`.
 
-Line 20 exists to demonstrate that the same detection rule produces different
+Line 22 exists to demonstrate that the same detection rule produces different
 severities depending on source scope: a public source adds +8, a private one
 subtracts 4.
 
 ## `events.sample.jsonl`
 
-The ingestor's output for the log above: 21 parsed events plus **2 synthetic
+The ingestor's output for the log above: 23 parsed events plus **2 synthetic
 correlated incidents** (`correlated_brute_force` at the fifth failure,
 `correlated_successful_login_after_bruteforce` on the success). It is used three
 ways — as the `python -m sentinel demo` data source when no ingestor output

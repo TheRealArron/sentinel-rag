@@ -67,7 +67,7 @@ class TestReadEndpoints:
     def test_stats(self, router):
         status, payload = get(router, "/api/stats")
         assert status == 200
-        assert payload["events"]["events"] == 23
+        assert payload["events"]["events"] == 25
         assert payload["events"]["incidents"] == 2
         assert payload["response"]["mode"] == "dry-run"
 
@@ -85,7 +85,8 @@ class TestReadEndpoints:
 
     def test_events_filters(self, router):
         _s, by_sev = get(router, "/api/events", severity="critical", limit=100)
-        assert by_sev["count"] == 5
+        # 5 from the intrusion narrative + 2 honeytoken hits.
+        assert by_sev["count"] == 7
         assert all(e["severity"] == "critical" for e in by_sev["events"])
 
         _s, incidents = get(router, "/api/events", incidents_only=1, limit=100)
@@ -316,3 +317,58 @@ class TestEngineIntegration:
         assert info["vector_backend"] == "local"
         assert info["llm_available"] is False
         assert info["embedder_semantic"] is False
+
+
+class TestHoneytokensInTheFixture:
+    """The demo data must actually exercise Phase 5.
+
+    These assert on the Go ingestor's output as committed, so if the honeytoken
+    config or detection logic regresses, the Python suite notices even though the
+    detection itself lives in Go.
+    """
+
+    def _canaries(self, events):
+        return [e for e in events if e.rule == "honeytoken_referenced"]
+
+    def test_two_canary_events_are_present(self, engine):
+        canaries = self._canaries(engine.events.all())
+        assert len(canaries) == 2, [e.rule for e in engine.events.all()]
+
+    def test_canaries_score_100_and_are_critical(self, engine):
+        for event in self._canaries(engine.events.all()):
+            assert event.score == 100
+            assert event.severity == "critical"
+            assert event.category == "deception"
+
+    def test_both_token_kinds_are_demonstrated(self, engine):
+        kinds = {e.fields.get("honeytoken_kind") for e in self._canaries(engine.events.all())}
+        assert kinds == {"user", "path"}
+
+    def test_the_triggering_rule_is_preserved(self, engine):
+        # The alert must say *how* the canary was touched, not merely that it was.
+        triggers = {e.fields.get("trigger_rule") for e in self._canaries(engine.events.all())}
+        assert triggers == {"ssh_invalid_user", "sudo_command_executed"}
+
+    def test_canary_tags_are_bilingual(self, engine):
+        for event in self._canaries(engine.events.all()):
+            assert "honeytoken" in event.tags
+            assert "ハニートークン" in event.tags
+
+    def test_a_single_canary_clears_the_firewall_threshold(self, engine):
+        # The whole point of Phase 5: before it, only a correlated incident could
+        # reach the response threshold. Now one event can.
+        canary = next(e for e in self._canaries(engine.events.all()) if e.source_ip)
+        action = engine.responder.block(canary.source_ip, score=canary.score, reason="honeytoken")
+        assert action.allowed is True
+
+        ordinary = next(e for e in engine.events.all() if e.rule == "ssh_failed_password")
+        refused = engine.responder.block(ordinary.source_ip, score=ordinary.score, reason="ordinary")
+        assert refused.allowed is False
+        assert "below threshold" in refused.reason
+
+    def test_canaries_did_not_disturb_the_brute_force_correlation(self, engine):
+        # The canary lines were placed to avoid perturbing the 5-failure window
+        # the rest of the fixture depends on.
+        incident = next(e for e in engine.events.all() if e.rule == "correlated_brute_force")
+        assert incident.fields["failure_count"] == "5"
+        assert incident.fields["targeted_users"] == "admin, arron, oracle, root, test"
