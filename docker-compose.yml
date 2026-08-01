@@ -73,6 +73,15 @@ services:
       SENTINEL_EMBEDDING_BACKEND: ${SENTINEL_EMBEDDING_BACKEND:-auto}
       SENTINEL_VECTOR_BACKEND: ${SENTINEL_VECTOR_BACKEND:-auto}
       SENTINEL_ANONYMIZE: ${SENTINEL_ANONYMIZE:-1}
+      # Phase 7. host.docker.internal reaches an Ollama running on the host;
+      # add `extra_hosts: ["host.docker.internal:host-gateway"]` on Linux, or
+      # point this at a sibling container.
+      SENTINEL_LOCAL_BACKEND: ${SENTINEL_LOCAL_BACKEND:-none}
+      SENTINEL_LOCAL_BASE_URL: ${SENTINEL_LOCAL_BASE_URL:-http://host.docker.internal:11434}
+      SENTINEL_LOCAL_MODEL: ${SENTINEL_LOCAL_MODEL:-qwen2.5:7b}
+      SENTINEL_LOCAL_TIMEOUT: ${SENTINEL_LOCAL_TIMEOUT:-180}
+      SENTINEL_LLM_FALLBACK: ${SENTINEL_LLM_FALLBACK:-none}
+      SENTINEL_AIR_GAP: ${SENTINEL_AIR_GAP:-0}
       SENTINEL_API_TOKEN: ${SENTINEL_API_TOKEN:-}
       # Active response cannot work from inside this container by design — see
       # the note below and scripts/sentinel-responder.sh.
@@ -90,6 +99,11 @@ services:
       - "127.0.0.1:${SENTINEL_API_PORT:-8000}:8000"
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
+    # Reaches an Ollama running on the host. Harmless when SENTINEL_LOCAL_BACKEND
+    # is none, and required for Phase 7 on Linux, where host.docker.internal is
+    # not resolvable by default.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }

@@ -115,6 +115,10 @@ reindex: ## Drop and rebuild the index
 analyze: ## Triage the most severe recent events
 	$(PYTHON) -m sentinel analyze --min-score 60
 
+.PHONY: local-check
+local-check: ## Preflight the local inference server (Phase 7)
+	$(PYTHON) -m sentinel warm --json
+
 .PHONY: shadow
 shadow: ## Run Shadow Search over the last 24h (Phase 6)
 	$(PYTHON) -m sentinel shadow

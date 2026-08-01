@@ -539,6 +539,61 @@ worth looking at. `--as-of` replays any historical window for incident review.
 
 ---
 
+### 11. Air-gap mode, and the fallback I refused to make automatic
+
+Phase 7 adds local inference: **Ollama** (`/api/chat`) and **OpenAI-compatible**
+(`/v1/chat/completions`), the latter covering vLLM, llama.cpp's `llama-server`,
+LM Studio and text-generation-webui — so the runtime is a URL, not a code change.
+
+Both speak HTTP through `urllib`, so **local inference needs no pip install at
+all**. That is deliberate: pulling in an HTTP client to POST one JSON document to
+a socket on the same machine would make the air-gap feature — the one whose whole
+point is self-sufficiency — depend on PyPI being reachable to install it.
+
+**The part I did not build as specified.** The natural design for "use a local
+model, fall back to Gemini if it's slow" is automatic escalation. That is wrong
+here:
+
+> Anyone who configures local inference has decided their logs do not leave the
+> machine. A fallback that silently ships them to a hosted API the first time the
+> local model is slow does not *degrade* that guarantee — it **inverts** it, at
+> exactly the moment nobody is watching.
+
+So escalation is opt-in and named (`SENTINEL_LLM_FALLBACK=gemini`), never
+inferred from a local backend being present. Unset, a local failure degrades to
+the rule-based analyst — the same known, safe state as having no provider at all.
+When it *is* enabled and fires, the alert records it:
+
+```
+Local inference (ollama/qwen2.5:7b) failed, so this request was escalated to
+gemini/gemini-2.0-flash — pseudonymised log text left the host. Reason: …
+```
+
+`SENTINEL_AIR_GAP=1` goes further and makes egress **unrepresentable**: no cloud
+client is constructed at all, and naming one is a startup error. Enforced twice —
+in config validation *and* again at construction — because a mode whose only
+enforcement is validation stops being enforced the moment validation is skipped.
+That is the difference between a policy and a control.
+
+```bash
+$ SENTINEL_AIR_GAP=1 SENTINEL_LLM_PROVIDER=gemini python -m sentinel stats
+configuration error: SENTINEL_AIR_GAP=1 conflicts with SENTINEL_LLM_PROVIDER='gemini'.
+Air-gap means no egress; use ollama or local.
+```
+
+`make local-check` is the preflight, and it reports air-gap posture **without
+loading a model** — an operator asking "is anything leaving this host?" should
+not have to trigger a 2 GB model load to find out. It catches the quiet failure
+that matters: a host configured for local inference where the model was never
+pulled, so every alert silently degrades to rule-based.
+
+The HTTP tests run against a real `http.server` on localhost rather than a mocked
+`urlopen` — mocking the transport tests that the code calls a function, while a
+socket tests that it speaks the protocol, which is the part that breaks when
+Ollama renames a field.
+
+---
+
 <a name="performance"></a>
 ## 📊 Performance
 
@@ -591,7 +646,7 @@ Measured, not asserted: a 4 MiB single log line is consumed in full
 (`bytes_read=4194387`) at **5.9 MB peak RSS** with `-max-line 1024`, and
 `-follow` survives a rename-and-create logrotate cycle without losing an event.
 
-**Python:** 290 tests covering language detection on ASCII-heavy Japanese,
+**Python:** 322 tests covering language detection on ASCII-heavy Japanese,
 script-aware chunking, the hashing embedder's persistence-safe determinism,
 storage, the bilingual retrieval floor, pseudonymisation round-trips, every
 analyst guard rail, every response guard rail, and the full HTTP surface.
@@ -616,9 +671,9 @@ quietly rotted, and that is worth failing a build over.
       24 hours by *statistical surprise* against a learned baseline and
       proactively correlates the findings against the bilingual corpus. See
       `make shadow-demo`.
-- [ ] **Phase 7: Air-gap mode** — Ollama / vLLM for fully local inference, with
-      graceful fallback to Gemini (pseudonymised) when local inference is
-      unavailable or too slow. Removes the last external dependency.
+- [x] **Phase 7: Air-gap mode** — Ollama and OpenAI-compatible (vLLM,
+      llama.cpp, LM Studio) local inference over the standard library, with cloud
+      escalation opt-in and named rather than automatic.
 - [ ] **Phase 8: Blast-radius graphing** — NetworkX graph over IPs, users, and
       files, so lateral movement is visible as shape: one IP fanning out to many
       users is a star, credential reuse across hosts is a bridge.

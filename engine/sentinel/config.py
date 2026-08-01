@@ -115,6 +115,30 @@ class Settings:
     gemini_api_key: str = field(default_factory=lambda: _env("GEMINI_API_KEY", _env("GOOGLE_API_KEY", "")))
     openai_api_key: str = field(default_factory=lambda: _env("OPENAI_API_KEY", ""))
 
+    # --- local inference / air-gap (Phase 7) ------------------------------
+    # none | ollama | openai-compatible. The second covers vLLM, llama.cpp's
+    # llama-server, and LM Studio, so the runtime is a URL rather than a code
+    # change. Both talk over urllib, so local inference needs no pip install —
+    # which matters because the host this is for may have no way to do one.
+    local_backend: str = field(default_factory=lambda: _env("SENTINEL_LOCAL_BACKEND", "none"))
+    local_base_url: str = field(default_factory=lambda: _env("SENTINEL_LOCAL_BASE_URL", "http://127.0.0.1:11434"))
+    local_model: str = field(default_factory=lambda: _env("SENTINEL_LOCAL_MODEL", "qwen2.5:7b"))
+    # Generous by default: a 7B model on a laptop CPU is tens of seconds, and a
+    # timeout that fires routinely turns into an escalation that routinely leaks.
+    local_timeout: float = field(default_factory=lambda: _env_float("SENTINEL_LOCAL_TIMEOUT", 180.0))
+    local_api_key: str = field(default_factory=lambda: _env("SENTINEL_LOCAL_API_KEY", ""))
+    local_json_mode: bool = field(default_factory=lambda: _env_bool("SENTINEL_LOCAL_JSON_MODE", False))
+
+    # Cloud escalation is opt-in and NAMED, never inferred. Someone who chose
+    # local inference chose that their logs stay on the machine; a fallback that
+    # fires silently on the first slow response inverts that guarantee at exactly
+    # the moment nobody is watching.
+    llm_fallback: str = field(default_factory=lambda: _env("SENTINEL_LLM_FALLBACK", "none"))
+
+    # A control, not a preference: under air-gap no cloud client is constructed
+    # at all, and naming one is a configuration error.
+    air_gap: bool = field(default_factory=lambda: _env_bool("SENTINEL_AIR_GAP", False))
+
     # --- privacy -----------------------------------------------------------
     # Pseudonymise host-identifying data before it leaves the machine. This is
     # the technical control behind the project's privacy claim, so it defaults on.
@@ -161,8 +185,45 @@ class Settings:
             raise ValueError(f"SENTINEL_EMBEDDING_BACKEND must be auto|e5|hashing, got {self.embedding_backend!r}")
         if self.vector_backend not in {"auto", "chroma", "local"}:
             raise ValueError(f"SENTINEL_VECTOR_BACKEND must be auto|chroma|local, got {self.vector_backend!r}")
-        if self.llm_provider not in {"auto", "gemini", "openai", "heuristic"}:
-            raise ValueError(f"SENTINEL_LLM_PROVIDER must be auto|gemini|openai|heuristic, got {self.llm_provider!r}")
+        if self.llm_provider not in {"auto", "gemini", "openai", "ollama", "local", "heuristic"}:
+            raise ValueError(
+                f"SENTINEL_LLM_PROVIDER must be auto|gemini|openai|ollama|local|heuristic, "
+                f"got {self.llm_provider!r}"
+            )
+        if self.local_backend not in {"none", "ollama", "openai-compatible"}:
+            raise ValueError(
+                f"SENTINEL_LOCAL_BACKEND must be none|ollama|openai-compatible, got {self.local_backend!r}"
+            )
+        if self.llm_fallback not in {"none", "gemini", "openai"}:
+            raise ValueError(
+                f"SENTINEL_LLM_FALLBACK must be none|gemini|openai, got {self.llm_fallback!r}"
+            )
+        if self.local_timeout <= 0:
+            raise ValueError("SENTINEL_LOCAL_TIMEOUT must be positive")
+        if not self.local_base_url.startswith(("http://", "https://")):
+            raise ValueError(
+                f"SENTINEL_LOCAL_BASE_URL must be an http(s) URL, got {self.local_base_url!r}"
+            )
+
+        # Air-gap is enforced here as configuration, and again in get_llm as a
+        # control. Both, because a mode whose only enforcement is validation is a
+        # mode that stops being enforced the moment validation is skipped.
+        if self.air_gap:
+            if self.llm_provider in {"gemini", "openai"}:
+                raise ValueError(
+                    f"SENTINEL_AIR_GAP=1 conflicts with SENTINEL_LLM_PROVIDER={self.llm_provider!r}. "
+                    f"Air-gap means no egress; use ollama or local."
+                )
+            if self.llm_fallback != "none":
+                raise ValueError(
+                    f"SENTINEL_AIR_GAP=1 conflicts with SENTINEL_LLM_FALLBACK={self.llm_fallback!r}. "
+                    f"Air-gap means no egress, including on failure."
+                )
+        if self.llm_fallback != "none" and self.local_backend == "none":
+            raise ValueError(
+                f"SENTINEL_LLM_FALLBACK={self.llm_fallback!r} needs a local primary to fall back "
+                f"*from*; set SENTINEL_LOCAL_BACKEND, or set the provider directly."
+            )
         if self.response_mode not in {"dry-run", "enforce", "disabled"}:
             raise ValueError(f"SENTINEL_RESPONSE_MODE must be dry-run|enforce|disabled, got {self.response_mode!r}")
         if self.child_tokens >= self.parent_tokens:
@@ -183,6 +244,10 @@ class Settings:
             raise ValueError("top_k and candidate_k must be positive")
         if self.candidate_k < self.top_k:
             raise ValueError(f"candidate_k ({self.candidate_k}) must be >= top_k ({self.top_k})")
+        if self.llm_fallback == "gemini" and not self.gemini_api_key:
+            raise ValueError("SENTINEL_LLM_FALLBACK=gemini but GEMINI_API_KEY is not set")
+        if self.llm_fallback == "openai" and not self.openai_api_key:
+            raise ValueError("SENTINEL_LLM_FALLBACK=openai but OPENAI_API_KEY is not set")
         if self.llm_provider == "gemini" and not self.gemini_api_key:
             raise ValueError("SENTINEL_LLM_PROVIDER=gemini but GEMINI_API_KEY is not set")
         if self.llm_provider == "openai" and not self.openai_api_key:

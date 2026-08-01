@@ -256,6 +256,7 @@ class Analyst:
         context = self.retriever.build_context(retrieved)
         prompt = self._build_prompt(events, question, context, anonymizer)
 
+        escalations_before = getattr(self.llm, "escalations", 0)
         try:
             raw = self.llm.complete(SYSTEM_PROMPT, prompt)
             payload = extract_json(raw)
@@ -264,7 +265,7 @@ class Analyst:
             alert.notes.append(f"LLM reasoning unavailable, used rule-based analysis: {exc}")
             return alert
 
-        return self._alert_from_payload(
+        alert = self._alert_from_payload(
             payload=payload,
             alert_id=alert_id,
             events=events,
@@ -272,6 +273,13 @@ class Analyst:
             anonymizer=anonymizer,
             observed_severity=observed_severity,
         )
+        # If local inference escalated to a cloud provider mid-request, the alert
+        # has to say so. Alert.provider already carries whoever answered; this
+        # adds the reason, because "why did my air-gapped box call an API" is not
+        # a question to answer by reading logs.
+        if getattr(self.llm, "escalations", 0) > escalations_before:
+            alert.notes.extend(getattr(self.llm, "notes", [])[-1:])
+        return alert
 
     # -- query and prompt construction -------------------------------------
 

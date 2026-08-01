@@ -379,6 +379,13 @@ class SentinelEngine:
             "provider": self._llm.provider if self._llm else "not loaded",
             "model": self._llm.model if self._llm else "not loaded",
             "available": self._llm.available if self._llm else None,
+            # Air-gap posture is reported whether or not the LLM has loaded: an
+            # operator asking "is anything leaving this host?" must not have to
+            # trigger a model load to find out.
+            "air_gap": self.settings.air_gap,
+            "local_backend": self.settings.local_backend,
+            "cloud_fallback": self.settings.llm_fallback,
+            "escalations": getattr(self._llm, "escalations", 0) if self._llm else 0,
         }
         out["config"] = {
             "embedding_backend": self.settings.embedding_backend,
@@ -412,7 +419,28 @@ class SentinelEngine:
             "parents": self.parents.count(),
             "llm_provider": self.llm.provider,
             "llm_available": self.llm.available,
+            "air_gap": self.settings.air_gap,
+            "local": self.local_health(),
         }
+
+    def local_health(self) -> dict[str, Any]:
+        """Probe the local inference server without loading anything heavy.
+
+        Preflight for air-gap deployments: the failure mode this catches is a
+        host configured for local inference where the model was never pulled, so
+        every alert silently degrades to rule-based.
+        """
+        if self.settings.local_backend in {"", "none"}:
+            return {"enabled": False}
+        from .local_llm import build_local_llm
+
+        try:
+            backend = build_local_llm(self.settings)
+        except Exception as exc:  # noqa: BLE001
+            return {"enabled": True, "error": str(exc)}
+        if backend is None:
+            return {"enabled": False}
+        return {"enabled": True, **backend.health()}
 
 
 def event_from_fingerprints(engine: SentinelEngine, fingerprints: Iterable[str]) -> list[LogEvent]:
