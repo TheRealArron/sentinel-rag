@@ -203,6 +203,53 @@ def cmd_analyze(args, engine: SentinelEngine, printer: Printer) -> int:
     return 0
 
 
+def cmd_graph(args, engine: SentinelEngine, printer: Printer) -> int:
+    from .graph import summarise
+
+    graph = engine.attack_graph(min_score=args.min_score)
+    if args.dot:
+        print(graph.to_dot())
+        return 0
+    if args.json:
+        print(json.dumps(graph.to_dict(seed=args.seed, max_hops=args.hops),
+                         ensure_ascii=False, indent=2))
+        return 0
+
+    info = summarise(graph)
+    printer.header("Attack graph")
+    printer.kv("entities", info["nodes"])
+    printer.kv("interactions", info["edges"])
+    printer.kv("components", f"{info['components']} (largest {info['largest_component']})")
+
+    if info["shapes"]:
+        printer.header("Structural findings")
+        for shape in info["shapes"]:
+            printer.line(f"  {printer.bold(shape['name'].upper())}  "
+                         f"[{printer.severity(shape['severity'])}] score={shape['score']}")
+            printer.line(_wrap(shape["description"]["en"], indent="    "))
+            if args.lang in {"both", "ja"}:
+                printer.line(_wrap(shape["description"]["ja"], indent="    "))
+            printer.line()
+    else:
+        printer.line()
+        printer.line("  No star, funnel, chain or bridge pattern present.")
+
+    if args.seed:
+        radius = graph.blast_radius(args.seed, max_hops=args.hops)
+        if not radius:
+            printer.line(f"  Unknown seed {args.seed!r}; use --json to list node ids.")
+            return 1
+        printer.header(f"Blast radius from {args.seed} ({args.hops} hops, access-granting edges only)")
+        for nid, hop in sorted(radius.items(), key=lambda kv: (kv[1], kv[0])):
+            if hop == 0:
+                continue
+            node = graph.nodes[nid]
+            printer.line(f"  {hop} hop  {node.kind:<10} {node.label}")
+        printer.line()
+        printer.kv("entities reached", len(radius) - 1)
+    return 0
+
+
 def cmd_shadow(args, engine: SentinelEngine, printer: Printer) -> int:
     as_of = None
     if args.as_of:
@@ -444,6 +491,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=25, help="max events to analyse")
     p.add_argument("--min-score", type=int, default=60, help="ignore events below this score")
     p.set_defaults(func=cmd_analyze)
+
+    p = sub.add_parser("graph", help="attack-path graph and blast radius (Phase 8)")
+    p.add_argument("--seed", default="", metavar="ID",
+                   help="node id to compute a blast radius from, e.g. source_ip:203.0.113.45")
+    p.add_argument("--hops", type=int, default=3, help="maximum hops for the blast radius")
+    p.add_argument("--min-score", type=int, default=0, help="ignore events below this score")
+    p.add_argument("--dot", action="store_true", help="emit Graphviz DOT instead")
+    p.set_defaults(func=cmd_graph)
 
     p = sub.add_parser("shadow", help="proactive correlation over the last window (Phase 6)")
     p.add_argument("--window", type=int, default=None, help="hours to review (default 24)")

@@ -594,6 +594,67 @@ Ollama renames a field.
 
 ---
 
+### 12. Blast radius: the answer is a shape, not a row count
+
+A table answers "what happened". It answers "how far did it get?" badly, because
+that answer is *structural*: one address fanning out to many accounts looks
+nothing like many addresses converging on one, and neither looks like a chain
+running source → account → root → file. Those are horizontal brute force, a
+targeted credential attack, and a completed kill chain — three different
+incidents that produce near-identical log tables.
+
+So the graph names shapes rather than just drawing them:
+
+| Shape | Structure | Claim |
+|---|---|---|
+| **star** | one source → many accounts | horizontal brute force / spraying |
+| **funnel** | many sources → one account | that account was *chosen* |
+| **chain** | source → account → escalation → file | a completed access path |
+| **bridge** | one account, several successful origins | pivot or leaked credential |
+
+On the demo intrusion it reports a `star` (6 accounts, 2 succeeded) and a `chain`
+— `203.0.113.45 → arron → root → /etc/wodahs`.
+
+**Two constraints separate a usable number from a scary one.** Both were found by
+running it, not by reasoning about it:
+
+*Only access-granting edges extend the radius.* Following failed logins would
+count every account the attacker *tried* as compromised. On the demo that is 9
+entities reached versus 16 touched.
+
+*Traversal respects causality.* Without it, reachability walks backwards through
+history: the attacker escalates to `root`, `root` ran a cron job last Tuesday, and
+the report claims the attacker touched `/usr/bin/certbot`. Shared high-traffic
+nodes like `root` make this the norm, not an edge case, and it is why naive attack
+graphs over-report so badly. An edge is only traversable if it last occurred
+*after* the attacker arrived at its source — and arrival uses the edge's
+*earliest* valid occurrence, because using the latest over-constrains every
+onward hop and silently truncates the radius.
+
+**Why not NetworkX.** What is needed here is adjacency, BFS, degree and connected
+components — about eighty lines over graphs of a few hundred nodes. NetworkX's
+value is its algorithm catalogue; importing it to run a breadth-first search would
+put a dependency in the one place that has none. So it is an **export target**
+instead: `to_networkx()` when the package is present, plus `to_dot()` for
+Graphviz, Gephi or Cytoscape. The engine stays dependency-free; the analyst keeps
+the toolbox.
+
+```bash
+python -m sentinel graph --seed source_ip:203.0.113.45 --hops 4
+curl -s localhost:8000/api/graph.dot | dot -Tsvg > attack.svg
+```
+
+**The rendering encodes entity kind by shape, not colour.** A node-link diagram is
+an all-pairs context — any two kinds can end up adjacent — where the palette
+documents a three-slot categorical cap, so five colour-coded kinds could not clear
+the separation floors. Shape has no such limit, survives greyscale and CVD, and
+frees colour to carry the one thing that matters: blue for inside the blast
+radius, red for critical, grey for neither. Layout is layered left-to-right in
+attack order rather than force-directed, so the same incident renders identically
+every time and its shape becomes something an operator can learn.
+
+---
+
 <a name="performance"></a>
 ## 📊 Performance
 
@@ -646,7 +707,7 @@ Measured, not asserted: a 4 MiB single log line is consumed in full
 (`bytes_read=4194387`) at **5.9 MB peak RSS** with `-max-line 1024`, and
 `-follow` survives a rename-and-create logrotate cycle without losing an event.
 
-**Python:** 322 tests covering language detection on ASCII-heavy Japanese,
+**Python:** 360 tests covering language detection on ASCII-heavy Japanese,
 script-aware chunking, the hashing embedder's persistence-safe determinism,
 storage, the bilingual retrieval floor, pseudonymisation round-trips, every
 analyst guard rail, every response guard rail, and the full HTTP surface.
@@ -674,9 +735,9 @@ quietly rotted, and that is worth failing a build over.
 - [x] **Phase 7: Air-gap mode** — Ollama and OpenAI-compatible (vLLM,
       llama.cpp, LM Studio) local inference over the standard library, with cloud
       escalation opt-in and named rather than automatic.
-- [ ] **Phase 8: Blast-radius graphing** — NetworkX graph over IPs, users, and
-      files, so lateral movement is visible as shape: one IP fanning out to many
-      users is a star, credential reuse across hosts is a bridge.
+- [x] **Phase 8: Blast-radius graphing** — typed entity graph with named shape
+      detection (star / funnel / chain / bridge) and a causality-respecting blast
+      radius. `python -m sentinel graph`.
 - [ ] **Phase 9** — Multi-host aggregation over mTLS
 - [ ] **Phase 10** — Sigma rule import, so the detection set is not hand-maintained
 

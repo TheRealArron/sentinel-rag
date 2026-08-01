@@ -46,3 +46,4 @@ htmlcov/
 .idea/
 *.swp
 .DS_Store
+attack.svg

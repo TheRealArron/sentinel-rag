@@ -117,6 +117,8 @@ class Router:
             ("POST", "/api/search"): Router.search,
             ("POST", "/api/analyze"): Router.analyze,
             ("POST", "/api/index"): Router.index,
+            ("GET", "/api/graph"): Router.graph,
+            ("GET", "/api/graph.dot"): Router.graph_dot,
             ("GET", "/api/shadow"): Router.shadow_latest,
             ("POST", "/api/shadow/run"): Router.shadow_run,
             ("GET", "/api/response/status"): Router.response_status,
@@ -262,6 +264,26 @@ class Router:
         rebuild = bool(request.body.get("rebuild")) or request.q_bool("rebuild")
         stats = self.engine.index_all(rebuild=rebuild)
         return Response(200, {"rebuild": rebuild, **stats.to_dict(), "index": self.engine.indexer.stats()})
+
+    def graph(self, request: Request) -> Response:
+        """Entity graph, shapes, and optionally a blast radius from a seed."""
+        graph = self.engine.attack_graph(
+            limit=max(1, min(request.q_int("limit", 2000), 20000)),
+            min_score=request.q_int("min_score", 0),
+        )
+        seed = request.q("seed")
+        if seed and seed not in graph.nodes:
+            raise BadRequest(
+                f"unknown seed {seed!r}; expected an id like 'source_ip:203.0.113.45' "
+                f"(see the 'nodes' array)"
+            )
+        return Response(200, graph.to_dict(seed=seed, max_hops=max(1, min(request.q_int("hops", 3), 8))))
+
+    def graph_dot(self, request: Request) -> Response:
+        """Graphviz DOT, for `curl … | dot -Tsvg > attack.svg`."""
+        graph = self.engine.attack_graph(min_score=request.q_int("min_score", 0))
+        return Response(200, content_type="text/vnd.graphviz; charset=utf-8",
+                        body_text=graph.to_dot())
 
     def shadow_latest(self, request: Request) -> Response:
         """The most recent report, read from disk. Cheap: never runs a search.

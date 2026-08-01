@@ -347,6 +347,18 @@ class SentinelEngine:
         data["never_run"] = False
         return data
 
+    def attack_graph(self, limit: int = 5000, min_score: int = 0):
+        """Build the entity graph from the buffered events.
+
+        Rebuilt per request rather than cached: it is O(events) over a bounded
+        buffer, and a stale graph on a security dashboard is worse than a slightly
+        slower one.
+        """
+        from .graph import build_graph
+
+        self.events.refresh()
+        return build_graph(self.events.query(limit=limit, min_score=min_score))
+
     def index_all(self, rebuild: bool = False) -> IndexStats:
         if rebuild:
             return self.indexer.rebuild()

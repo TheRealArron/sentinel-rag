@@ -211,6 +211,43 @@ td.rule { font-family: var(--mono); font-size: 11.5px; white-space: nowrap; }
 }
 .score { font-variant-numeric: tabular-nums; font-weight: 600; }
 
+/* --- attack graph -------------------------------------------------------
+   Entity KIND is encoded by node SHAPE, not colour. A node-link diagram is an
+   all-pairs context (any two kinds can end up adjacent), where the palette
+   documents a three-slot categorical cap — five colour-coded kinds could not
+   clear the separation floors. Shape has no such limit, survives greyscale and
+   print, and every node is labelled anyway.
+
+   Colour is therefore left free to carry one thing: reachability. Blue = inside
+   the blast radius, red = critical severity, grey = neither. Those three clear
+   the all-pairs CVD and normal-vision floors (the grey is deliberately
+   achromatic — it is the "unremarkable" role, not a category). */
+.graph-wrap { overflow-x: auto; background: var(--surface-2); border-radius: var(--radius); padding: 8px 0; }
+.graph-svg { display: block; min-width: 720px; }
+.graph-svg .edge { fill: none; stroke: var(--baseline); stroke-width: 1.5; }
+.graph-svg .edge.grants { stroke: var(--text-muted); stroke-width: 2; }
+.graph-svg .edge.in-radius { stroke: var(--series-1); stroke-width: 2.5; }
+.graph-svg .node { stroke: var(--surface-2); stroke-width: 2; fill: var(--text-muted); }
+.graph-svg .node.in-radius { fill: var(--series-1); }
+.graph-svg .node.critical { fill: var(--sev-critical); }
+.graph-svg .node.seed { stroke: var(--text-primary); stroke-width: 3; }
+.graph-svg .node-label { font-family: var(--mono); font-size: 10.5px; fill: var(--text-secondary); }
+.graph-svg .col-label {
+  font-family: var(--sans); font-size: 10px; fill: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.graph-svg g.node-group { cursor: pointer; }
+.graph-svg g.node-group:hover .node-label { fill: var(--text-primary); }
+.shape-card {
+  border-left: 3px solid var(--baseline); padding: 8px 0 8px 12px; margin-bottom: 10px;
+}
+.shape-card.critical { border-left-color: var(--sev-critical); }
+.shape-card .name {
+  font-size: 11px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase;
+  color: var(--text-primary);
+}
+.shape-card .desc { font-size: 12.5px; color: var(--text-secondary); margin-top: 3px; }
+
 /* --- alert panel -------------------------------------------------------- */
 .alert-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 12px; }
 .alert-title { font-size: 16px; font-weight: 650; margin: 0; flex: 1 1 260px; min-width: 0; }
@@ -315,6 +352,19 @@ td.rule { font-family: var(--mono); font-size: 11.5px; white-space: nowrap; }
     <button type="button" id="askBtn" data-i18n="ask"></button>
   </div>
   <div id="alertPanel"><div class="empty" data-i18n="noAlert"></div></div>
+</section>
+
+<section class="card" style="margin-bottom:16px">
+  <div class="head">
+    <h2 data-i18n="graphTitle"></h2>
+    <span class="note" id="graphNote"></span>
+  </div>
+  <div class="filters">
+    <button type="button" id="graphResetBtn" data-i18n="graphReset"></button>
+    <span class="muted" style="font-size:12px" data-i18n="graphHint"></span>
+  </div>
+  <div class="graph-wrap"><svg id="graphSvg" class="graph-svg" role="img"></svg></div>
+  <div id="graphShapes" style="margin-top:14px"></div>
 </section>
 
 <section class="card" style="margin-bottom:16px">
@@ -425,7 +475,18 @@ const I18N = {
   baselineLabel: { en: "baseline", ja: "ベースライン" },
   novel: { en: "never seen before", ja: "初出現" },
   rare: { en: "rare", ja: "まれ" },
-  spike: { en: "rate spike", ja: "急増" }
+  spike: { en: "rate spike", ja: "急増" },
+  graphTitle: { en: "Attack paths & blast radius", ja: "攻撃経路と影響範囲" },
+  graphReset: { en: "Clear focus", ja: "選択を解除" },
+  graphHint: { en: "Click an entity to trace what it reached", ja: "エンティティをクリックすると到達範囲を表示" },
+  graphEmpty: { en: "No entity relationships in the current events.", ja: "現在のイベントに関連はありません。" },
+  reached: { en: "reached", ja: "到達" },
+  entities: { en: "entities", ja: "エンティティ" },
+  source_ip: { en: "source", ja: "送信元" },
+  userKind: { en: "account", ja: "アカウント" },
+  hostKind: { en: "host", ja: "ホスト" },
+  processKind: { en: "process", ja: "プロセス" },
+  fileKind: { en: "file", ja: "ファイル" }
 };
 
 const SEVERITIES = ["critical", "high", "warning", "notice", "info"];
@@ -716,6 +777,127 @@ async function runAnalysis(payload) {
   }
 }
 
+/* --- attack graph ------------------------------------------------------- */
+const KIND_LABEL_KEY = { source_ip: "source_ip", user: "userKind", host: "hostKind",
+                         process: "processKind", file: "fileKind" };
+let graphSeed = "";
+
+// Shape per entity kind. Encoding kind by shape rather than colour keeps the
+// diagram readable in greyscale, under CVD, and past the three-colour cap that
+// an all-pairs context imposes.
+function nodeShape(kind, x, y, r, cls) {
+  const c = ` class="${cls}"`;
+  switch (kind) {
+    case "source_ip":  // circle
+      return `<circle${c} cx="${x}" cy="${y}" r="${r}"/>`;
+    case "user":       // square
+      return `<rect${c} x="${x - r}" y="${y - r}" width="${2 * r}" height="${2 * r}" rx="2"/>`;
+    case "host":       // diamond
+      return `<polygon${c} points="${x},${y - r - 1} ${x + r + 1},${y} ${x},${y + r + 1} ${x - r - 1},${y}"/>`;
+    case "process":    // hexagon
+      return `<polygon${c} points="${x - r},${y - r / 2} ${x},${y - r} ${x + r},${y - r / 2} ${x + r},${y + r / 2} ${x},${y + r} ${x - r},${y + r / 2}"/>`;
+    default:           // file: tag
+      return `<polygon${c} points="${x - r},${y - r} ${x + r * 0.5},${y - r} ${x + r},${y} ${x + r * 0.5},${y + r} ${x - r},${y + r}"/>`;
+  }
+}
+
+function renderGraph(data) {
+  const svg = $("graphSvg");
+  const nodes = data.nodes || [];
+  const edges = data.edges || [];
+  $("graphNote").textContent = data.blast_radius
+    ? `${data.blast_radius.reached} ${t("entities")} ${t("reached")}`
+    : `${(data.stats || {}).nodes || 0} ${t("entities")}`;
+
+  if (!nodes.length) {
+    svg.innerHTML = "";
+    svg.setAttribute("height", "60");
+    $("graphShapes").innerHTML = `<div class="empty">${esc(t("graphEmpty"))}</div>`;
+    return;
+  }
+
+  const kinds = data.kind_order || ["source_ip", "user", "host", "process", "file"];
+  const columns = kinds.map((k) => nodes.filter((n) => n.kind === k)).filter((c) => c.length);
+  const usedKinds = kinds.filter((k) => nodes.some((n) => n.kind === k));
+
+  const colW = 190, rowH = 30, padTop = 34, padBottom = 14;
+  const tallest = Math.max.apply(null, columns.map((c) => c.length));
+  const width = Math.max(columns.length * colW, 720);
+  const height = padTop + tallest * rowH + padBottom;
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("height", String(height));
+  svg.setAttribute("aria-label", `Attack graph: ${nodes.length} entities, ${edges.length} relationships`);
+
+  // Deterministic positions: column by kind, row by descending activity. The
+  // same incident therefore renders identically every time, so its shape is
+  // something an operator can learn.
+  const pos = {};
+  columns.forEach((col, ci) => {
+    col.slice().sort((a, b) => b.events - a.events || a.label.localeCompare(b.label))
+       .forEach((n, ri) => {
+         pos[n.id] = { x: ci * colW + 48, y: padTop + ri * rowH + 12 };
+       });
+  });
+
+  let out = "";
+  usedKinds.forEach((k, ci) => {
+    out += `<text class="col-label" x="${ci * colW + 30}" y="16">${esc(t(KIND_LABEL_KEY[k] || k))}</text>`;
+  });
+
+  edges.forEach((e) => {
+    const a = pos[e.src], b = pos[e.dst];
+    if (!a || !b) return;
+    const inRadius = data.blast_radius &&
+      nodes.some((n) => n.id === e.src && n.hops != null) &&
+      nodes.some((n) => n.id === e.dst && n.hops != null);
+    const mx = (a.x + b.x) / 2;
+    const cls = "edge" + (e.grants_access ? " grants" : "") + (inRadius ? " in-radius" : "");
+    const dash = e.grants_access ? "" : ' stroke-dasharray="4 3"';
+    out += `<path class="${cls}"${dash} d="M${a.x + 9},${a.y} C${mx},${a.y} ${mx},${b.y} ${b.x - 9},${b.y}">` +
+           `<title>${esc(`${e.kind} ×${e.count}`)}</title></path>`;
+  });
+
+  nodes.forEach((n) => {
+    const p = pos[n.id];
+    if (!p) return;
+    const inRadius = n.hops != null && n.hops > 0;
+    const isSeed = n.id === data.seed;
+    const critical = n.peak_severity === "critical";
+    const cls = "node" + (isSeed ? " seed" : "") +
+                (critical ? " critical" : inRadius ? " in-radius" : "");
+    const r = Math.min(10, 5 + Math.log2(1 + n.events) * 1.6);
+    const canary = (n.tags || []).indexOf("honeytoken") >= 0 ? " ⚑" : "";
+    const label = (n.label.length > 20 ? n.label.slice(0, 19) + "…" : n.label) + canary;
+    out += `<g class="node-group" data-id="${esc(n.id)}" tabindex="0">` +
+           nodeShape(n.kind, p.x, p.y, r, cls) +
+           `<title>${esc(`${n.kind} ${n.label} — ${n.events} events, peak ${n.peak_severity}` +
+                          (n.hops != null ? `, ${n.hops} hop(s) from focus` : ""))}</title>` +
+           `<text class="node-label" x="${p.x + 14}" y="${p.y + 3.5}">${esc(label)}</text></g>`;
+  });
+  svg.innerHTML = out;
+
+  svg.querySelectorAll("g.node-group").forEach((g) => {
+    g.addEventListener("click", () => { graphSeed = g.dataset.id; loadGraph(); });
+  });
+
+  const shapes = data.shapes || [];
+  $("graphShapes").innerHTML = shapes.length
+    ? shapes.map((sh) => `<div class="shape-card ${sh.severity === "critical" ? "critical" : ""}">
+        <div class="name">${esc(sh.name)} · ${esc(sevLabel(sh.severity))}</div>
+        <div class="desc">${esc(lang === "ja" ? sh.description.ja : sh.description.en)}</div>
+      </div>`).join("")
+    : "";
+}
+
+async function loadGraph() {
+  try {
+    const q = graphSeed ? `?seed=${encodeURIComponent(graphSeed)}&hops=4` : "";
+    renderGraph(await api("/api/graph" + q));
+  } catch (err) {
+    $("graphShapes").innerHTML = `<div class="notice err">${esc(err.message)}</div>`;
+  }
+}
+
 /* --- shadow search ------------------------------------------------------ */
 const KIND_LABEL = { novel: "novel", rare: "rare", spike: "spike" };
 
@@ -825,6 +1007,7 @@ async function refresh() {
     renderFeed(lastEvents);
     setLive((stats.events || {}).events > 0 ? "ok" : "stale");
     loadShadow();
+    loadGraph();
   } catch (err) {
     setLive("down");
     $("feedNote").textContent = `${t("requestFailed")}: ${err.message}`;
@@ -864,6 +1047,7 @@ $("themeBtn").addEventListener("click", () => {
 });
 $("refreshBtn").addEventListener("click", refresh);
 $("shadowBtn").addEventListener("click", runShadow);
+$("graphResetBtn").addEventListener("click", () => { graphSeed = ""; loadGraph(); });
 $("triageBtn").addEventListener("click", () => runAnalysis({ triage: true, limit: 25, min_score: 60 }));
 $("analyzeSelectedBtn").addEventListener("click", () => runAnalysis({ event_ids: Array.from(selected) }));
 $("askBtn").addEventListener("click", () => {

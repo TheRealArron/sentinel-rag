@@ -119,6 +119,15 @@ analyze: ## Triage the most severe recent events
 local-check: ## Preflight the local inference server (Phase 7)
 	$(PYTHON) -m sentinel warm --json
 
+.PHONY: graph
+graph: ## Attack-path graph and structural findings (Phase 8)
+	$(PYTHON) -m sentinel graph
+
+.PHONY: graph-svg
+graph-svg: ## Render the attack graph to attack.svg (needs graphviz)
+	$(PYTHON) -m sentinel graph --dot | dot -Tsvg > attack.svg
+	@echo "wrote attack.svg"
+
 .PHONY: shadow
 shadow: ## Run Shadow Search over the last 24h (Phase 6)
 	$(PYTHON) -m sentinel shadow
@@ -193,7 +202,7 @@ docker-build: ## Build both images without starting them
 clean: ## Remove build output and generated data (keeps the corpus)
 	rm -rf ingestor/bin ingestor/coverage.out
 	rm -rf data/index data/chroma data/models
-	rm -f data/events.jsonl data/audit.log data/baseline.log data/full.log
+	rm -f data/events.jsonl data/audit.log data/baseline.log data/full.log attack.svg
 	find . -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .pytest_cache -prune -exec rm -rf {} + 2>/dev/null || true
 	@echo "cleaned"
