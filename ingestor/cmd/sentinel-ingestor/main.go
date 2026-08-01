@@ -61,7 +61,7 @@ func run() error {
 		bfThresh   = flag.Int("brute-threshold", 5, "auth failures from one source that trigger a brute-force incident")
 		bfWindow   = flag.Duration("brute-window", time.Minute, "sliding window for the brute-force threshold")
 		bfCooldown = flag.Duration("brute-cooldown", 5*time.Minute, "minimum gap between repeat incidents for one source")
-		honeyPath  = flag.String("honeytokens", defaultHoneytokenPath, "canary username/path config (JSON); see config/honeytokens.json")
+		honeyPath  = flag.String("honeytokens", defaultHoneytokenPath, "canary config (JSON), resolved relative to the working directory")
 		honeyCheck = flag.String("honeytokens-verify", "", "verify canaries against a passwd file (use /etc/passwd, on the host) and exit")
 		stats      = flag.Bool("stats", false, "print a run summary to stderr as JSON")
 		showVer    = flag.Bool("version", false, "print version and exit")
@@ -194,7 +194,11 @@ func openOutput(path string) (io.Writer, func(), error) {
 	return f, func() { _ = f.Close() }, nil
 }
 
-// defaultHoneytokenPath is looked for relative to the working directory. When the
+// defaultHoneytokenPath is resolved relative to the WORKING DIRECTORY, not the
+// binary. Running from anywhere other than the repo root will not find it, which
+// is why deployments should name the file explicitly with an absolute path —
+// see config/README.md and the compose file, both of which do.
+// When the
 // flag is left at this default and the file is absent, deception detection is
 // simply off — a fresh clone should not fail to start over an optional feature.
 // When the flag is set explicitly and the file is missing, that is an error: the

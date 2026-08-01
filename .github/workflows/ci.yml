@@ -61,7 +61,15 @@ jobs:
           # committed fixture regardless of where it runs.
           TZ: UTC
         run: |
-          /tmp/sentinel-ingestor -in ../data/samples/sample_syslog.log -out /tmp/events.jsonl -stats
+          # -honeytokens is named explicitly, not left at its default. The default
+          # is resolved relative to the working directory, which is `ingestor/`
+          # here, so the repo-root config would not be found and the canaries would
+          # be silently unarmed. Naming it also models the production contract: an
+          # explicitly-named file that is missing is a hard error, so a broken
+          # canary config fails the build instead of quietly disarming.
+          /tmp/sentinel-ingestor -honeytokens=../config/honeytokens.json \
+            -in ../data/samples/sample_syslog.log -out /tmp/events.jsonl -stats 2>/tmp/stats.txt
+          cat /tmp/stats.txt
           lines=$(wc -l < /tmp/events.jsonl)
           echo "emitted $lines events"
           # 23 parsed lines + 2 correlated incidents
@@ -69,8 +77,14 @@ jobs:
           grep -q correlated_brute_force /tmp/events.jsonl || { echo "::error::brute-force incident missing"; exit 1; }
           grep -q correlated_successful_login_after_bruteforce /tmp/events.jsonl || { echo "::error::compromise incident missing"; exit 1; }
           # Phase 5: the canary lines must produce exactly two score-100 events.
+          # This assertion is why the -honeytokens flag above is explicit: with the
+          # default path it silently found nothing and this caught it.
           honey=$(grep -c honeytoken_referenced /tmp/events.jsonl || true)
           [ "$honey" -eq 2 ] || { echo "::error::expected 2 honeytoken hits, got $honey"; exit 1; }
+          # And the canaries must actually be armed, not merely absent from the log.
+          # jq, not grep: -stats pretty-prints, so there is a space after the colon.
+          armed=$(jq -r '.honeytokens_armed' /tmp/stats.txt)
+          [ "${armed:-0}" -ge 5 ] || { echo "::error::honeytokens not armed (armed=${armed:-0})"; exit 1; }
 
       - name: Committed fixture matches the ingestor
         # data/samples/events.sample.jsonl is the Python suite's fixture and the
