@@ -338,6 +338,20 @@ def cmd_serve(args, engine: SentinelEngine, printer: Printer) -> int:
     return 0
 
 
+def cmd_hub(args, engine: SentinelEngine, printer: Printer) -> int:
+    from .hub import serve_hub
+
+    settings = engine.settings
+    if args.cert:
+        settings = __import__("dataclasses").replace(
+            settings, hub_cert=args.cert, hub_key=args.key, hub_ca=args.ca,
+            hub_port=args.port or settings.hub_port,
+            hub_revocation_list=args.revocation or settings.hub_revocation_list,
+        )
+    serve_hub(settings)
+    return 0
+
+
 def cmd_stats(args, engine: SentinelEngine, printer: Printer) -> int:
     stats = engine.stats()
     if args.json:
@@ -513,6 +527,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=0)
     p.add_argument("--stdlib", action="store_true", help="force the dependency-free server")
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("hub", help="run the mTLS fleet hub for remote probes (Phase 9)")
+    p.add_argument("--cert", default="", help="hub server certificate")
+    p.add_argument("--key", default="", help="hub server private key")
+    p.add_argument("--ca", default="", help="CA that signed the probe certificates")
+    p.add_argument("--revocation", default="", help="revocation list JSON (hot-reloaded)")
+    p.add_argument("--port", type=int, default=0)
+    p.set_defaults(func=cmd_hub)
 
     p = sub.add_parser("stats", help="show event, index and response statistics")
     p.set_defaults(func=cmd_stats)

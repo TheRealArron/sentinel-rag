@@ -68,3 +68,35 @@ type Discard struct{ N int64 }
 
 func (d *Discard) Write(*event.Event) error { d.N++; return nil }
 func (d *Discard) Flush() error             { return nil }
+
+// tee fans one event out to several sinks.
+type tee struct{ sinks []Sink }
+
+// Tee writes every event to all sinks. Used to keep a local JSONL copy while
+// also shipping to a remote hub: a probe that only ships has no record of last
+// resort if the hub is down and the spool overflows.
+//
+// A failure in any sink is reported, but the remaining sinks still receive the
+// event — losing the local copy because the network is down would invert the
+// point of having both.
+func Tee(sinks ...Sink) Sink { return &tee{sinks: sinks} }
+
+func (t *tee) Write(ev *event.Event) error {
+	var firstErr error
+	for _, s := range t.sinks {
+		if err := s.Write(ev); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (t *tee) Flush() error {
+	var firstErr error
+	for _, s := range t.sinks {
+		if err := s.Flush(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}

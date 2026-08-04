@@ -2,6 +2,11 @@
 .env
 *.pem
 *.key
+*.crt
+*.csr
+# The private CA. Contains the root key that signs every probe identity in the
+# fleet; committing it would hand an attacker the ability to mint a trusted probe.
+pki/
 
 # The original project brief. Kept locally; it is working notes, not a
 # deliverable. Delete this line if you want it published.

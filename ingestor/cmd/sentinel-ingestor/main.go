@@ -28,6 +28,7 @@ import (
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/correlate"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/honeytoken"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/pipeline"
+	"github.com/TheRealArron/sentinel-rag/ingestor/internal/ship"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sink"
 )
 
@@ -49,22 +50,29 @@ func main() {
 
 func run() error {
 	var (
-		in         = flag.String("in", "-", `input log file, or "-" for stdin`)
-		out        = flag.String("out", "-", `output JSONL file, or "-" for stdout`)
-		workers    = flag.Int("workers", runtime.NumCPU(), "parser worker goroutines")
-		minScore   = flag.Int("min-score", 0, "drop events scoring below this (0-100)")
-		maxLine    = flag.Int("max-line", 8192, "maximum bytes kept per log line")
-		keepRaw    = flag.Bool("raw", false, "include the sanitised raw line on each event")
-		follow     = flag.Bool("follow", false, "keep reading as the file grows (tail -F)")
-		fromStart  = flag.Bool("from-start", false, "with -follow, start at the beginning of the file")
-		noCorr     = flag.Bool("no-correlate", false, "disable stateful incident correlation")
-		bfThresh   = flag.Int("brute-threshold", 5, "auth failures from one source that trigger a brute-force incident")
-		bfWindow   = flag.Duration("brute-window", time.Minute, "sliding window for the brute-force threshold")
-		bfCooldown = flag.Duration("brute-cooldown", 5*time.Minute, "minimum gap between repeat incidents for one source")
-		honeyPath  = flag.String("honeytokens", defaultHoneytokenPath, "canary config (JSON), resolved relative to the working directory")
-		honeyCheck = flag.String("honeytokens-verify", "", "verify canaries against a passwd file (use /etc/passwd, on the host) and exit")
-		stats      = flag.Bool("stats", false, "print a run summary to stderr as JSON")
-		showVer    = flag.Bool("version", false, "print version and exit")
+		in            = flag.String("in", "-", `input log file, or "-" for stdin`)
+		out           = flag.String("out", "-", `output JSONL file, or "-" for stdout`)
+		workers       = flag.Int("workers", runtime.NumCPU(), "parser worker goroutines")
+		minScore      = flag.Int("min-score", 0, "drop events scoring below this (0-100)")
+		maxLine       = flag.Int("max-line", 8192, "maximum bytes kept per log line")
+		keepRaw       = flag.Bool("raw", false, "include the sanitised raw line on each event")
+		follow        = flag.Bool("follow", false, "keep reading as the file grows (tail -F)")
+		fromStart     = flag.Bool("from-start", false, "with -follow, start at the beginning of the file")
+		noCorr        = flag.Bool("no-correlate", false, "disable stateful incident correlation")
+		bfThresh      = flag.Int("brute-threshold", 5, "auth failures from one source that trigger a brute-force incident")
+		bfWindow      = flag.Duration("brute-window", time.Minute, "sliding window for the brute-force threshold")
+		bfCooldown    = flag.Duration("brute-cooldown", 5*time.Minute, "minimum gap between repeat incidents for one source")
+		honeyPath     = flag.String("honeytokens", defaultHoneytokenPath, "canary config (JSON), resolved relative to the working directory")
+		honeyCheck    = flag.String("honeytokens-verify", "", "verify canaries against a passwd file (use /etc/passwd, on the host) and exit")
+		remote        = flag.String("remote", "", "ship events to a Sentinel hub over mTLS, e.g. https://hub.lan:8443")
+		remoteCert    = flag.String("remote-cert", "", "client certificate (this probe's identity)")
+		remoteKey     = flag.String("remote-key", "", "client private key")
+		remoteCA      = flag.String("remote-ca", "", "CA that signed the hub's certificate")
+		remoteName    = flag.String("remote-server-name", "", "override the expected hub certificate name")
+		remoteSpool   = flag.String("remote-spool", "", "directory to buffer events in while the hub is unreachable")
+		remoteSpoolMB = flag.Int("remote-spool-mb", 256, "spool size cap in MiB; oldest batches are dropped past it")
+		stats         = flag.Bool("stats", false, "print a run summary to stderr as JSON")
+		showVer       = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
 
@@ -111,6 +119,32 @@ func run() error {
 
 	js := sink.NewJSONL(writer)
 
+	// Remote shipping composes with the local sink rather than replacing it: a
+	// probe that only ships has no local copy, so a hub outage plus a spool
+	// overflow would be silent total loss. Keeping both means the local file
+	// remains the record of last resort.
+	var dest sink.Sink = js
+	var shipper *ship.Shipper
+	if *remote != "" {
+		shipper, err = ship.New(ship.Config{
+			URL:        *remote,
+			CertFile:   *remoteCert,
+			KeyFile:    *remoteKey,
+			CAFile:     *remoteCA,
+			ServerName: *remoteName,
+			SpoolDir:   *remoteSpool,
+			SpoolMaxMB: *remoteSpoolMB,
+		})
+		if err != nil {
+			return fmt.Errorf("remote shipping: %w", err)
+		}
+		defer func() { _ = shipper.Close() }()
+		dest = sink.Tee(js, shipper)
+		if !*stats {
+			fmt.Fprintf(os.Stderr, "sentinel-ingestor: shipping to %s (mTLS)\n", *remote)
+		}
+	}
+
 	// In follow mode the consumer wants events as they happen, not when a 256 KiB
 	// buffer fills, so flush on a ticker.
 	if *follow {
@@ -132,7 +166,7 @@ func run() error {
 		}()
 	}
 
-	st, runErr := pipeline.Run(ctx, reader, js, pipeline.Options{
+	st, runErr := pipeline.Run(ctx, reader, dest, pipeline.Options{
 		Workers:            *workers,
 		MaxLineLen:         *maxLine,
 		MinScore:           *minScore,
@@ -147,15 +181,24 @@ func run() error {
 	})
 
 	if *stats {
+		var shipStats *ship.Stats
+		var shipErr string
+		if shipper != nil {
+			_ = shipper.Flush()
+			s := shipper.Stats()
+			shipStats, shipErr = &s, shipper.LastError()
+		}
 		enc := json.NewEncoder(os.Stderr)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(struct {
 			pipeline.Stats
-			Version          string `json:"version"`
-			Workers          int    `json:"workers"`
-			HoneytokensArmed int    `json:"honeytokens_armed"`
-			HoneytokensPath  string `json:"honeytokens_path,omitempty"`
-		}{st, version, *workers, tokens.Len(), tokens.Path()})
+			Version          string      `json:"version"`
+			Workers          int         `json:"workers"`
+			HoneytokensArmed int         `json:"honeytokens_armed"`
+			HoneytokensPath  string      `json:"honeytokens_path,omitempty"`
+			Remote           *ship.Stats `json:"remote,omitempty"`
+			RemoteError      string      `json:"remote_error,omitempty"`
+		}{st, version, *workers, tokens.Len(), tokens.Path(), shipStats, shipErr})
 	}
 	return runErr
 }

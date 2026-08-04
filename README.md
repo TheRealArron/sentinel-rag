@@ -655,6 +655,79 @@ every time and its shape becomes something an operator can learn.
 
 ---
 
+### 13. The fleet: mTLS, and what a certificate does not prove
+
+Phase 9 turns one machine into a fleet. Go probes ship NDJSON over mutually
+authenticated TLS to a Python hub; `scripts/sentinel-ca.sh` is the private CA.
+
+**Why HTTPS and not gRPC.** The mTLS work — the load-bearing part — is *identical*
+under both, because mTLS is a TLS-layer property and gRPC's mutual auth **is** TLS
+mutual auth. What differs is cost: grpc-go pulls ~40 transitive modules into the
+ingestor, whose dependency-freedom is a stated security property (it parses
+attacker-controlled input and ships `FROM scratch`; CI enforces the empty
+`go.mod`). That buys protobuf typing and HTTP/2 multiplexing, neither of which a
+single append-only line stream per probe uses. With `crypto/tls` on one side and
+`ssl` on the other, both halves stay standard library — and NDJSON over chunked
+HTTP/1.1 is what Vector, Fluent Bit and the Elastic Beats already do. gRPC earns
+its keep when schemas evolve across team boundaries; that is real, just not this.
+
+**The gap mTLS leaves.** It proves *a* probe holding a CA-signed key is connected.
+It does **not** prove which host the logs describe. Without binding the two, a
+compromised probe-04 can file clean logs as probe-07 and hide inside the fleet.
+So the hub overwrites every event's `host` with the certificate's Common Name.
+
+Running it showed the first version of that was wrong. Rejecting mismatches
+dropped 100% of a probe's telemetry when its syslog hostname differed from its
+cert — which hands an attacker a way to *silence* a probe by changing a hostname.
+The claim is now **neutralised, not obeyed**: `host` becomes the authenticated CN,
+the original is kept as `_claimed_host`, and the mismatch is counted and surfaced.
+You cannot be lied to, and you cannot be made to go blind.
+
+| Attack | Result |
+|---|---|
+| No client certificate | `tlsv13 alert certificate required` — handshake |
+| Certificate from another CA | `tlsv1 alert unknown ca` — handshake |
+| Impostor hub | probe refuses: `failed to verify certificate: x509` |
+| Valid cert, forged `host` | accepted, but rewritten to the real identity |
+| Revoked probe | `403 certificate for 'probe-04' is revoked` |
+
+**Revocation — the question this phase was really about.** If probe-04 is stolen,
+how do you stop trusting it *without reissuing the fleet?*
+
+Not OCSP: a per-connection network call makes the responder a hard dependency,
+and when it is down you choose between failing open (accepting revoked probes
+exactly when something is wrong) or failing closed (a total telemetry blackout).
+Not a signed CRL either: a CRL is signed so it can cross an untrusted channel,
+but this list lives on the machine that enforces it — an attacker who can edit it
+already owns the hub, so the signature guards nothing while requiring the CA key
+online to add one line.
+
+Instead: a JSON deny list keyed on certificate fingerprint, re-read when its
+mtime changes. `sentinel-ca.sh revoke probe-04` is one file write — immediate, no
+restart, no CA key, and **no other certificate touched**. It pairs with 90-day
+client certificates so the list only covers the window between theft and expiry
+and stays bounded. A malformed list keeps the previous entries rather than
+failing open.
+
+**The probe does not lose logs when the hub is down.** Events go to a bounded
+on-disk spool and replay oldest-first on reconnect — the moment the network
+breaks is exactly the moment worth recording, and an attacker who can reach the
+host can arrange for it to break. The spool is capped, because an unbounded one
+turns a hub outage into a full disk.
+
+```bash
+./scripts/sentinel-ca.sh init
+./scripts/sentinel-ca.sh server sentinel-hub.lan 192.168.1.42
+./scripts/sentinel-ca.sh client probe-01
+python -m sentinel hub                      # on the hub
+sentinel-ingestor -in /var/log/auth.log -follow \
+  -remote https://sentinel-hub.lan:8443 \
+  -remote-cert probe-01.crt -remote-key probe-01.key -remote-ca ca.crt \
+  -remote-spool /var/spool/sentinel         # on each probe
+```
+
+---
+
 <a name="performance"></a>
 ## 📊 Performance
 
@@ -707,7 +780,7 @@ Measured, not asserted: a 4 MiB single log line is consumed in full
 (`bytes_read=4194387`) at **5.9 MB peak RSS** with `-max-line 1024`, and
 `-follow` survives a rename-and-create logrotate cycle without losing an event.
 
-**Python:** 360 tests covering language detection on ASCII-heavy Japanese,
+**Python:** 388 tests covering language detection on ASCII-heavy Japanese,
 script-aware chunking, the hashing embedder's persistence-safe determinism,
 storage, the bilingual retrieval floor, pseudonymisation round-trips, every
 analyst guard rail, every response guard rail, and the full HTTP surface.
@@ -738,7 +811,9 @@ quietly rotted, and that is worth failing a build over.
 - [x] **Phase 8: Blast-radius graphing** — typed entity graph with named shape
       detection (star / funnel / chain / bridge) and a causality-respecting blast
       radius. `python -m sentinel graph`.
-- [ ] **Phase 9** — Multi-host aggregation over mTLS
+- [x] **Phase 9: Distributed Sentinel (mTLS)** — a private CA, Go probes
+      shipping over mutually authenticated TLS to a Python hub, certificate
+      identity pinned to log content, and hot-reloaded revocation.
 - [ ] **Phase 10** — Sigma rule import, so the detection set is not hand-maintained
 
 <details>

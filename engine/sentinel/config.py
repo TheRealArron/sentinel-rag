@@ -173,6 +173,32 @@ class Settings:
     )
     ufw_binary: str = field(default_factory=lambda: _env("SENTINEL_UFW_BINARY", "ufw"))
 
+    # --- fleet hub (Phase 9) ----------------------------------------------
+    # mTLS ingest from remote Go probes. Certificates come from scripts/sentinel-ca.sh.
+    # Binds all interfaces by design: a hub that only listens on loopback cannot
+    # receive from the fleet. Unlike the dashboard, this port is safe to expose —
+    # it refuses every connection that does not present a CA-signed client
+    # certificate, before any application data is read.
+    hub_host: str = field(default_factory=lambda: _env("SENTINEL_HUB_HOST", "0.0.0.0"))  # noqa: S104
+    hub_port: int = field(default_factory=lambda: _env_int("SENTINEL_HUB_PORT", 8443))
+    hub_cert: str = field(default_factory=lambda: _env("SENTINEL_HUB_CERT", ""))
+    hub_key: str = field(default_factory=lambda: _env("SENTINEL_HUB_KEY", ""))
+    hub_ca: str = field(default_factory=lambda: _env("SENTINEL_HUB_CA", ""))
+    # Hot-reloaded deny list of certificate fingerprints. Revoking one probe must
+    # not require reissuing the fleet.
+    hub_revocation_list: str = field(default_factory=lambda: _env("SENTINEL_HUB_REVOCATION_LIST", ""))
+    # Optional second gate: even a CA-signed certificate must be named here.
+    hub_allowed_probes: list[str] = field(default_factory=lambda: _env_list("SENTINEL_HUB_ALLOWED_PROBES", ""))
+    # Off by default, and it should stay off. Enabling it lets a probe declare
+    # which host its events describe, so any valid certificate becomes a licence
+    # to file logs about any machine in the fleet.
+    hub_trust_claimed_host: bool = field(default_factory=lambda: _env_bool("SENTINEL_HUB_TRUST_CLAIMED_HOST", False))
+    # Fail closed on a host/certificate disagreement instead of rewriting. Off by
+    # default: rejecting drops 100% of a probe's telemetry over a hostname
+    # change, which hands an attacker a way to silence a probe. Rewriting
+    # neutralises the claim without losing the event.
+    hub_reject_host_mismatch: bool = field(default_factory=lambda: _env_bool("SENTINEL_HUB_REJECT_HOST_MISMATCH", False))
+
     # --- API ---------------------------------------------------------------
     api_host: str = field(default_factory=lambda: _env("SENTINEL_API_HOST", "127.0.0.1"))
     api_port: int = field(default_factory=lambda: _env_int("SENTINEL_API_PORT", 8000))
@@ -240,6 +266,8 @@ class Settings:
             raise ValueError("SENTINEL_SHADOW_TOP_N must be positive")
         if self.shadow_min_surprise < 0:
             raise ValueError("SENTINEL_SHADOW_MIN_SURPRISE must not be negative")
+        if not 1 <= self.hub_port <= 65535:
+            raise ValueError(f"SENTINEL_HUB_PORT must be 1-65535, got {self.hub_port}")
         if self.top_k <= 0 or self.candidate_k <= 0:
             raise ValueError("top_k and candidate_k must be positive")
         if self.candidate_k < self.top_k:

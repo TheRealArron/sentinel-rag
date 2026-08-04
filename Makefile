@@ -119,6 +119,18 @@ analyze: ## Triage the most severe recent events
 local-check: ## Preflight the local inference server (Phase 7)
 	$(PYTHON) -m sentinel warm --json
 
+.PHONY: ca
+ca: ## Initialise the private CA and issue hub + probe certs (Phase 9)
+	./scripts/sentinel-ca.sh init
+	./scripts/sentinel-ca.sh server sentinel-hub.lan 127.0.0.1 localhost
+	./scripts/sentinel-ca.sh client probe-01
+	@echo
+	@./scripts/sentinel-ca.sh list
+
+.PHONY: hub
+hub: ## Run the mTLS fleet hub (needs `make ca` first)
+	$(PYTHON) -m sentinel hub 	  --cert pki/certs/sentinel-hub.lan.crt 	  --key pki/private/sentinel-hub.lan.key 	  --ca pki/ca.crt --revocation pki/revoked.json
+
 .PHONY: graph
 graph: ## Attack-path graph and structural findings (Phase 8)
 	$(PYTHON) -m sentinel graph
