@@ -1,0 +1,27 @@
+title: SSH Brute Force Against Multiple Accounts
+id: 7e1f8a3b-4c2d-4e9a-9f31-2b6c8d5a1e04
+status: experimental
+description: >
+  Repeated SSH password failures. Sentinel's correlator turns a burst of these
+  into an incident; this rule is the per-line half.
+references:
+  - https://attack.mitre.org/techniques/T1110/001/
+author: Sentinel RAG sample
+date: 2026/08/05
+logsource:
+  product: linux
+  service: sshd
+detection:
+  selection:
+    message|contains:
+      - 'Failed password for'
+      - 'Failed keyboard-interactive/pam for'
+  filter_internal:
+    message|contains: 'from 127.0.0.1'
+  condition: selection and not filter_internal
+falsepositives:
+  - A user who has genuinely forgotten their password
+level: medium
+tags:
+  - attack.credential_access
+  - attack.t1110.001

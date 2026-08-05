@@ -1,0 +1,143 @@
+{
+  "version": 1,
+  "generator": "sentinel sigma compile",
+  "rules": [
+    {
+      "name": "sigma_ssh_brute_force_against_multiple_accounts",
+      "title": "SSH Brute Force Against Multiple Accounts",
+      "category": "authentication",
+      "score": 55,
+      "outcome": "suspicious",
+      "mitre": [
+        "T1110.001"
+      ],
+      "tags": [
+        "credential-access",
+        "認証情報アクセス",
+        "password-guessing",
+        "パスワード推測",
+        "sigma",
+        "シグマ",
+        "authentication"
+      ],
+      "processes": [
+        "sshd"
+      ],
+      "source": "ssh-brute-force.yml",
+      "sigma_id": "7e1f8a3b-4c2d-4e9a-9f31-2b6c8d5a1e04",
+      "level": "medium",
+      "predicate": {
+        "op": "and",
+        "children": [
+          {
+            "op": "match",
+            "field": "message",
+            "match": "contains",
+            "values": [
+              "Failed password for",
+              "Failed keyboard-interactive/pam for"
+            ],
+            "cased": false
+          },
+          {
+            "op": "not",
+            "children": [
+              {
+                "op": "match",
+                "field": "message",
+                "match": "contains",
+                "values": [
+                  "from 127.0.0.1"
+                ],
+                "cased": false
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "sigma_ssh_authorized_keys_modified",
+      "title": "SSH Authorized Keys Modified",
+      "category": "persistence",
+      "score": 88,
+      "outcome": "suspicious",
+      "mitre": [
+        "T1098.004"
+      ],
+      "tags": [
+        "persistence",
+        "永続化",
+        "ssh-key-persistence",
+        "SSH鍵による永続化",
+        "sigma",
+        "シグマ",
+        "persistence"
+      ],
+      "processes": [],
+      "source": "ssh-key-persistence.yml",
+      "sigma_id": "9b4e1c77-2f83-4d16-b5a9-7c3e0d8f2a51",
+      "level": "critical",
+      "predicate": {
+        "op": "and",
+        "children": [
+          {
+            "op": "match",
+            "field": "command",
+            "match": "contains",
+            "values": [
+              "authorized_keys"
+            ],
+            "cased": false
+          },
+          {
+            "op": "match",
+            "field": "command",
+            "match": "contains",
+            "values": [
+              ">>",
+              "tee",
+              "echo"
+            ],
+            "cased": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "sigma_sudo_privilege_escalation_attempt_by_unauthorised_user",
+      "title": "Sudo Privilege Escalation Attempt By Unauthorised User",
+      "category": "privilege-escalation",
+      "score": 72,
+      "outcome": "suspicious",
+      "mitre": [
+        "T1548.003"
+      ],
+      "tags": [
+        "privilege-escalation",
+        "権限昇格",
+        "sudo-abuse",
+        "sudoの悪用",
+        "sigma",
+        "シグマ",
+        "privilege-escalation"
+      ],
+      "processes": [
+        "sudo"
+      ],
+      "source": "sudo-not-in-sudoers.yml",
+      "sigma_id": "3d9c2f18-6a7b-4e51-8c04-9f2e7b1a6d33",
+      "level": "high",
+      "predicate": {
+        "op": "match",
+        "field": "message",
+        "match": "contains",
+        "values": [
+          "user NOT in sudoers",
+          "incorrect password attempts"
+        ],
+        "cased": false
+      }
+    }
+  ]
+}

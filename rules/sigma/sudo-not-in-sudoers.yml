@@ -1,0 +1,16 @@
+title: Sudo Privilege Escalation Attempt By Unauthorised User
+id: 3d9c2f18-6a7b-4e51-8c04-9f2e7b1a6d33
+status: stable
+description: A user not present in sudoers attempted a privileged command.
+logsource:
+  product: linux
+  service: sudo
+detection:
+  keywords:
+    - 'user NOT in sudoers'
+    - 'incorrect password attempts'
+  condition: keywords
+level: high
+tags:
+  - attack.privilege_escalation
+  - attack.t1548.003

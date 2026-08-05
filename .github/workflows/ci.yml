@@ -54,6 +54,22 @@ jobs:
       - name: Build
         run: go build -trimpath -ldflags "-s -w" -o /tmp/sentinel-ingestor ./cmd/sentinel-ingestor
 
+      - name: Compile the Sigma rules
+        # Rebuilt from source rather than trusting the committed bundle, so a
+        # transpiler change that emits something Go cannot read fails here rather
+        # than in production. The result must match what is committed.
+        working-directory: .
+        run: |
+          # No PyYAML installed on purpose: the transpiler carries a fallback
+          # parser for the Sigma subset, and this is what keeps it honest.
+          cd engine && python3 -m sentinel sigma --rules ../rules/sigma --out /tmp/sigma.json
+          cd ..
+          if ! diff -u <(jq -S . rules/external/sigma.json) <(jq -S . /tmp/sigma.json); then
+            echo "::error::rules/external/sigma.json is stale — run 'make sigma' and commit"
+            exit 1
+          fi
+          mkdir -p /tmp/rules && cp /tmp/sigma.json /tmp/rules/
+
       - name: Smoke test against the sample log
         env:
           # RFC 3164 timestamps carry no timezone, so the ingestor reads them in
@@ -67,7 +83,10 @@ jobs:
           # be silently unarmed. Naming it also models the production contract: an
           # explicitly-named file that is missing is a hard error, so a broken
           # canary config fails the build instead of quietly disarming.
-          /tmp/sentinel-ingestor -honeytokens=../config/honeytokens.json \
+          # -sigma="" disables imported rules. The committed fixture describes a
+          # default install, so this step must not depend on them; Phase 11 gets
+          # its own step below.
+          /tmp/sentinel-ingestor -honeytokens=../config/honeytokens.json -sigma="" \
             -in ../data/samples/sample_syslog.log -out /tmp/events.jsonl -stats 2>/tmp/stats.txt
           cat /tmp/stats.txt
           lines=$(wc -l < /tmp/events.jsonl)
@@ -100,6 +119,30 @@ jobs:
             exit 1
           fi
           echo "fixture matches the ingestor"
+
+      - name: Imported Sigma rules fire end to end
+        env:
+          TZ: UTC
+        run: |
+          /tmp/sentinel-ingestor -honeytokens=../config/honeytokens.json \
+            -sigma=/tmp/rules \
+            -in ../data/samples/sample_syslog.log -out /tmp/sigma-events.jsonl \
+            -stats 2>/tmp/sigma-stats.txt
+          armed=$(jq -r '.sigma_rules' /tmp/sigma-stats.txt)
+          [ "${armed:-0}" -ge 3 ] || { echo "::error::sigma rules not armed (${armed:-0})"; exit 1; }
+          # Loaded is not the same as working: assert events actually carry the
+          # attribution. Counting only loaded rules would pass with a matcher
+          # that never fires.
+          attributed=$(jq -r 'select(.fields.sigma_rule != null)|.fields.sigma_rule' \
+            /tmp/sigma-events.jsonl | sort -u | wc -l)
+          [ "$attributed" -ge 2 ] || { echo "::error::only $attributed sigma rule(s) attributed"; exit 1; }
+          # Regression guard: an imported rule must not disable correlation by
+          # overwriting the outcome a built-in derived from the log line.
+          grep -q correlated_brute_force /tmp/sigma-events.jsonl || {
+            echo "::error::sigma import broke brute-force correlation"; exit 1; }
+          [ "$(wc -l < /tmp/sigma-events.jsonl)" -eq 25 ] || {
+            echo "::error::sigma import changed the event count"; exit 1; }
+          echo "sigma: ${armed} rule(s) armed, ${attributed} distinct rule(s) attributed"
 
   python:
     name: Python engine (${{ matrix.python-version }})

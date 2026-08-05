@@ -11,3 +11,4 @@ Why the code is the way it is. Source files carry short comments for local
 | [grounding.md](grounding.md) | Citation validation, severity clamping, prompt budget |
 | [privacy.md](privacy.md) | What is pseudonymised, and what deliberately is not |
 | [dependencies.md](dependencies.md) | Why the optional-dependency design, and its limits |
+| [sigma.md](sigma.md) | The Sigma subset, what it refuses, and how the two matchers stay in sync |

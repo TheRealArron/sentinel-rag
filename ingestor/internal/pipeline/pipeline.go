@@ -34,6 +34,7 @@ import (
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/honeytoken"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/parser"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sanitize"
+	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sigma"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sink"
 )
 
@@ -53,6 +54,8 @@ type Options struct {
 	Correlation        correlate.Config
 	// Honeytokens may be nil, which disables deception detection.
 	Honeytokens *honeytoken.Set
+	// Sigma holds detections transpiled from Sigma YAML. nil disables them.
+	Sigma *sigma.Set
 }
 
 // Stats is the run summary printed with -stats.
@@ -270,7 +273,7 @@ func process(j job, opts Options) result {
 	ev.Timestamp = ts.UTC().Format(time.RFC3339Nano)
 	ev.Stamp()
 
-	enrich.Apply(ev, env, san, opts.Honeytokens)
+	enrich.ApplyWithSigma(ev, env, san, opts.Honeytokens, opts.Sigma)
 	return result{seq: j.seq, ev: ev, ts: ts}
 }
 

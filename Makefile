@@ -104,9 +104,23 @@ sample: build ## Regenerate the committed sample fixture from the ingestor
 	@# meaning this fixture would otherwise differ between a developer in
 	@# Asia/Tokyo and a CI runner in UTC, and the drift check would cry wolf on
 	@# every machine.
-	TZ=UTC ./$(BIN) -in $(SAMPLE) -out - > data/samples/events.sample.jsonl
+	@# -sigma="" is deliberate. The fixture describes a DEFAULT install, so it
+	@# must not vary with whatever Sigma rules a given machine has compiled into
+	@# rules/external. Phase 11 is exercised separately, in CI and in the Go tests.
+	TZ=UTC ./$(BIN) -sigma="" -in $(SAMPLE) -out - > data/samples/events.sample.jsonl
 	@echo "regenerated data/samples/events.sample.jsonl ($$(wc -l < data/samples/events.sample.jsonl) events)"
 	@git diff --stat data/samples/events.sample.jsonl 2>/dev/null || true
+
+.PHONY: sigma
+sigma: ## Compile rules/sigma/*.yml into the bundle the ingestor loads (Phase 11)
+	@# The ingestor reads the JSON this produces at startup, so a new detection
+	@# needs this target and a restart — never a Go rebuild.
+	cd engine && $(PYTHON) -m sentinel sigma --rules ../rules/sigma --out ../rules/external/sigma.json
+
+.PHONY: sigma-check
+sigma-check: ## Compile Sigma rules without writing, and refresh the Go/Python agreement vectors
+	cd engine && $(PYTHON) -m sentinel sigma --rules ../rules/sigma --dry-run
+	$(PYTHON) scripts/gen-sigma-vectors.py
 
 .PHONY: honeytokens-verify
 honeytokens-verify: build ## Check canaries do not collide with real accounts (run on the host)

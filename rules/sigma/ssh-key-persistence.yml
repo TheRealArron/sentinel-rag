@@ -1,0 +1,19 @@
+title: SSH Authorized Keys Modified
+id: 9b4e1c77-2f83-4d16-b5a9-7c3e0d8f2a51
+status: stable
+description: A backdoor public key appended to an authorized_keys file.
+logsource:
+  product: linux
+detection:
+  selection_path:
+    command|contains: 'authorized_keys'
+  selection_write:
+    command|contains:
+      - '>>'
+      - 'tee'
+      - 'echo'
+  condition: selection_path and selection_write
+level: critical
+tags:
+  - attack.persistence
+  - attack.t1098.004

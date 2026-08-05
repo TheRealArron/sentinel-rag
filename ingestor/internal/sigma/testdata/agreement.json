@@ -1,0 +1,1036 @@
+[
+  {
+    "name": "contains_hit",
+    "predicate": {
+      "op": "match",
+      "field": "message",
+      "match": "contains",
+      "values": [
+        "Failed password"
+      ],
+      "cased": false
+    },
+    "event": {
+      "message": "Failed password for root from 10.0.0.1"
+    },
+    "want": true
+  },
+  {
+    "name": "contains_miss",
+    "predicate": {
+      "op": "match",
+      "field": "message",
+      "match": "contains",
+      "values": [
+        "Failed password"
+      ],
+      "cased": false
+    },
+    "event": {
+      "message": "Accepted password for root"
+    },
+    "want": false
+  },
+  {
+    "name": "contains_case_folded",
+    "predicate": {
+      "op": "match",
+      "field": "message",
+      "match": "contains",
+      "values": [
+        "FAILED PASSWORD"
+      ],
+      "cased": false
+    },
+    "event": {
+      "message": "failed password for root"
+    },
+    "want": true
+  },
+  {
+    "name": "contains_case_sensitive_miss",
+    "predicate": {
+      "op": "match",
+      "field": "message",
+      "match": "contains",
+      "values": [
+        "FAILED PASSWORD"
+      ],
+      "cased": true
+    },
+    "event": {
+      "message": "failed password for root"
+    },
+    "want": false
+  },
+  {
+    "name": "equals_exact",
+    "predicate": {
+      "op": "match",
+      "field": "user",
+      "match": "equals",
+      "values": [
+        "root"
+      ],
+      "cased": false
+    },
+    "event": {
+      "user": "root"
+    },
+    "want": true
+  },
+  {
+    "name": "equals_rejects_substring",
+    "predicate": {
+      "op": "match",
+      "field": "user",
+      "match": "equals",
+      "values": [
+        "root"
+      ],
+      "cased": false
+    },
+    "event": {
+      "user": "rooted"
+    },
+    "want": false
+  },
+  {
+    "name": "startswith_hit",
+    "predicate": {
+      "op": "match",
+      "field": "command",
+      "match": "startswith",
+      "values": [
+        "/etc/"
+      ],
+      "cased": false
+    },
+    "event": {
+      "command": "/etc/shadow"
+    },
+    "want": true
+  },
+  {
+    "name": "startswith_miss",
+    "predicate": {
+      "op": "match",
+      "field": "command",
+      "match": "startswith",
+      "values": [
+        "/etc/"
+      ],
+      "cased": false
+    },
+    "event": {
+      "command": "/var/etc/shadow"
+    },
+    "want": false
+  },
+  {
+    "name": "endswith_hit",
+    "predicate": {
+      "op": "match",
+      "field": "command",
+      "match": "endswith",
+      "values": [
+        ".pem"
+      ],
+      "cased": false
+    },
+    "event": {
+      "command": "/root/key.pem"
+    },
+    "want": true
+  },
+  {
+    "name": "endswith_miss",
+    "predicate": {
+      "op": "match",
+      "field": "command",
+      "match": "endswith",
+      "values": [
+        ".pem"
+      ],
+      "cased": false
+    },
+    "event": {
+      "command": "/root/key.pem.bak"
+    },
+    "want": false
+  },
+  {
+    "name": "regex_hit",
+    "predicate": {
+      "op": "match",
+      "field": "message",
+      "match": "regex",
+      "values": [
+        "port \\d+"
+      ],
+      "cased": false
+    },
+    "event": {
+      "message": "from 10.0.0.1 port 22 ssh2"
+    },
+    "want": true
+  },
+  {
+    "name": "regex_miss",
+    "predicate": {
+      "op": "match",
+      "field": "message",
+      "match": "regex",
+      "values": [
+        "port \\d+"
+      ],
+      "cased": false
+    },
+    "event": {
+      "message": "from 10.0.0.1 port unknown"
+    },
+    "want": false
+  },
+  {
+    "name": "regex_case_folded",
+    "predicate": {
+      "op": "match",
+      "field": "message",
+      "match": "regex",
+      "values": [
+        "FAILED"
+      ],
+      "cased": false
+    },
+    "event": {
+      "message": "failed password"
+    },
+    "want": true
+  },
+  {
+    "name": "value_list_is_or",
+    "predicate": {
+      "op": "match",
+      "field": "message",
+      "match": "contains",
+      "values": [
+        "nope",
+        "yes"
+      ],
+      "cased": false
+    },
+    "event": {
+      "message": "say yes"
+    },
+    "want": true
+  },
+  {
+    "name": "missing_field_never_matches",
+    "predicate": {
+      "op": "match",
+      "field": "command",
+      "match": "contains",
+      "values": [
+        "x"
+      ],
+      "cased": false
+    },
+    "event": {
+      "message": "no command field here"
+    },
+    "want": false
+  },
+  {
+    "name": "and_both_true",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "message",
+          "match": "contains",
+          "values": [
+            "Failed"
+          ],
+          "cased": false
+        },
+        {
+          "op": "match",
+          "field": "user",
+          "match": "equals",
+          "values": [
+            "root"
+          ],
+          "cased": false
+        }
+      ]
+    },
+    "event": {
+      "message": "Failed password",
+      "user": "root"
+    },
+    "want": true
+  },
+  {
+    "name": "and_one_false",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "message",
+          "match": "contains",
+          "values": [
+            "Failed"
+          ],
+          "cased": false
+        },
+        {
+          "op": "match",
+          "field": "user",
+          "match": "equals",
+          "values": [
+            "root"
+          ],
+          "cased": false
+        }
+      ]
+    },
+    "event": {
+      "message": "Failed password",
+      "user": "arron"
+    },
+    "want": false
+  },
+  {
+    "name": "or_one_true",
+    "predicate": {
+      "op": "or",
+      "children": [
+        {
+          "op": "match",
+          "field": "message",
+          "match": "contains",
+          "values": [
+            "nope"
+          ],
+          "cased": false
+        },
+        {
+          "op": "match",
+          "field": "user",
+          "match": "equals",
+          "values": [
+            "root"
+          ],
+          "cased": false
+        }
+      ]
+    },
+    "event": {
+      "message": "Failed password",
+      "user": "root"
+    },
+    "want": true
+  },
+  {
+    "name": "or_all_false",
+    "predicate": {
+      "op": "or",
+      "children": [
+        {
+          "op": "match",
+          "field": "message",
+          "match": "contains",
+          "values": [
+            "nope"
+          ],
+          "cased": false
+        },
+        {
+          "op": "match",
+          "field": "user",
+          "match": "equals",
+          "values": [
+            "root"
+          ],
+          "cased": false
+        }
+      ]
+    },
+    "event": {
+      "message": "Failed password",
+      "user": "arron"
+    },
+    "want": false
+  },
+  {
+    "name": "not_excludes",
+    "predicate": {
+      "op": "not",
+      "children": [
+        {
+          "op": "match",
+          "field": "source_ip",
+          "match": "equals",
+          "values": [
+            "127.0.0.1"
+          ],
+          "cased": false
+        }
+      ]
+    },
+    "event": {
+      "source_ip": "127.0.0.1"
+    },
+    "want": false
+  },
+  {
+    "name": "not_admits",
+    "predicate": {
+      "op": "not",
+      "children": [
+        {
+          "op": "match",
+          "field": "source_ip",
+          "match": "equals",
+          "values": [
+            "127.0.0.1"
+          ],
+          "cased": false
+        }
+      ]
+    },
+    "event": {
+      "source_ip": "203.0.113.9"
+    },
+    "want": true
+  },
+  {
+    "name": "filtered_selection",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "message",
+          "match": "contains",
+          "values": [
+            "Failed password"
+          ],
+          "cased": false
+        },
+        {
+          "op": "not",
+          "children": [
+            {
+              "op": "match",
+              "field": "source_ip",
+              "match": "startswith",
+              "values": [
+                "10."
+              ],
+              "cased": false
+            }
+          ]
+        }
+      ]
+    },
+    "event": {
+      "message": "Failed password for root",
+      "source_ip": "10.0.0.5"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_ssh_brute_force_against_multiple_accounts__event0",
+    "rule": "sigma_ssh_brute_force_against_multiple_accounts",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "message",
+          "match": "contains",
+          "values": [
+            "Failed password for",
+            "Failed keyboard-interactive/pam for"
+          ],
+          "cased": false
+        },
+        {
+          "op": "not",
+          "children": [
+            {
+              "op": "match",
+              "field": "message",
+              "match": "contains",
+              "values": [
+                "from 127.0.0.1"
+              ],
+              "cased": false
+            }
+          ]
+        }
+      ]
+    },
+    "event": {
+      "message": "Failed password for invalid user oracle from 203.0.113.45 port 55021 ssh2",
+      "user": "oracle",
+      "source_ip": "203.0.113.45",
+      "process": "sshd",
+      "command": "Failed password for invalid user oracle from 203.0.113.45 port 55021 ssh2"
+    },
+    "want": true
+  },
+  {
+    "name": "sigma_ssh_brute_force_against_multiple_accounts__event1",
+    "rule": "sigma_ssh_brute_force_against_multiple_accounts",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "message",
+          "match": "contains",
+          "values": [
+            "Failed password for",
+            "Failed keyboard-interactive/pam for"
+          ],
+          "cased": false
+        },
+        {
+          "op": "not",
+          "children": [
+            {
+              "op": "match",
+              "field": "message",
+              "match": "contains",
+              "values": [
+                "from 127.0.0.1"
+              ],
+              "cased": false
+            }
+          ]
+        }
+      ]
+    },
+    "event": {
+      "message": "Failed password for root from 127.0.0.1 port 22 ssh2",
+      "user": "root",
+      "source_ip": "127.0.0.1",
+      "process": "sshd",
+      "command": "Failed password for root from 127.0.0.1 port 22 ssh2"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_ssh_brute_force_against_multiple_accounts__event2",
+    "rule": "sigma_ssh_brute_force_against_multiple_accounts",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "message",
+          "match": "contains",
+          "values": [
+            "Failed password for",
+            "Failed keyboard-interactive/pam for"
+          ],
+          "cased": false
+        },
+        {
+          "op": "not",
+          "children": [
+            {
+              "op": "match",
+              "field": "message",
+              "match": "contains",
+              "values": [
+                "from 127.0.0.1"
+              ],
+              "cased": false
+            }
+          ]
+        }
+      ]
+    },
+    "event": {
+      "message": "Accepted publickey for arron from 192.168.1.20 port 55022 ssh2",
+      "user": "arron",
+      "source_ip": "192.168.1.20",
+      "process": "sshd",
+      "command": "Accepted publickey for arron from 192.168.1.20 port 55022 ssh2"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_ssh_brute_force_against_multiple_accounts__event3",
+    "rule": "sigma_ssh_brute_force_against_multiple_accounts",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "message",
+          "match": "contains",
+          "values": [
+            "Failed password for",
+            "Failed keyboard-interactive/pam for"
+          ],
+          "cased": false
+        },
+        {
+          "op": "not",
+          "children": [
+            {
+              "op": "match",
+              "field": "message",
+              "match": "contains",
+              "values": [
+                "from 127.0.0.1"
+              ],
+              "cased": false
+            }
+          ]
+        }
+      ]
+    },
+    "event": {
+      "message": "mallory : user NOT in sudoers ; TTY=pts/0 ; USER=root ; COMMAND=/bin/bash",
+      "user": "mallory",
+      "process": "sudo",
+      "command": "mallory : user NOT in sudoers ; TTY=pts/0 ; USER=root ; COMMAND=/bin/bash"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_ssh_brute_force_against_multiple_accounts__event4",
+    "rule": "sigma_ssh_brute_force_against_multiple_accounts",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "message",
+          "match": "contains",
+          "values": [
+            "Failed password for",
+            "Failed keyboard-interactive/pam for"
+          ],
+          "cased": false
+        },
+        {
+          "op": "not",
+          "children": [
+            {
+              "op": "match",
+              "field": "message",
+              "match": "contains",
+              "values": [
+                "from 127.0.0.1"
+              ],
+              "cased": false
+            }
+          ]
+        }
+      ]
+    },
+    "event": {
+      "message": "echo ssh-rsa AAAAB3 attacker@evil >> /home/arron/.ssh/authorized_keys",
+      "user": "arron",
+      "process": "bash",
+      "command": "echo ssh-rsa AAAAB3 attacker@evil >> /home/arron/.ssh/authorized_keys"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_ssh_brute_force_against_multiple_accounts__event5",
+    "rule": "sigma_ssh_brute_force_against_multiple_accounts",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "message",
+          "match": "contains",
+          "values": [
+            "Failed password for",
+            "Failed keyboard-interactive/pam for"
+          ],
+          "cased": false
+        },
+        {
+          "op": "not",
+          "children": [
+            {
+              "op": "match",
+              "field": "message",
+              "match": "contains",
+              "values": [
+                "from 127.0.0.1"
+              ],
+              "cased": false
+            }
+          ]
+        }
+      ]
+    },
+    "event": {
+      "message": "cat /home/arron/.ssh/authorized_keys",
+      "user": "arron",
+      "process": "bash",
+      "command": "cat /home/arron/.ssh/authorized_keys"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_ssh_authorized_keys_modified__event0",
+    "rule": "sigma_ssh_authorized_keys_modified",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "command",
+          "match": "contains",
+          "values": [
+            "authorized_keys"
+          ],
+          "cased": false
+        },
+        {
+          "op": "match",
+          "field": "command",
+          "match": "contains",
+          "values": [
+            ">>",
+            "tee",
+            "echo"
+          ],
+          "cased": false
+        }
+      ]
+    },
+    "event": {
+      "message": "Failed password for invalid user oracle from 203.0.113.45 port 55021 ssh2",
+      "user": "oracle",
+      "source_ip": "203.0.113.45",
+      "process": "sshd",
+      "command": "Failed password for invalid user oracle from 203.0.113.45 port 55021 ssh2"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_ssh_authorized_keys_modified__event1",
+    "rule": "sigma_ssh_authorized_keys_modified",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "command",
+          "match": "contains",
+          "values": [
+            "authorized_keys"
+          ],
+          "cased": false
+        },
+        {
+          "op": "match",
+          "field": "command",
+          "match": "contains",
+          "values": [
+            ">>",
+            "tee",
+            "echo"
+          ],
+          "cased": false
+        }
+      ]
+    },
+    "event": {
+      "message": "Failed password for root from 127.0.0.1 port 22 ssh2",
+      "user": "root",
+      "source_ip": "127.0.0.1",
+      "process": "sshd",
+      "command": "Failed password for root from 127.0.0.1 port 22 ssh2"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_ssh_authorized_keys_modified__event2",
+    "rule": "sigma_ssh_authorized_keys_modified",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "command",
+          "match": "contains",
+          "values": [
+            "authorized_keys"
+          ],
+          "cased": false
+        },
+        {
+          "op": "match",
+          "field": "command",
+          "match": "contains",
+          "values": [
+            ">>",
+            "tee",
+            "echo"
+          ],
+          "cased": false
+        }
+      ]
+    },
+    "event": {
+      "message": "Accepted publickey for arron from 192.168.1.20 port 55022 ssh2",
+      "user": "arron",
+      "source_ip": "192.168.1.20",
+      "process": "sshd",
+      "command": "Accepted publickey for arron from 192.168.1.20 port 55022 ssh2"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_ssh_authorized_keys_modified__event3",
+    "rule": "sigma_ssh_authorized_keys_modified",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "command",
+          "match": "contains",
+          "values": [
+            "authorized_keys"
+          ],
+          "cased": false
+        },
+        {
+          "op": "match",
+          "field": "command",
+          "match": "contains",
+          "values": [
+            ">>",
+            "tee",
+            "echo"
+          ],
+          "cased": false
+        }
+      ]
+    },
+    "event": {
+      "message": "mallory : user NOT in sudoers ; TTY=pts/0 ; USER=root ; COMMAND=/bin/bash",
+      "user": "mallory",
+      "process": "sudo",
+      "command": "mallory : user NOT in sudoers ; TTY=pts/0 ; USER=root ; COMMAND=/bin/bash"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_ssh_authorized_keys_modified__event4",
+    "rule": "sigma_ssh_authorized_keys_modified",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "command",
+          "match": "contains",
+          "values": [
+            "authorized_keys"
+          ],
+          "cased": false
+        },
+        {
+          "op": "match",
+          "field": "command",
+          "match": "contains",
+          "values": [
+            ">>",
+            "tee",
+            "echo"
+          ],
+          "cased": false
+        }
+      ]
+    },
+    "event": {
+      "message": "echo ssh-rsa AAAAB3 attacker@evil >> /home/arron/.ssh/authorized_keys",
+      "user": "arron",
+      "process": "bash",
+      "command": "echo ssh-rsa AAAAB3 attacker@evil >> /home/arron/.ssh/authorized_keys"
+    },
+    "want": true
+  },
+  {
+    "name": "sigma_ssh_authorized_keys_modified__event5",
+    "rule": "sigma_ssh_authorized_keys_modified",
+    "predicate": {
+      "op": "and",
+      "children": [
+        {
+          "op": "match",
+          "field": "command",
+          "match": "contains",
+          "values": [
+            "authorized_keys"
+          ],
+          "cased": false
+        },
+        {
+          "op": "match",
+          "field": "command",
+          "match": "contains",
+          "values": [
+            ">>",
+            "tee",
+            "echo"
+          ],
+          "cased": false
+        }
+      ]
+    },
+    "event": {
+      "message": "cat /home/arron/.ssh/authorized_keys",
+      "user": "arron",
+      "process": "bash",
+      "command": "cat /home/arron/.ssh/authorized_keys"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_sudo_privilege_escalation_attempt_by_unauthorised_user__event0",
+    "rule": "sigma_sudo_privilege_escalation_attempt_by_unauthorised_user",
+    "predicate": {
+      "op": "match",
+      "field": "message",
+      "match": "contains",
+      "values": [
+        "user NOT in sudoers",
+        "incorrect password attempts"
+      ],
+      "cased": false
+    },
+    "event": {
+      "message": "Failed password for invalid user oracle from 203.0.113.45 port 55021 ssh2",
+      "user": "oracle",
+      "source_ip": "203.0.113.45",
+      "process": "sshd",
+      "command": "Failed password for invalid user oracle from 203.0.113.45 port 55021 ssh2"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_sudo_privilege_escalation_attempt_by_unauthorised_user__event1",
+    "rule": "sigma_sudo_privilege_escalation_attempt_by_unauthorised_user",
+    "predicate": {
+      "op": "match",
+      "field": "message",
+      "match": "contains",
+      "values": [
+        "user NOT in sudoers",
+        "incorrect password attempts"
+      ],
+      "cased": false
+    },
+    "event": {
+      "message": "Failed password for root from 127.0.0.1 port 22 ssh2",
+      "user": "root",
+      "source_ip": "127.0.0.1",
+      "process": "sshd",
+      "command": "Failed password for root from 127.0.0.1 port 22 ssh2"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_sudo_privilege_escalation_attempt_by_unauthorised_user__event2",
+    "rule": "sigma_sudo_privilege_escalation_attempt_by_unauthorised_user",
+    "predicate": {
+      "op": "match",
+      "field": "message",
+      "match": "contains",
+      "values": [
+        "user NOT in sudoers",
+        "incorrect password attempts"
+      ],
+      "cased": false
+    },
+    "event": {
+      "message": "Accepted publickey for arron from 192.168.1.20 port 55022 ssh2",
+      "user": "arron",
+      "source_ip": "192.168.1.20",
+      "process": "sshd",
+      "command": "Accepted publickey for arron from 192.168.1.20 port 55022 ssh2"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_sudo_privilege_escalation_attempt_by_unauthorised_user__event3",
+    "rule": "sigma_sudo_privilege_escalation_attempt_by_unauthorised_user",
+    "predicate": {
+      "op": "match",
+      "field": "message",
+      "match": "contains",
+      "values": [
+        "user NOT in sudoers",
+        "incorrect password attempts"
+      ],
+      "cased": false
+    },
+    "event": {
+      "message": "mallory : user NOT in sudoers ; TTY=pts/0 ; USER=root ; COMMAND=/bin/bash",
+      "user": "mallory",
+      "process": "sudo",
+      "command": "mallory : user NOT in sudoers ; TTY=pts/0 ; USER=root ; COMMAND=/bin/bash"
+    },
+    "want": true
+  },
+  {
+    "name": "sigma_sudo_privilege_escalation_attempt_by_unauthorised_user__event4",
+    "rule": "sigma_sudo_privilege_escalation_attempt_by_unauthorised_user",
+    "predicate": {
+      "op": "match",
+      "field": "message",
+      "match": "contains",
+      "values": [
+        "user NOT in sudoers",
+        "incorrect password attempts"
+      ],
+      "cased": false
+    },
+    "event": {
+      "message": "echo ssh-rsa AAAAB3 attacker@evil >> /home/arron/.ssh/authorized_keys",
+      "user": "arron",
+      "process": "bash",
+      "command": "echo ssh-rsa AAAAB3 attacker@evil >> /home/arron/.ssh/authorized_keys"
+    },
+    "want": false
+  },
+  {
+    "name": "sigma_sudo_privilege_escalation_attempt_by_unauthorised_user__event5",
+    "rule": "sigma_sudo_privilege_escalation_attempt_by_unauthorised_user",
+    "predicate": {
+      "op": "match",
+      "field": "message",
+      "match": "contains",
+      "values": [
+        "user NOT in sudoers",
+        "incorrect password attempts"
+      ],
+      "cased": false
+    },
+    "event": {
+      "message": "cat /home/arron/.ssh/authorized_keys",
+      "user": "arron",
+      "process": "bash",
+      "command": "cat /home/arron/.ssh/authorized_keys"
+    },
+    "want": false
+  }
+]

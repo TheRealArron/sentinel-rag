@@ -18,6 +18,7 @@ import (
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/honeytoken"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/parser"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sanitize"
+	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sigma"
 )
 
 var (
@@ -28,6 +29,12 @@ var (
 // Apply enriches ev in place using the parsed envelope and the sanitised message.
 // tokens may be nil, in which case honeytoken detection is disabled.
 func Apply(ev *event.Event, env parser.Envelope, san sanitize.Result, tokens *honeytoken.Set) {
+	ApplyWithSigma(ev, env, san, tokens, nil)
+}
+
+// ApplyWithSigma is Apply plus detections transpiled from Sigma YAML.
+func ApplyWithSigma(ev *event.Event, env parser.Envelope, san sanitize.Result,
+	tokens *honeytoken.Set, sig *sigma.Set) {
 	ev.Category = CatUnknown
 	ev.Score = 5
 
@@ -59,6 +66,7 @@ func Apply(ev *event.Event, env parser.Envelope, san sanitize.Result, tokens *ho
 		ev.SourceIP = firstIP(env.Message)
 	}
 
+	applySigma(ev, env, sig, matched)
 	applyModifiers(ev, env, san)
 	applyHoneytokens(ev, env, tokens)
 
@@ -67,6 +75,69 @@ func Apply(ev *event.Event, env parser.Envelope, san sanitize.Result, tokens *ho
 	ev.AddTags(ev.Category)
 	if ev.SourceIP != "" {
 		ev.AddTags("scope:" + scopeOf(ev.SourceIP))
+	}
+}
+
+// applySigma applies the matching transpiled Sigma rule, if any.
+//
+// The first version of this ran Sigma only when no built-in rule had matched, on
+// the theory that the hand-tuned built-ins should win. Testing it end to end
+// showed why that is wrong: the built-ins already cover the common SSH and sudo
+// lines, so an imported rule was shadowed on essentially every event it was
+// written for, and the import silently bought nothing.
+//
+// So Sigma always runs, and the two sources compose the way a real detection
+// stack composes them:
+//
+//   - Tags and ATT&CK techniques always merge. This is most of the value of the
+//     import — a built-in that knows a line is an SSH failure gains T1110.001
+//     from the Sigma rule that knows it is brute force.
+//   - The verdict (rule name, category, score) is taken over only when nothing
+//     built-in matched, or when the Sigma rule scores strictly higher. An
+//     imported rule can escalate an event; it cannot quietly downgrade one.
+func applySigma(ev *event.Event, env parser.Envelope, sig *sigma.Set, builtinMatched bool) {
+	if sig.Len() == 0 {
+		return
+	}
+	rule := sig.Match(ev, env.Process)
+	if rule == nil {
+		return
+	}
+
+	// Attribution always merges: this is what the import is for.
+	ev.MITRE = dedupe(append(ev.MITRE, rule.MITRE...))
+	ev.AddTags(rule.Tags...)
+	ev.SetField("sigma_rule", rule.Name)
+	ev.SetField("sigma_title", rule.Title)
+	ev.SetField("sigma_source", rule.Source)
+	if rule.SigmaID != "" {
+		ev.SetField("sigma_id", rule.SigmaID)
+	}
+
+	if builtinMatched && rule.Score <= ev.Score {
+		return
+	}
+	if builtinMatched {
+		// Preserve what the built-in concluded, so an analyst can see that two
+		// independent rules fired and which one set the score.
+		ev.SetField("builtin_rule", ev.Rule)
+	}
+	ev.Rule = rule.Name
+	ev.Category = rule.Category
+	ev.Score = rule.Score
+
+	// Outcome is deliberately NOT overwritten when the pipeline already derived
+	// one. Sigma has no outcome concept, so the transpiler's value is a guess
+	// from the rule's level — whereas a built-in rule read success/failure off
+	// the log line itself.
+	//
+	// This is not theoretical. The correlator keys brute-force detection on
+	// `outcome == "failure"`, so the first version of this line — an
+	// unconditional assignment — let an imported rule silently disable
+	// brute-force and compromise correlation. The sample fixture went from 25
+	// events to 23 and that is how it was caught.
+	if ev.Outcome == "" {
+		ev.Outcome = rule.Outcome
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/honeytoken"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/pipeline"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/ship"
+	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sigma"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sink"
 )
 
@@ -63,6 +65,7 @@ func run() error {
 		bfWindow      = flag.Duration("brute-window", time.Minute, "sliding window for the brute-force threshold")
 		bfCooldown    = flag.Duration("brute-cooldown", 5*time.Minute, "minimum gap between repeat incidents for one source")
 		honeyPath     = flag.String("honeytokens", defaultHoneytokenPath, "canary config (JSON), resolved relative to the working directory")
+		sigmaDir      = flag.String("sigma", defaultSigmaDir, "directory of compiled Sigma bundles; empty disables them (see `make sigma`)")
 		honeyCheck    = flag.String("honeytokens-verify", "", "verify canaries against a passwd file (use /etc/passwd, on the host) and exit")
 		remote        = flag.String("remote", "", "ship events to a Sentinel hub over mTLS, e.g. https://hub.lan:8443")
 		remoteCert    = flag.String("remote-cert", "", "client certificate (this probe's identity)")
@@ -98,6 +101,15 @@ func run() error {
 	if tokens.Len() > 0 && !*stats {
 		fmt.Fprintf(os.Stderr, "sentinel-ingestor: %d honeytoken(s) armed from %s: %s\n",
 			tokens.Len(), tokens.Path(), tokens.Summary())
+	}
+
+	sigmaRules, err := loadSigma(*sigmaDir, flagWasSet("sigma"))
+	if err != nil {
+		return err
+	}
+	if sigmaRules.Len() > 0 && !*stats {
+		fmt.Fprintf(os.Stderr, "sentinel-ingestor: sigma %s from %s\n",
+			sigmaRules.Summary(), strings.Join(sigmaRules.Sources(), ", "))
 	}
 
 	// SIGINT/SIGTERM cancel the context so -follow shuts down cleanly and the
@@ -173,6 +185,7 @@ func run() error {
 		IncludeRaw:         *keepRaw,
 		DisableCorrelation: *noCorr,
 		Honeytokens:        tokens,
+		Sigma:              sigmaRules,
 		Correlation: correlate.Config{
 			FailureThreshold: *bfThresh,
 			Window:           *bfWindow,
@@ -196,9 +209,10 @@ func run() error {
 			Workers          int         `json:"workers"`
 			HoneytokensArmed int         `json:"honeytokens_armed"`
 			HoneytokensPath  string      `json:"honeytokens_path,omitempty"`
+			SigmaRules       int         `json:"sigma_rules"`
 			Remote           *ship.Stats `json:"remote,omitempty"`
 			RemoteError      string      `json:"remote_error,omitempty"`
-		}{st, version, *workers, tokens.Len(), tokens.Path(), shipStats, shipErr})
+		}{st, version, *workers, tokens.Len(), tokens.Path(), sigmaRules.Len(), shipStats, shipErr})
 	}
 	return runErr
 }
@@ -248,6 +262,31 @@ func openOutput(path string) (io.Writer, func(), error) {
 // operator asked for canaries and must not be left believing they are armed.
 // Same auto-versus-explicit contract the Python engine uses for its backends.
 const defaultHoneytokenPath = "config/honeytokens.json"
+
+// Rules live outside the binary so a new detection is a file, not a release.
+const defaultSigmaDir = "rules/external"
+
+// loadSigma reads compiled bundles. A missing default directory is silent — most
+// installs have no imported rules. A missing *explicit* -sigma is an error: the
+// operator asked for those detections and must not be told everything is fine
+// while running with none of them.
+func loadSigma(dir string, explicit bool) (*sigma.Set, error) {
+	// An empty -sigma disables imported rules outright. This is what `make
+	// sample` and the fixture check use: the committed fixture must describe a
+	// default install, so it cannot depend on whatever an operator happens to
+	// have dropped in rules/external.
+	if dir == "" {
+		return &sigma.Set{}, nil
+	}
+	set, err := sigma.Load(dir)
+	if err != nil {
+		return nil, err
+	}
+	if explicit && set.Len() == 0 {
+		return nil, fmt.Errorf("-sigma %s: no rules loaded (run `make sigma` to compile rules/sigma)", dir)
+	}
+	return set, nil
+}
 
 func flagWasSet(name string) bool {
 	set := false

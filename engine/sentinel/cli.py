@@ -19,6 +19,7 @@ import argparse
 import json
 import shutil
 import sys
+from pathlib import Path
 
 from .config import Settings, get_settings
 from .engine import SentinelEngine
@@ -201,6 +202,63 @@ def cmd_analyze(args, engine: SentinelEngine, printer: Printer) -> int:
         return 0
     print_alert(alert, printer, lang=args.lang)
     return 0
+
+
+def cmd_sigma(args, engine: SentinelEngine, printer: Printer) -> int:
+    """Compile Sigma YAML into the JSON bundle the Go ingestor loads.
+
+    Transpilation lives here rather than in Go so the ingestor keeps an empty
+    go.mod — see docs/design/sigma.md. The output is data, so adding a detection
+    never needs a rebuild.
+    """
+    from .sigma import compile_directory, write_bundle
+
+    report = compile_directory(Path(args.rules))
+
+    if args.json:
+        print(json.dumps({
+            "summary": report.summary(),
+            "bundle": report.to_bundle(),
+            "skipped": [{"rule": n, "reason": w} for n, w in report.skipped],
+            "failed": [{"rule": n, "reason": w} for n, w in report.failed],
+        }, ensure_ascii=False, indent=2))
+        return 1 if report.failed else 0
+
+    printer.header("Sigma → Sentinel")
+    printer.kv("source", args.rules)
+    printer.kv("result", report.summary())
+
+    if report.rules:
+        printer.header("Compiled")
+        for rule in report.rules:
+            printer.line(f"  {printer.bold(rule.name)}")
+            printer.line(f"    {rule.title}")
+            detail = f"    score={rule.score} ({rule.level})  category={rule.category}"
+            if rule.processes:
+                detail += f"  processes={','.join(rule.processes)}"
+            printer.line(detail)
+            if rule.mitre:
+                printer.line(f"    MITRE={','.join(rule.mitre)}")
+
+    # Skipped rules are printed, never swallowed. Importing a community ruleset
+    # and silently dropping a third of it is how you end up believing you have
+    # coverage you do not have.
+    if report.skipped:
+        printer.header("Skipped (outside the Sentinel subset)")
+        for name, why in report.skipped:
+            printer.line(f"  {name}: {why}")
+    if report.failed:
+        printer.header("Failed")
+        for name, why in report.failed:
+            printer.line(f"  {printer.bold(name)}: {why}")
+
+    if not args.dry_run:
+        out = write_bundle(report, Path(args.out))
+        printer.line()
+        printer.line(f"  wrote {out} ({len(report.rules)} rule(s))")
+        printer.line("  the ingestor picks these up on next start; no rebuild needed")
+
+    return 1 if report.failed else 0
 
 
 def cmd_graph(args, engine: SentinelEngine, printer: Printer) -> int:
@@ -505,6 +563,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=25, help="max events to analyse")
     p.add_argument("--min-score", type=int, default=60, help="ignore events below this score")
     p.set_defaults(func=cmd_analyze)
+
+    p = sub.add_parser("sigma", help="compile Sigma rules for the ingestor (Phase 11)")
+    p.add_argument("--rules", default="rules/sigma", help="directory of Sigma YAML rules")
+    p.add_argument("--out", default="rules/external/sigma.json",
+                   help="bundle the Go ingestor loads")
+    p.add_argument("--dry-run", action="store_true", help="report only, do not write")
+    p.set_defaults(func=cmd_sigma)
 
     p = sub.add_parser("graph", help="attack-path graph and blast radius (Phase 8)")
     p.add_argument("--seed", default="", metavar="ID",

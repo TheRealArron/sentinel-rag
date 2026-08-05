@@ -1,0 +1,13 @@
+title: Windows Failed Logon (deliberately outside the subset)
+id: 00000000-0000-0000-0000-000000000001
+description: Present to demonstrate that unsupported rules are skipped with a reason.
+logsource:
+  product: windows
+  service: security
+detection:
+  selection:
+    EventID: 4625
+  condition: selection
+level: medium
+tags:
+  - attack.t1110

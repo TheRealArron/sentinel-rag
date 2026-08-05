@@ -399,6 +399,7 @@ python -m sentinel analyze --min-score 60   # triage the most severe events
 python -m sentinel serve                    # dashboard + JSON API
 python -m sentinel stats                    # which backends are actually live
 python -m sentinel block 203.0.113.45 --score 97
+python -m sentinel sigma                    # compile Sigma rules for the ingestor
 ```
 
 Ingestor:
@@ -412,7 +413,39 @@ Ingestor:
 
 # straight from journald
 journalctl -f -o short-iso | ./ingestor/bin/sentinel-ingestor -in - -out -
+
+# with imported Sigma rules (compile them first with `make sigma`)
+./ingestor/bin/sentinel-ingestor -in /var/log/auth.log -sigma rules/external -stats
 ```
+
+### Speaking Sigma
+
+Sigma is the format the rest of the industry writes detections in. Sentinel
+imports the subset that makes sense on syslog:
+
+```bash
+cp some-community-rule.yml rules/sigma/
+make sigma          # -> rules/external/sigma.json
+# restart the ingestor; no Go rebuild
+```
+
+The transpiler compiles to a predicate tree rather than a flattened regex — a
+regex cannot express `selection and not filter`, which is the most common shape
+in real Sigma rules — and **refuses** anything it cannot translate faithfully
+(Windows logsources, `| count()` aggregations, encoding modifiers) with a stated
+reason rather than approximating it:
+
+```
+3 compiled, 1 skipped (outside the subset), 0 failed
+
+  SKIPPED windows-only-unsupported.yml: logsource product 'windows' is outside
+    the Linux/syslog subset (Sentinel parses syslog, not windows event logs)
+```
+
+ATT&CK metadata carries through into bilingual tags, so a rule imported from an
+English-language ruleset is findable by an analyst filtering on 認証情報アクセス.
+Imported rules can escalate a verdict but never quietly lower one.
+[`docs/design/sigma.md`](docs/design/sigma.md) has the full reasoning.
 
 ### HTTP API
 
@@ -829,10 +862,17 @@ Measured, not asserted: a 4 MiB single log line is consumed in full
 (`bytes_read=4194387`) at **5.9 MB peak RSS** with `-max-line 1024`, and
 `-follow` survives a rename-and-create logrotate cycle without losing an event.
 
-**Python:** 411 tests covering language detection on ASCII-heavy Japanese,
+**Python:** 488 tests covering language detection on ASCII-heavy Japanese,
 script-aware chunking, the hashing embedder's persistence-safe determinism,
 storage, the bilingual retrieval floor, pseudonymisation round-trips, every
-analyst guard rail, every response guard rail, and the full HTTP surface.
+analyst guard rail, every response guard rail, the full HTTP surface, and the
+Sigma transpiler's translations *and* its refusals.
+
+The Go and Python Sigma matchers are pinned to one shared vector file, generated
+from the Python reference evaluator rather than hand-authored — a transpiler
+whose consumer interprets its output differently is worse than no transpiler.
+The suite fails if it stops covering an operator, or if it ever contains only
+positive cases.
 
 CI runs the Python suite **without installing `requirements.txt`** — on purpose.
 If a test ever starts needing torch, the zero-dependency fallback path has
@@ -863,7 +903,11 @@ quietly rotted, and that is worth failing a build over.
 - [x] **Phase 9: Distributed Sentinel (mTLS)** — a private CA, Go probes
       shipping over mutually authenticated TLS to a Python hub, certificate
       identity pinned to log content, and hot-reloaded revocation.
-- [ ] **Phase 10** — Sigma rule import, so the detection set is not hand-maintained
+- [x] **Phase 11: Sigma interoperability** — a Sentinel-subset transpiler that
+      compiles Sigma YAML into a predicate tree the Go ingestor hot-loads, with
+      bilingual ATT&CK tagging, explicit refusals for what it cannot faithfully
+      translate, and a shared vector suite keeping the Go and Python matchers in
+      agreement. `make sigma`. See [`docs/design/sigma.md`](docs/design/sigma.md).
 
 <details>
 <summary><b>Design note on Phase 5: why a hash set, not a Bloom filter</b></summary>

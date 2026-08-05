@@ -6,6 +6,7 @@ package event
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"strconv"
 	"time"
 )
 
@@ -117,4 +118,44 @@ var Now = func() time.Time { return time.Now().UTC() }
 // Stamp fills IngestedAt with the current UTC time in RFC3339.
 func (e *Event) Stamp() {
 	e.IngestedAt = Now().Format(time.RFC3339Nano)
+}
+
+// SigmaField exposes the normalised fields a transpiled Sigma rule can match on.
+// Kept as an explicit switch rather than reflection: the set of matchable fields
+// is a contract with the transpiler's FIELD_MAP, and a typo should be a missing
+// match rather than a silently empty one.
+func (e *Event) SigmaField(name string) string {
+	switch name {
+	case "message":
+		return e.Message
+	case "user":
+		return e.User
+	case "host":
+		return e.Host
+	case "process":
+		return e.Process
+	case "source_ip":
+		return e.SourceIP
+	case "dest_ip":
+		return e.DestIP
+	case "source_port":
+		if e.SourcePort == 0 {
+			return ""
+		}
+		return strconv.Itoa(e.SourcePort)
+	case "dest_port":
+		if e.DestPort == 0 {
+			return ""
+		}
+		return strconv.Itoa(e.DestPort)
+	case "command":
+		// Falls back to the message: many syslog lines carry the command inline
+		// rather than in a parsed field, and a rule written against `command`
+		// should still fire on those.
+		if cmd := e.Fields["command"]; cmd != "" {
+			return cmd
+		}
+		return e.Message
+	}
+	return e.Fields[name]
 }
