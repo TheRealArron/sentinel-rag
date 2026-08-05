@@ -39,6 +39,7 @@ def _to_request(fastapi_request: FastAPIRequest, body: dict[str, Any] | None = N
         query=dict(fastapi_request.query_params.items()),
         body=body or {},
         headers={k.lower(): v for k, v in fastapi_request.headers.items()},
+        client=fastapi_request.client.host if fastapi_request.client else "",
     )
 
 
@@ -77,6 +78,17 @@ def create_app(engine: SentinelEngine | None = None) -> FastAPI:
     engine = engine or SentinelEngine()
     router = Router(engine)
     app = FastAPI(title="Sentinel RAG", description=DESCRIPTION, version="1.0.0")
+
+    # Deliberately NO CORSMiddleware. Installing one with an allowlist would
+    # *loosen* the current policy, not tighten it: with no middleware FastAPI
+    # sends no Access-Control-Allow-Origin at all, so no cross-origin page can
+    # read any response. CSRF — which CORS does not address, because it governs
+    # reading rather than sending — is handled in guard.py, in the shared router,
+    # so the stdlib server is covered by the same rules.
+    #
+    # Rate limiting is there too, rather than SlowAPI, for the same reason: a
+    # FastAPI-only limiter would leave `python -m sentinel serve --stdlib`
+    # completely unmetered.
 
     async def handle(fastapi_request: FastAPIRequest, with_body: bool = False):
         body = await _json_body(fastapi_request) if with_body else {}

@@ -1,27 +1,11 @@
 """Embedding backends.
 
-``E5Embedder`` is the real one and the reason the cross-lingual claim holds.
-``intfloat/multilingual-e5-large`` is trained with a contrastive objective across
-94 languages, so an English query and a Japanese passage describing the same
-attack land close together in the same space — that is what makes an English
-"Failed password" log retrieve a Japanese JPCERT advisory. Two details are easy
-to get wrong and both are handled here:
+``E5Embedder`` is the real one: multilingual-e5 with the mandatory asymmetric
+``query: ``/``passage: `` prefixes. ``HashingEmbedder`` is a zero-dependency
+lexical fallback with **no cross-lingual ability**; ``Embedder.semantic`` reports
+which regime you are in.
 
-*   **The asymmetric prefixes are mandatory.** e5 is trained with ``query: `` on
-    queries and ``passage: `` on documents. Omitting them, or using the same
-    prefix for both, costs a large chunk of retrieval quality — it is the single
-    most common way this model is misused.
-*   **Vectors must be L2-normalised** before a cosine/inner-product index sees
-    them, or "similarity" silently becomes a function of text length.
-
-``HashingEmbedder`` is a zero-dependency fallback so the engine boots and the
-demo runs on a machine with nothing pip-installed. It is honest about what it is:
-a lexical hashing vectoriser with **no cross-lingual ability at all**. In fallback
-mode the EN/JA bridge is carried entirely by the bilingual tag pairs that the Go
-ingestor attaches to events and the ``keywords`` front-matter on advisories —
-shared literal tokens, not shared semantics. Retrieval still works; it is just
-lexical. ``Embedder.semantic`` reports which regime you are in, and the API
-surfaces it so nobody mistakes a demo for a deployment.
+See docs/design/retrieval.md and docs/design/dependencies.md.
 """
 
 from __future__ import annotations

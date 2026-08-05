@@ -1,21 +1,13 @@
 """Sentinel RAG — bilingual AI-powered SecOps engine.
 
-The Python half of the system: it indexes the Go ingestor's structured events
-alongside Japanese (JPCERT/CC) and English (CVE) threat advisories, retrieves
-across both languages, and produces cited bilingual security alerts.
-
-Public surface:
-
-    from sentinel import SentinelEngine, get_settings
+    from sentinel import SentinelEngine
 
     engine = SentinelEngine()
     engine.index_all()
-    alert = engine.triage_top()
-    print(alert.to_json())
+    print(engine.triage_top().to_json())
 
-Submodules are import-light on purpose — nothing here pulls in torch, chromadb, or
-an HTTP framework at import time, so ``import sentinel`` stays fast and works on a
-machine with no third-party packages installed.
+Submodules are import-light: ``import sentinel`` touches no filesystem and pulls
+in no heavy dependency.
 """
 
 from __future__ import annotations

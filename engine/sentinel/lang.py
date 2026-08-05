@@ -1,19 +1,10 @@
-"""Language handling for the bilingual corpus.
+"""Language detection and token estimation for the bilingual corpus.
 
-Two things live here, both deliberately dependency-free:
+Both are dependency-free and both are script-aware, because Japanese security
+advisories are dense with ASCII (CVE ids, IPs, "sshd") and Japanese averages ~1
+token per character against English's ~4.
 
-*   ``detect_language`` — a script-ratio classifier. A full langid model would be
-    overkill and wrong for this corpus: Japanese security advisories are dense
-    with ASCII (CVE ids, IP addresses, "sshd", "Authentication"), so a
-    probabilistic model trained on prose mislabels them as English. Counting
-    Japanese script code points is both cheaper and more accurate here.
-*   ``estimate_tokens`` — a tokenizer-free length estimate. Loading a HuggingFace
-    tokenizer just to split text would drag a heavy dependency into the chunking
-    path, and chunk boundaries do not need to be exact. What they do need is to
-    be *right about CJK*: Japanese averages close to one token per character
-    while English averages about four characters per token, so a single
-    characters-per-token constant would make Japanese parents four times too
-    large and silently blow the model's context budget.
+See docs/design/retrieval.md.
 """
 
 from __future__ import annotations

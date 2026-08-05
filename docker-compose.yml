@@ -46,7 +46,16 @@ services:
     # Everything a log parser needs and nothing else.
     read_only: true
     cap_drop: ["ALL"]
-    security_opt: ["no-new-privileges:true"]
+    # Layered confinement. cap_drop and read_only bound what the container may
+    # do; these two bound what it may touch and which syscalls it may make.
+    # AppArmor carries the path policy (seccomp cannot express "read /var/log but
+    # not /etc/shadow"); seccomp denies syscalls a log parser never needs.
+    # Load the AppArmor profile first:
+    #   sudo apparmor_parser -r -W security/apparmor-sentinel-ingestor
+    security_opt:
+      - "no-new-privileges:true"
+      - "seccomp=./security/seccomp-sentinel-ingestor.json"
+      # - "apparmor=sentinel-ingestor"   # uncomment once the profile is loaded
     # No network at all: the ingestor reads a file and writes a file.
     network_mode: none
     logging:

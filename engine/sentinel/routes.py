@@ -22,21 +22,10 @@ from pathlib import Path
 from typing import Any
 
 from .engine import SentinelEngine, event_from_fingerprints
+from .guard import CSRFPolicy, RateLimiter
 from .lang import LANG_EN, LANG_JA
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-
-# Endpoints that change state or spend money. When SENTINEL_API_TOKEN is set,
-# these require it; reads stay open so the dashboard works without a token.
-PROTECTED: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("POST", "/api/index"),
-        ("POST", "/api/shadow/run"),
-        ("POST", "/api/response/block"),
-        ("POST", "/api/response/unblock"),
-        ("POST", "/api/analyze"),
-    }
-)
 
 _IP_RE = re.compile(r"\A[0-9a-fA-F.:]{2,45}\Z")
 
@@ -48,6 +37,7 @@ class Request:
     query: dict[str, str] = field(default_factory=dict)
     body: dict[str, Any] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
+    client: str = ""
 
     def q(self, key: str, default: str = "") -> str:
         return self.query.get(key, default)
@@ -99,41 +89,89 @@ class NotFound(Exception):
     """404."""
 
 
-Handler = Callable[["Router", Request], Response]
+class Forbidden(Exception):
+    """403: authenticated (or unauthenticated) but not permitted."""
+
+
+class TooManyRequests(Exception):
+    """429: rate limited."""
+
+    def __init__(self, message: str, retry_after: float) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+Handler = Callable[["Router", "Request"], "Response"]
+
+
+@dataclass(frozen=True)
+class Route:
+    """One endpoint: where it lives, who may call it, what it costs.
+
+    Declaring all three together is the point. They used to live in three places
+    — a route table, a PROTECTED set, and an ENDPOINT_COST map in another module —
+    so adding an endpoint meant three edits and nothing checked they agreed. An
+    endpoint that is forgotten in the cost map is silently unmetered.
+    """
+
+    method: str
+    path: str
+    handler: Handler
+    protected: bool = False
+    cost: int = 1
+
+
+ROUTES: dict[tuple[str, str], Route] = {}
+
+
+def route(method: str, path: str, *, protected: bool = False, cost: int = 1):
+    """Register a handler. Adding an endpoint is this decorator and nothing else.
+
+    ``protected`` requires the API token when one is configured. ``cost`` is the
+    rate-limit price: LLM-backed endpoints are worth many cheap reads.
+    """
+
+    def decorate(fn: Handler) -> Handler:
+        key = (method.upper(), path)
+        if key in ROUTES:
+            raise RuntimeError(f"duplicate route {method} {path}")
+        ROUTES[key] = Route(method.upper(), path, fn, protected, cost)
+        return fn
+
+    return decorate
+
+
+def alias(method: str, path: str, target: tuple[str, str]) -> None:
+    """Point another path at an already-registered route."""
+    existing = ROUTES[(method.upper(), target[1])]
+    ROUTES[(method.upper(), path)] = Route(
+        method.upper(), path, existing.handler, existing.protected, existing.cost
+    )
 
 
 class Router:
     def __init__(self, engine: SentinelEngine) -> None:
         self.engine = engine
-        self.routes: dict[tuple[str, str], Handler] = {
-            ("GET", "/"): Router.dashboard,
-            ("GET", "/index.html"): Router.dashboard,
-            ("GET", "/api/health"): Router.health,
-            ("GET", "/api/stats"): Router.stats,
-            ("GET", "/api/config"): Router.config,
-            ("GET", "/api/events"): Router.events,
-            ("GET", "/api/events/summary"): Router.events_summary,
-            ("GET", "/api/search"): Router.search,
-            ("POST", "/api/search"): Router.search,
-            ("POST", "/api/analyze"): Router.analyze,
-            ("POST", "/api/index"): Router.index,
-            ("GET", "/api/graph"): Router.graph,
-            ("GET", "/api/graph.dot"): Router.graph_dot,
-            ("GET", "/api/shadow"): Router.shadow_latest,
-            ("POST", "/api/shadow/run"): Router.shadow_run,
-            ("GET", "/api/response/status"): Router.response_status,
-            ("GET", "/api/response/history"): Router.response_history,
-            ("POST", "/api/response/block"): Router.response_block,
-            ("POST", "/api/response/unblock"): Router.response_unblock,
-        }
+        settings = engine.settings
+        self.limiter = RateLimiter(
+            capacity=settings.api_rate_capacity,
+            refill_per_second=settings.api_rate_refill,
+        )
+        self.csrf = CSRFPolicy(require_json=settings.api_require_json_content_type)
+        self.csrf.allowed_origins = self.csrf.default_origins(settings.api_host, settings.api_port)
+        for origin in settings.api_allowed_origins:
+            normalised = CSRFPolicy._normalise(origin)
+            if normalised:
+                self.csrf.allowed_origins.add(normalised)
+        self.routes = ROUTES
 
     # -- dispatch ----------------------------------------------------------
 
     def dispatch(self, request: Request) -> Response:
         """Route a request, converting handler exceptions into HTTP responses."""
         key = (request.method.upper(), _normalise(request.path))
-        handler = self.routes.get(key)
-        if handler is None:
+        spec = self.routes.get(key)
+        if spec is None:
             # Distinguish "wrong method" from "no such path": a 405 tells the
             # caller their URL was right, which saves real debugging time.
             if any(p == key[1] for _m, p in self.routes):
@@ -141,8 +179,13 @@ class Router:
             return Response(404, {"error": "not found", "path": key[1]})
 
         try:
-            self._authorise(key, request)
-            return handler(self, request)
+            self._guard(spec, request)
+            self._authorise(spec, request)
+            return spec.handler(self, request)
+        except TooManyRequests as exc:
+            return Response(429, {"error": str(exc), "retry_after": round(exc.retry_after, 1)})
+        except Forbidden as exc:
+            return Response(403, {"error": str(exc)})
         except Unauthorized as exc:
             return Response(401, {"error": str(exc)})
         except BadRequest as exc:
@@ -154,9 +197,30 @@ class Router:
             # frames leak filesystem layout and package versions to a caller.
             return Response(500, {"error": f"{type(exc).__name__}: {exc}"})
 
-    def _authorise(self, key: tuple[str, str], request: Request) -> None:
+    def _guard(self, spec: Route, request: Request) -> None:
+        """CSRF and rate limit, before any handler work. Order matters: an
+        over-limit request must not first cost an LLM call."""
+        allowed, reason = self.csrf.check(
+            spec.method,
+            request.headers.get("content-type", ""),
+            request.headers.get("origin", ""),
+        )
+        if not allowed:
+            raise Forbidden(reason)
+
+        if not self.engine.settings.api_rate_limit_enabled:
+            return
+        ok, retry_after = self.limiter.check(request.client or "unknown", spec.cost)
+        if not ok:
+            raise TooManyRequests(
+                f"rate limit exceeded for {spec.path} (cost {spec.cost}); "
+                f"retry in {retry_after:.0f}s",
+                retry_after,
+            )
+
+    def _authorise(self, spec: Route, request: Request) -> None:
         token = self.engine.settings.api_token
-        if not token or key not in PROTECTED:
+        if not token or not spec.protected:
             return
         provided = request.bearer()
         # Constant-time comparison: a plain != on a secret is a timing oracle.
@@ -167,185 +231,214 @@ class Router:
                 "this endpoint requires the SENTINEL_API_TOKEN bearer token"
             )
 
-    # -- handlers ----------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# handlers
+# --------------------------------------------------------------------------- #
 
-    def dashboard(self, request: Request) -> Response:
-        path = STATIC_DIR / "dashboard.html"
-        if not path.exists():
-            raise NotFound("dashboard.html is missing from the package")
-        return Response(
-            200,
-            content_type="text/html; charset=utf-8",
-            body_text=path.read_text(encoding="utf-8"),
-        )
 
-    def health(self, request: Request) -> Response:
-        return Response(200, self.engine.health())
+@route("GET", "/")
+def dashboard(router: Router, request: Request) -> Response:
+    path = STATIC_DIR / "dashboard.html"
+    if not path.exists():
+        raise NotFound("dashboard.html is missing from the package")
+    return Response(
+        200,
+        content_type="text/html; charset=utf-8",
+        body_text=path.read_text(encoding="utf-8"),
+    )
 
-    def stats(self, request: Request) -> Response:
-        return Response(200, self.engine.stats())
+@route("GET", "/api/health")
+def health(router: Router, request: Request) -> Response:
+    return Response(200, router.engine.health())
 
-    def config(self, request: Request) -> Response:
-        return Response(200, self.engine.settings.redacted())
+@route("GET", "/api/stats")
+def stats(router: Router, request: Request) -> Response:
+    return Response(200, router.engine.stats())
 
-    def events(self, request: Request) -> Response:
-        self.engine.events.refresh()
-        limit = max(1, min(request.q_int("limit", 100), 2000))
-        events = self.engine.events.query(
-            limit=limit,
-            min_score=request.q_int("min_score", 0),
-            severity=request.q("severity"),
-            category=request.q("category"),
-            source_ip=request.q("source_ip"),
-            rule=request.q("rule"),
-            incidents_only=request.q_bool("incidents_only"),
-            search=request.q("q"),
-        )
-        return Response(200, {"count": len(events), "events": [e.to_dict() for e in events]})
+@route("GET", "/api/config")
+def config(router: Router, request: Request) -> Response:
+    return Response(200, router.engine.settings.redacted())
 
-    def events_summary(self, request: Request) -> Response:
-        self.engine.events.refresh()
-        return Response(200, self.engine.events.summary())
+@route("GET", "/api/events")
+def events(router: Router, request: Request) -> Response:
+    router.engine.events.refresh()
+    limit = max(1, min(request.q_int("limit", 100), 2000))
+    events = router.engine.events.query(
+        limit=limit,
+        min_score=request.q_int("min_score", 0),
+        severity=request.q("severity"),
+        category=request.q("category"),
+        source_ip=request.q("source_ip"),
+        rule=request.q("rule"),
+        incidents_only=request.q_bool("incidents_only"),
+        search=request.q("q"),
+    )
+    return Response(200, {"count": len(events), "events": [e.to_dict() for e in events]})
 
-    def search(self, request: Request) -> Response:
-        query = (request.body.get("query") or request.q("q") or "").strip()
-        if not query:
-            raise BadRequest("a non-empty 'query' (POST body) or 'q' (query string) is required")
-        k = _as_int(request.body.get("k"), request.q_int("k", self.engine.settings.top_k))
-        languages = _as_str_list(request.body.get("languages")) or _split(request.q("languages"))
-        doc_types = _as_str_list(request.body.get("doc_types")) or _split(request.q("doc_types"))
+@route("GET", "/api/events/summary")
+def events_summary(router: Router, request: Request) -> Response:
+    router.engine.events.refresh()
+    return Response(200, router.engine.events.summary())
 
-        for lang in languages:
-            if lang not in {LANG_EN, LANG_JA}:
-                raise BadRequest(f"unsupported language {lang!r}; expected 'en' or 'ja'")
+@route("GET", "/api/search", cost=5)
+@route("POST", "/api/search", cost=5)
+def search(router: Router, request: Request) -> Response:
+    query = (request.body.get("query") or request.q("q") or "").strip()
+    if not query:
+        raise BadRequest("a non-empty 'query' (POST body) or 'q' (query string) is required")
+    k = _as_int(request.body.get("k"), request.q_int("k", router.engine.settings.top_k))
+    languages = _as_str_list(request.body.get("languages")) or _split(request.q("languages"))
+    doc_types = _as_str_list(request.body.get("doc_types")) or _split(request.q("doc_types"))
 
-        results = self.engine.search(
-            query,
-            k=k,
-            languages=languages or None,
-            doc_types=doc_types or None,
-        )
-        return Response(
-            200,
-            {
-                "query": query,
-                "count": len(results),
-                "language_mix": self.engine.retriever.language_mix(results),
-                "embedder": self.engine.embedder.name,
-                "embedder_semantic": self.engine.embedder.semantic,
-                "vector_backend": self.engine.vectors.backend,
-                "results": [r.to_dict() for r in results],
-            },
-        )
+    for lang in languages:
+        if lang not in {LANG_EN, LANG_JA}:
+            raise BadRequest(f"unsupported language {lang!r}; expected 'en' or 'ja'")
 
-    def analyze(self, request: Request) -> Response:
-        """Analyse specific events, a question, or the top recent events."""
-        body = request.body
-        question = str(body.get("question") or "").strip()
-        event_ids = _as_str_list(body.get("event_ids"))
+    results = router.engine.search(
+        query,
+        k=k,
+        languages=languages or None,
+        doc_types=doc_types or None,
+    )
+    return Response(
+        200,
+        {
+            "query": query,
+            "count": len(results),
+            "language_mix": router.engine.retriever.language_mix(results),
+            "embedder": router.engine.embedder.name,
+            "embedder_semantic": router.engine.embedder.semantic,
+            "vector_backend": router.engine.vectors.backend,
+            "results": [r.to_dict() for r in results],
+        },
+    )
 
-        if event_ids:
-            events = event_from_fingerprints(self.engine, event_ids)
-            if not events:
-                raise BadRequest(
-                    "none of the supplied event_ids are in the event buffer; "
-                    "they may have aged out or the fingerprints may be wrong"
-                )
-            alert = self.engine.analyze_events(events, question=question)
-        elif question and not body.get("triage"):
-            alert = self.engine.analyze_question(question)
-        else:
-            limit = _as_int(body.get("limit"), 25)
-            min_score = _as_int(body.get("min_score"), 60)
-            alert = self.engine.triage_top(limit=limit, min_score=min_score, question=question)
-        return Response(200, alert.to_dict())
+@route("POST", "/api/analyze", protected=True, cost=30)
+def analyze(router: Router, request: Request) -> Response:
+    """Analyse specific events, a question, or the top recent events."""
+    body = request.body
+    question = str(body.get("question") or "").strip()
+    event_ids = _as_str_list(body.get("event_ids"))
 
-    def index(self, request: Request) -> Response:
-        rebuild = bool(request.body.get("rebuild")) or request.q_bool("rebuild")
-        stats = self.engine.index_all(rebuild=rebuild)
-        return Response(200, {"rebuild": rebuild, **stats.to_dict(), "index": self.engine.indexer.stats()})
-
-    def graph(self, request: Request) -> Response:
-        """Entity graph, shapes, and optionally a blast radius from a seed."""
-        graph = self.engine.attack_graph(
-            limit=max(1, min(request.q_int("limit", 2000), 20000)),
-            min_score=request.q_int("min_score", 0),
-        )
-        seed = request.q("seed")
-        if seed and seed not in graph.nodes:
+    if event_ids:
+        events = event_from_fingerprints(router.engine, event_ids)
+        if not events:
             raise BadRequest(
-                f"unknown seed {seed!r}; expected an id like 'source_ip:203.0.113.45' "
-                f"(see the 'nodes' array)"
+                "none of the supplied event_ids are in the event buffer; "
+                "they may have aged out or the fingerprints may be wrong"
             )
-        return Response(200, graph.to_dict(seed=seed, max_hops=max(1, min(request.q_int("hops", 3), 8))))
+        alert = router.engine.analyze_events(events, question=question)
+    elif question and not body.get("triage"):
+        alert = router.engine.analyze_question(question)
+    else:
+        limit = _as_int(body.get("limit"), 25)
+        min_score = _as_int(body.get("min_score"), 60)
+        alert = router.engine.triage_top(limit=limit, min_score=min_score, question=question)
+    return Response(200, alert.to_dict())
 
-    def graph_dot(self, request: Request) -> Response:
-        """Graphviz DOT, for `curl … | dot -Tsvg > attack.svg`."""
-        graph = self.engine.attack_graph(min_score=request.q_int("min_score", 0))
-        return Response(200, content_type="text/vnd.graphviz; charset=utf-8",
-                        body_text=graph.to_dot())
+@route("POST", "/api/index", protected=True, cost=20)
+def index(router: Router, request: Request) -> Response:
+    rebuild = bool(request.body.get("rebuild")) or request.q_bool("rebuild")
+    stats = router.engine.index_all(rebuild=rebuild)
+    return Response(200, {"rebuild": rebuild, **stats.to_dict(), "index": router.engine.indexer.stats()})
 
-    def shadow_latest(self, request: Request) -> Response:
-        """The most recent report, read from disk. Cheap: never runs a search.
-
-        The dashboard polls this every few seconds; running a full baseline build
-        on each poll would make the panel the most expensive thing in the system.
-        """
-        return Response(200, self.engine.shadow_latest())
-
-    def shadow_run(self, request: Request) -> Response:
-        """Execute a Shadow Search pass now. Protected: it costs retrieval and,
-        with a provider configured, LLM calls."""
-        as_of = None
-        if request.body.get("as_of"):
-            from datetime import datetime, timezone
-
-            try:
-                as_of = datetime.fromisoformat(str(request.body["as_of"]).replace("Z", "+00:00"))
-            except ValueError:
-                raise BadRequest("'as_of' must be an ISO timestamp") from None
-            if as_of.tzinfo is None:
-                as_of = as_of.replace(tzinfo=timezone.utc)
-
-        report = self.engine.shadow_search(
-            window_hours=_as_int(request.body.get("window_hours"), 0) or None,
-            limit=_as_int(request.body.get("limit"), 0) or None,
-            ignore_cooldown=bool(request.body.get("ignore_cooldown")),
-            now=as_of,
+@route("GET", "/api/graph", cost=3)
+def graph(router: Router, request: Request) -> Response:
+    """Entity graph, shapes, and optionally a blast radius from a seed."""
+    graph = router.engine.attack_graph(
+        limit=max(1, min(request.q_int("limit", 2000), 20000)),
+        min_score=request.q_int("min_score", 0),
+    )
+    seed = request.q("seed")
+    if seed and seed not in graph.nodes:
+        raise BadRequest(
+            f"unknown seed {seed!r}; expected an id like 'source_ip:203.0.113.45' "
+            f"(see the 'nodes' array)"
         )
-        return Response(200, report.to_dict())
+    return Response(200, graph.to_dict(seed=seed, max_hops=max(1, min(request.q_int("hops", 3), 8))))
 
-    def response_status(self, request: Request) -> Response:
-        return Response(200, self.engine.responder.status())
+@route("GET", "/api/graph.dot", cost=3)
+def graph_dot(router: Router, request: Request) -> Response:
+    """Graphviz DOT, for `curl … | dot -Tsvg > attack.svg`."""
+    graph = router.engine.attack_graph(min_score=request.q_int("min_score", 0))
+    return Response(200, content_type="text/vnd.graphviz; charset=utf-8",
+                    body_text=graph.to_dot())
 
-    def response_history(self, request: Request) -> Response:
-        limit = max(1, min(request.q_int("limit", 100), 1000))
-        return Response(200, {"actions": self.engine.responder.history(limit)})
+@route("GET", "/api/shadow")
+def shadow_latest(router: Router, request: Request) -> Response:
+    """The most recent report, read from disk. Cheap: never runs a search.
 
-    def response_block(self, request: Request) -> Response:
-        ip = str(request.body.get("ip") or "").strip()
-        if not ip or not _IP_RE.match(ip):
-            raise BadRequest("'ip' must be a valid IPv4 or IPv6 address")
-        score = _as_int(request.body.get("score"), -1)
-        if score < 0:
-            # The score must come from the ingestor's deterministic rules, so the
-            # caller has to state it; defaulting it would let a block through with
-            # no evidence behind it.
-            raise BadRequest("'score' is required: pass the deterministic ingestor score for the triggering event")
-        reason = str(request.body.get("reason") or "").strip() or "operator request via API"
-        dry_run = request.body.get("dry_run")
-        action = self.engine.responder.block(
-            ip, score=score, reason=reason,
-            dry_run=None if dry_run is None else bool(dry_run),
-        )
-        return Response(200 if action.allowed else 403, action.to_dict())
+    The dashboard polls this every few seconds; running a full baseline build
+    on each poll would make the panel the most expensive thing in the system.
+    """
+    return Response(200, router.engine.shadow_latest())
 
-    def response_unblock(self, request: Request) -> Response:
-        ip = str(request.body.get("ip") or "").strip()
-        if not ip or not _IP_RE.match(ip):
-            raise BadRequest("'ip' must be a valid IPv4 or IPv6 address")
-        action = self.engine.responder.unblock(ip)
-        return Response(200 if action.allowed else 400, action.to_dict())
+@route("POST", "/api/shadow/run", protected=True, cost=30)
+def shadow_run(router: Router, request: Request) -> Response:
+    """Execute a Shadow Search pass now. Protected: it costs retrieval and,
+    with a provider configured, LLM calls."""
+    as_of = None
+    if request.body.get("as_of"):
+        from datetime import datetime, timezone
+
+        try:
+            as_of = datetime.fromisoformat(str(request.body["as_of"]).replace("Z", "+00:00"))
+        except ValueError:
+            raise BadRequest("'as_of' must be an ISO timestamp") from None
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=timezone.utc)
+
+    report = router.engine.shadow_search(
+        window_hours=_as_int(request.body.get("window_hours"), 0) or None,
+        limit=_as_int(request.body.get("limit"), 0) or None,
+        ignore_cooldown=bool(request.body.get("ignore_cooldown")),
+        now=as_of,
+    )
+    return Response(200, report.to_dict())
+
+@route("GET", "/api/response/status")
+def response_status(router: Router, request: Request) -> Response:
+    return Response(200, router.engine.responder.status())
+
+@route("GET", "/api/response/history")
+def response_history(router: Router, request: Request) -> Response:
+    limit = max(1, min(request.q_int("limit", 100), 1000))
+    return Response(200, {"actions": router.engine.responder.history(limit)})
+
+@route("POST", "/api/response/block", protected=True, cost=10)
+def response_block(router: Router, request: Request) -> Response:
+    ip = str(request.body.get("ip") or "").strip()
+    if not ip or not _IP_RE.match(ip):
+        raise BadRequest("'ip' must be a valid IPv4 or IPv6 address")
+    score = _as_int(request.body.get("score"), -1)
+    if score < 0:
+        # The score must come from the ingestor's deterministic rules, so the
+        # caller has to state it; defaulting it would let a block through with
+        # no evidence behind it.
+        raise BadRequest("'score' is required: pass the deterministic ingestor score for the triggering event")
+    reason = str(request.body.get("reason") or "").strip() or "operator request via API"
+    dry_run = request.body.get("dry_run")
+    action = router.engine.responder.block(
+        ip, score=score, reason=reason,
+        dry_run=None if dry_run is None else bool(dry_run),
+    )
+    return Response(200 if action.allowed else 403, action.to_dict())
+
+@route("POST", "/api/response/unblock", protected=True, cost=10)
+def response_unblock(router: Router, request: Request) -> Response:
+    ip = str(request.body.get("ip") or "").strip()
+    if not ip or not _IP_RE.match(ip):
+        raise BadRequest("'ip' must be a valid IPv4 or IPv6 address")
+    action = router.engine.responder.unblock(ip)
+    return Response(200 if action.allowed else 400, action.to_dict())
+
+
+alias("GET", "/index.html", ("GET", "/"))
+
+
+# --------------------------------------------------------------------------- #
+# request helpers
+# --------------------------------------------------------------------------- #
 
 
 def _normalise(path: str) -> str:

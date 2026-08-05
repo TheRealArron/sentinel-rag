@@ -1,0 +1,76 @@
+# AppArmor profile for the Sentinel Go ingestor.
+#
+#   sudo apparmor_parser -r -W security/apparmor-sentinel-ingestor
+#   docker run --security-opt apparmor=sentinel-ingestor ...
+#   # or in docker-compose.yml:  security_opt: ["apparmor=sentinel-ingestor"]
+#
+# AppArmor rather than seccomp for the *path* policy. Seccomp filters syscalls;
+# it cannot express "open() is fine for /var/log but not for /etc/shadow", which
+# is exactly the confinement wanted here. The two are complementary and this
+# repo ships both.
+#
+# NOT TESTED ON THIS MACHINE — no Docker or AppArmor tooling was available while
+# writing it. Load it in complain mode first and read the denials:
+#   sudo aa-complain /etc/apparmor.d/sentinel-ingestor
+#   sudo journalctl -f | grep apparmor
+
+#include <tunables/global>
+
+profile sentinel-ingestor flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # The binary itself. Static Go, no interpreter, no shared libraries.
+  /sentinel-ingestor        mr,
+
+  # ---- reads: host logs, and nothing else ---------------------------------
+  # Read-only, and specific. The ingestor's entire job is to read these.
+  /hostlogs/                r,
+  /hostlogs/**              r,
+  /var/log/auth.log         r,
+  /var/log/syslog           r,
+  /var/log/auth.log.[0-9]   r,
+  /var/log/syslog.[0-9]     r,
+
+  # Canary definitions, read-only.
+  /config/honeytokens.json  r,
+
+  # ---- writes: the event stream and the shipper spool, nothing else -------
+  /data/                    r,
+  /data/events.jsonl        rwk,
+  /var/spool/sentinel/      rw,
+  /var/spool/sentinel/**    rwk,
+
+  # ---- mTLS material: read-only, and only the probe's own identity --------
+  /pki/ca.crt               r,
+  /pki/certs/*.crt          r,
+  /pki/private/*.key        r,
+
+  # ---- network: outbound TLS to the hub only ------------------------------
+  # Omit these two lines entirely for a local-only ingestor; the compose file
+  # runs it with network_mode: none, in which case AppArmor has nothing to do.
+  network inet stream,
+  network inet6 stream,
+
+  # ---- explicitly denied ---------------------------------------------------
+  # Not merely absent — denied, so a policy edit that widens the reads above
+  # still cannot reach these. Logged when attempted, which makes an attempt a
+  # detection in its own right.
+  deny /etc/shadow          rwklx,
+  deny /etc/gshadow         rwklx,
+  deny /etc/passwd          wl,
+  deny /root/**             rwklx,
+  deny /home/**             rwklx,
+  deny /proc/*/mem          rwklx,
+  deny /sys/**              wl,
+  deny /var/log/**          wl,     # read the logs; never rewrite them
+  deny /**/.ssh/**          rwklx,
+
+  # No execution at all. The ingestor never spawns anything — it parses text.
+  deny /bin/**              x,
+  deny /usr/bin/**          x,
+  deny /usr/local/bin/**    x,
+
+  # No capabilities. The compose file already drops them; this is the second
+  # fence, in case the container is run by hand without cap_drop.
+  deny capability,
+}

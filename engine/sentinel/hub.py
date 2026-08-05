@@ -1,45 +1,13 @@
-"""Phase 9 — the fleet hub: mTLS log ingestion from many probes.
+"""Phase 9 fleet hub: mTLS ingest from remote Go probes.
 
-One Python engine, many Go ingestors. The probes ship NDJSON over mutually
-authenticated TLS; the hub verifies who is talking, decides whether it still
-trusts them, and appends to the event log the rest of the engine already reads.
+Probes ship NDJSON over mutually authenticated TLS. The hub verifies who is
+talking, decides whether it still trusts them, and appends to the event log.
 
-# Why HTTPS and not gRPC
+Two things worth knowing before reading: the hub pins each event's ``host`` to the
+client certificate's Common Name (mTLS proves who connected, not what the logs
+describe), and revocation is a hot-reloaded fingerprint deny list.
 
-gRPC is the obvious answer and it is not the right one here. The mTLS work — the
-part that is actually load-bearing — is *identical* under both, because mTLS is a
-TLS-layer property, not an application-protocol one. gRPC's mutual auth is TLS
-mutual auth.
-
-What differs is cost. grpc-go pulls roughly forty transitive modules into the Go
-ingestor, whose freedom from dependencies is a stated security property of this
-project: it is the component that parses attacker-controlled input, it ships as a
-`FROM scratch` container with no shell and no libc, and CI enforces the empty
-`go.mod`. Spending that on protobuf typing and HTTP/2 multiplexing would buy
-features this workload does not use — there is one stream of append-only lines
-per probe, no request/response fan-out, and no cross-team schema negotiation.
-
-With `crypto/tls` and `net/http` on one side and `ssl` and `http.server` on the
-other, both halves stay standard library. NDJSON over chunked HTTP/1.1 is also
-what Vector, Fluent Bit and the Elastic Beats do; it is the ordinary choice for
-log shipping, not a lesser one. gRPC earns its keep when schemas evolve across
-team boundaries — which is a real thing, just not this thing.
-
-# What mTLS proves, and the gap it leaves
-
-mTLS proves *a* probe holding a CA-signed key is connected. It does not prove
-which host the logs describe. Without binding the two, any valid probe can submit
-events claiming to be any other host — a compromised probe-04 could file clean
-logs as probe-07 and hide inside the fleet.
-
-So the hub pins every event's ``host`` field to the client certificate's Common
-Name. Authentication is not authorisation, and on a telemetry pipeline the
-difference is the entire attack.
-
-# Revocation
-
-See ``RevocationList``. Short version: a hot-reloaded deny list keyed on the
-certificate fingerprint, checked per connection, enforced at the hub.
+See docs/design/transport.md.
 """
 
 from __future__ import annotations
@@ -65,37 +33,11 @@ MAX_REQUEST_BYTES = 256 << 20
 
 
 class RevocationList:
-    """A hot-reloaded deny list of certificate fingerprints.
+    """Hot-reloaded deny list of certificate fingerprints.
 
-    # Why not OCSP
-
-    OCSP answers "is this certificate still good?" with a network call per
-    connection, which turns the responder into a hard dependency of the whole
-    fleet. When it is unreachable you must choose between fail-open — accepting
-    revoked probes exactly when something is wrong with your infrastructure — and
-    fail-closed, which converts a responder outage into a total telemetry
-    blackout. Standing up an OCSP responder to guard a handful of laptops is also
-    disproportionate.
-
-    # Why not a signed CRL
-
-    A CRL is signed by the CA so it can be distributed over an untrusted channel.
-    Here the list lives on the machine that enforces it. An attacker who can edit
-    the hub's revocation file already controls the hub, so the signature protects
-    nothing — it is ceremony, and ceremony that needs the CA key online to add one
-    line is worse than ceremony that does not.
-
-    # What this does instead
-
-    A JSON file the hub re-reads when its mtime changes, checked during the TLS
-    handshake callback. Revoking probe-04 is one entry plus a file write:
-    immediate, no restart, no CA key, and — the part the question was really
-    about — **no other certificate in the fleet is touched**. Reissuing the whole
-    fleet to remove one member is the failure mode this avoids.
-
-    It pairs with short client-certificate lifetimes (90 days by default). The
-    deny list only has to cover the window between theft and expiry, so it stays
-    small and bounded rather than growing forever.
+    Revoking one probe is a single file write: no restart, no CA key, and no
+    other certificate affected. See docs/design/transport.md for why not OCSP or
+    a signed CRL.
     """
 
     def __init__(self, path: Path | None) -> None:
@@ -209,28 +151,10 @@ class FleetHub:
     def accept_line(self, probe: str, line: str) -> tuple[bool, str]:
         """Validate and persist one NDJSON event from ``probe``.
 
-        The host pin is here. mTLS established *who is connected*; this
-        establishes *what they are allowed to say*. Without it a valid
-        certificate is a licence to file logs about any machine in the fleet.
-
-        # Rewrite, not reject
-
-        The obvious enforcement is to drop events whose ``host`` disagrees with
-        the certificate. Running it showed why that is wrong: a probe's syslog
-        host field is whatever the machine calls itself, and any disagreement —
-        a hostname change, a container, a cert issued under a different name —
-        silently discards 100% of that probe's telemetry. An attacker who can
-        set a hostname could then turn off a probe's visibility entirely, which
-        is a worse outcome than the impersonation it was guarding against.
-
-        So the claim is *neutralised* rather than obeyed: ``host`` is overwritten
-        with the authenticated CN, and the original is preserved as
-        ``_claimed_host`` for forensics. A probe cannot lie about which machine
-        it speaks for, and it cannot make itself disappear by trying to.
-
-        A mismatch is still a finding — it is counted and surfaced in
-        ``/status`` — and ``SENTINEL_HUB_REJECT_HOST_MISMATCH=1`` restores hard
-        rejection for deployments that would rather fail closed.
+        The host claim is neutralised rather than obeyed: ``host`` becomes the
+        authenticated CN and the original is kept as ``_claimed_host``. Rejecting
+        instead would let a hostname change silence a probe entirely.
+        See docs/design/transport.md.
         """
         try:
             event = json.loads(line)

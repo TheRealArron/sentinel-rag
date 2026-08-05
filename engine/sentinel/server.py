@@ -73,6 +73,7 @@ class _Handler(BaseHTTPRequestHandler):
             query=dict(parse_qsl(parsed.query, keep_blank_values=True)),
             body=body,
             headers={k.lower(): v for k, v in self.headers.items()},
+            client=self.client_address[0] if self.client_address else "",
         )
         response = self.router.dispatch(request)
         self._send(response.status, response.rendered(), response.content_type)
@@ -81,6 +82,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
+        # No Access-Control-Allow-Origin, ever. Sending none is the strictest
+        # possible CORS policy: a cross-origin page cannot read any response.
+        # Combined with the application/json requirement on mutating routes, a
+        # cross-origin request cannot be made to take effect either.
         # The dashboard inlines all of its CSS and JS, so a strict CSP costs
         # nothing here and removes the injected-script risk from rendering
         # attacker-controlled log text.

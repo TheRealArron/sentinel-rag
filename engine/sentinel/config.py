@@ -111,6 +111,11 @@ class Settings:
     openai_model: str = field(default_factory=lambda: _env("SENTINEL_OPENAI_MODEL", "gpt-4o-mini"))
     llm_temperature: float = field(default_factory=lambda: _env_float("SENTINEL_LLM_TEMPERATURE", 0.1))
     llm_max_tokens: int = field(default_factory=lambda: _env_int("SENTINEL_LLM_MAX_TOKENS", 1600))
+    # Bounds the prompt as well as the completion. Output caps stop a runaway
+    # answer; this stops a long-form injection padded with attacker-chosen log
+    # text from costing money per request and crowding the real evidence out of
+    # the context window.
+    llm_max_prompt_chars: int = field(default_factory=lambda: _env_int("SENTINEL_LLM_MAX_PROMPT_CHARS", 48000))
     llm_timeout: float = field(default_factory=lambda: _env_float("SENTINEL_LLM_TIMEOUT", 60.0))
     gemini_api_key: str = field(default_factory=lambda: _env("GEMINI_API_KEY", _env("GOOGLE_API_KEY", "")))
     openai_api_key: str = field(default_factory=lambda: _env("OPENAI_API_KEY", ""))
@@ -203,6 +208,26 @@ class Settings:
     api_host: str = field(default_factory=lambda: _env("SENTINEL_API_HOST", "127.0.0.1"))
     api_port: int = field(default_factory=lambda: _env_int("SENTINEL_API_PORT", 8000))
     api_token: str = field(default_factory=lambda: _env("SENTINEL_API_TOKEN", ""))
+    # Rate limiting. LLM endpoints cost real money and real CPU, and an unmetered
+    # /api/analyze is both a wallet drain and a way to keep the engine too busy to
+    # notice events. Enforced in the shared router so BOTH the FastAPI app and the
+    # stdlib server are covered — a control present in only one supported
+    # deployment path is not a control.
+    api_rate_limit_enabled: bool = field(default_factory=lambda: _env_bool("SENTINEL_API_RATE_LIMIT", True))
+    api_rate_capacity: int = field(default_factory=lambda: _env_int("SENTINEL_API_RATE_CAPACITY", 240))
+    api_rate_refill: float = field(default_factory=lambda: _env_float("SENTINEL_API_RATE_REFILL", 4.0))
+
+    # CSRF. The dashboard is unauthenticated by default, so a page the operator
+    # visits could otherwise issue a simple cross-origin POST to
+    # /api/response/block. Requiring application/json forces a preflight that this
+    # server (which sends no CORS headers at all) will never satisfy.
+    api_require_json_content_type: bool = field(
+        default_factory=lambda: _env_bool("SENTINEL_API_REQUIRE_JSON", True))
+    # Extra origins permitted to make mutating requests, beyond the dashboard's
+    # own. Only needed behind a reverse proxy.
+    api_allowed_origins: list[str] = field(
+        default_factory=lambda: _env_list("SENTINEL_API_ALLOWED_ORIGINS", ""))
+
     max_events_in_memory: int = field(default_factory=lambda: _env_int("SENTINEL_MAX_EVENTS", 20000))
 
     def validate(self) -> None:
@@ -266,6 +291,10 @@ class Settings:
             raise ValueError("SENTINEL_SHADOW_TOP_N must be positive")
         if self.shadow_min_surprise < 0:
             raise ValueError("SENTINEL_SHADOW_MIN_SURPRISE must not be negative")
+        if self.llm_max_tokens <= 0 or self.llm_max_prompt_chars <= 0:
+            raise ValueError("SENTINEL_LLM_MAX_TOKENS and _MAX_PROMPT_CHARS must be positive")
+        if self.api_rate_capacity <= 0 or self.api_rate_refill <= 0:
+            raise ValueError("SENTINEL_API_RATE_CAPACITY and _REFILL must be positive")
         if not 1 <= self.hub_port <= 65535:
             raise ValueError(f"SENTINEL_HUB_PORT must be 1-65535, got {self.hub_port}")
         if self.top_k <= 0 or self.candidate_k <= 0:

@@ -277,6 +277,17 @@ class Alert:
     provider: str = ""
     anonymized: bool = False
     degraded: bool = False
+    # Machine-readable faithfulness verdict. A human note is not enough: a
+    # downstream consumer routing alerts needs to be able to *filter* on this
+    # without parsing prose.
+    #   GROUNDED             every citation resolved to a retrieved source
+    #   PARTIALLY_GROUNDED   some citations resolved, some were invented
+    #   UNGROUNDED           the model cited nothing at all
+    #   POTENTIALLY_HALLUCINATED  every citation the model gave was invented
+    #   NOT_APPLICABLE       rule-based output, no model involved
+    grounding: str = "NOT_APPLICABLE"
+    citations_claimed: int = 0
+    citations_valid: int = 0
     notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -297,6 +308,11 @@ class Alert:
             "provider": self.provider,
             "anonymized": self.anonymized,
             "degraded": self.degraded,
+            "grounding": {
+                "verdict": self.grounding,
+                "citations_claimed": self.citations_claimed,
+                "citations_valid": self.citations_valid,
+            },
             "notes": list(self.notes),
         }
 

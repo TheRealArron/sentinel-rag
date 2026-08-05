@@ -32,6 +32,15 @@ demo: ## End-to-end walkthrough (no Go, no Docker, no API key needed)
 serve: ## Run the dashboard on http://127.0.0.1:8000/
 	$(PYTHON) -m sentinel serve
 
+.PHONY: lock
+lock: ## Regenerate the hash-pinned lockfile (slow: resolves the full ML stack)
+	$(PYTHON) -m piptools compile --generate-hashes --strip-extras \
+	  --output-file=engine/requirements.lock engine/requirements.txt
+
+.PHONY: install-locked
+install-locked: ## Install from the lockfile, verifying every hash
+	$(PYTHON) -m pip install --require-hashes -r engine/requirements.lock
+
 .PHONY: install
 install: ## Install the Python engine's optional dependencies
 	$(PYTHON) -m pip install -r engine/requirements.txt

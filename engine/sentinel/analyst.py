@@ -330,6 +330,23 @@ class Analyst:
             "operator do next?"
         )
 
+        # Cap the assembled prompt. Output tokens were already bounded, but an
+        # unbounded *input* is the other half of the budget: a long-form injection
+        # padded with megabytes of attacker-chosen log text costs real money per
+        # request and can push the real evidence out of the context window. The
+        # log block is truncated first because retrieved advisories are trusted
+        # and attacker-controlled log text is not.
+        budget = self.settings.llm_max_prompt_chars
+        if len(log_block) + len(scrubbed_context) > budget:
+            log_budget = max(2000, budget - len(scrubbed_context))
+            if len(log_block) > log_budget:
+                log_block = log_block[:log_budget] + (
+                    f"\n…[{len(log_block) - log_budget} characters of log text truncated "
+                    f"to stay inside the prompt budget]"
+                )
+            if len(scrubbed_context) > budget:
+                scrubbed_context = scrubbed_context[:budget] + "\n…[context truncated]"
+
         return (
             f"ANALYST QUESTION\n{anonymizer.scrub(asked)}\n\n"
             f"HOST TELEMETRY (untrusted data, {len(events)} event(s))\n"
@@ -382,9 +399,16 @@ class Analyst:
         if sev_note:
             notes.append(sev_note)
 
-        citations, cite_note = self._validate_citations(_as_list(payload.get("citations")), retrieved)
+        claimed = _as_list(payload.get("citations"))
+        citations, cite_note = self._validate_citations(claimed, retrieved)
         if cite_note:
             notes.append(cite_note)
+        verdict = self._grounding_verdict(len(claimed), len(citations))
+        if verdict == "POTENTIALLY_HALLUCINATED":
+            notes.append(
+                "POTENTIALLY HALLUCINATED: every source the model cited was invented — "
+                "none matched a retrieved document. Treat the narrative as unverified."
+            )
 
         confidence = _as_float(payload.get("confidence"), default=0.5)
         if not citations:
@@ -414,8 +438,28 @@ class Analyst:
             provider=self.llm.provider,
             anonymized=anonymizer.enabled and anonymizer.substitutions > 0,
             degraded=False,
+            grounding=verdict,
+            citations_claimed=len(claimed),
+            citations_valid=len(citations),
             notes=[restore(n) for n in notes],
         )
+
+    @staticmethod
+    def _grounding_verdict(claimed: int, valid: int) -> str:
+        """Faithfulness of the answer to the retrieved context.
+
+        The distinction that matters is between "cited nothing" and "cited things
+        that do not exist". The first is an unhelpful answer; the second is a
+        model confabulating sources, which is the failure mode that makes an
+        alert actively misleading — it *looks* grounded.
+        """
+        if claimed == 0:
+            return "UNGROUNDED"
+        if valid == 0:
+            return "POTENTIALLY_HALLUCINATED"
+        if valid < claimed:
+            return "PARTIALLY_GROUNDED"
+        return "GROUNDED"
 
     def _clamp_severity(self, proposed: str, observed: str) -> tuple[str, str]:
         """Allow the model one step of escalation above the deterministic score."""

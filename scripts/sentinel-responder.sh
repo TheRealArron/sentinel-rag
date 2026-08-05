@@ -33,18 +33,58 @@ set -euo pipefail
 
 AUDIT_LOG="${SENTINEL_AUDIT_LOG:-/var/lib/docker/volumes/sentinel-rag_sentinel-data/_data/audit.log}"
 STATE_FILE="${SENTINEL_RESPONDER_STATE:-/var/lib/sentinel/responder.state}"
+
+# The responder keeps its OWN audit trail, separate from the engine's audit.log
+# and from the journal. Two reasons: the engine's log is written by a container
+# the engine controls, so it is evidence produced by the thing under review; and
+# journald rotates on its own schedule, so the record of what was done to the
+# firewall would age out with unrelated noise. This file is append-only, one JSON
+# object per line, and records refusals as well as actions.
+RESPONDER_AUDIT="${SENTINEL_RESPONDER_AUDIT:-/var/lib/sentinel/responder-audit.jsonl}"
 ENFORCE="${SENTINEL_RESPONDER_ENFORCE:-0}"
 MIN_SCORE="${SENTINEL_RESPONDER_MIN_SCORE:-90}"
 MAX_PER_RUN="${SENTINEL_RESPONDER_MAX_PER_RUN:-5}"
 
-# Independent allowlist. Not read from the engine's configuration on purpose: a
-# compromised engine must not be able to widen what this script will block.
+# Independent allowlist. Deliberately NOT read from the engine's configuration: a
+# compromised engine must not be able to widen what this script will block. These
+# prefixes can only ever be added to from this file or from
+# SENTINEL_RESPONDER_EXTRA_ALLOW, never removed by anything the engine says.
 ALLOWLIST=(
   "127."        "10."         "172.16."     "172.17."     "172.18."     "172.19."
   "172.2"       "172.30."     "172.31."     "192.168."    "169.254."    "::1"
 )
 
+# Site-specific ranges that must never be blocked — your office, your university,
+# your ISP's gateway, the address you SSH in from. Set it; the defaults above
+# only cover loopback and RFC1918, which will not save you if you administer this
+# box from a public address.
+#
+#   SENTINEL_RESPONDER_EXTRA_ALLOW="203.0.113. 198.51.100.42"
+#
+# Left empty on purpose. Guessing an institution's range and shipping it as a
+# default would be a fabricated safety guarantee — if the guess is wrong the
+# operator believes they are protected and is not.
+read -r -a EXTRA_ALLOW <<< "${SENTINEL_RESPONDER_EXTRA_ALLOW:-}"
+ALLOWLIST+=("${EXTRA_ALLOW[@]}")
+
+# The address this session came from, if any. Blocking the range you are
+# currently connected from is the single most likely way to lock yourself out,
+# and it is trivially detectable.
+if [[ -n "${SSH_CLIENT:-}" ]]; then
+  ALLOWLIST+=("$(awk '{print $1}' <<< "$SSH_CLIENT")")
+fi
+
 log() { printf '%s sentinel-responder: %s\n' "$(date -Is)" "$*"; }
+
+# Structured, append-only, separate from the journal. Every decision including
+# refusals: "the system declined to act" is exactly what an incident review needs.
+audit() {
+  local verdict="$1" ip="$2" reason="$3" score="${4:--1}"
+  mkdir -p "$(dirname "$RESPONDER_AUDIT")" 2>/dev/null || true
+  printf '{"at":"%s","verdict":"%s","target":"%s","score":%s,"reason":"%s","enforce":%s,"host":"%s"}\n' \
+    "$(date -Is)" "$verdict" "$ip" "$score" "${reason//\"/\'}" "${ENFORCE:-0}" "$(hostname)" \
+    >> "$RESPONDER_AUDIT" 2>/dev/null || log "WARNING: could not write $RESPONDER_AUDIT"
+}
 die() { log "ERROR: $*"; exit 1; }
 
 command -v ufw >/dev/null 2>&1 || die "ufw is not installed"
@@ -80,6 +120,7 @@ while IFS=$'\t' read -r ip score reason at; do
 
   if is_allowlisted "$ip"; then
     log "REFUSED $ip — allowlisted range (host-side allowlist)"
+    audit refused "$ip" "allowlisted range" "$score"
     continue
   fi
 
@@ -87,11 +128,13 @@ while IFS=$'\t' read -r ip score reason at; do
   # be correct even if the engine is entirely compromised.
   if [[ ! "$score" =~ ^[0-9]+$ ]] || (( score < MIN_SCORE )); then
     log "REFUSED $ip — score '${score}' below host-side threshold $MIN_SCORE"
+    audit refused "$ip" "score below host-side threshold $MIN_SCORE" "$score"
     continue
   fi
 
   if ! [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
     log "REFUSED $ip — not a valid address"
+    audit refused "$ip" "not a valid address" "$score"
     continue
   fi
 
@@ -108,16 +151,19 @@ while IFS=$'\t' read -r ip score reason at; do
 
   if [[ "$ENFORCE" != "1" ]]; then
     log "DRY-RUN would block $ip (score $score, recorded $at): $reason"
+    audit dry-run "$ip" "$reason" "$score"
     continue
   fi
 
   # insert 1: a deny appended after an existing allow would never match.
   if ufw insert 1 deny from "$ip" to any; then
     log "BLOCKED $ip (score $score, recorded $at): $reason"
+    audit blocked "$ip" "$reason" "$score"
     echo "$ip" >> "$STATE_FILE"
     applied=$((applied + 1))
   else
     log "FAILED to block $ip — ufw returned $?"
+    audit failed "$ip" "ufw invocation failed" "$score"
   fi
 done < <(
   jq -r 'select(.action == "block" and .allowed == true)
@@ -126,3 +172,4 @@ done < <(
 )
 
 log "done — $processed approved decision(s) considered, $applied rule(s) applied (enforce=$ENFORCE)"
+log "allowlist has ${#ALLOWLIST[@]} prefix(es); audit trail: $RESPONDER_AUDIT"

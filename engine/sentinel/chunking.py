@@ -1,26 +1,10 @@
 """Hierarchical (parent-document) chunking.
 
-Why two levels. Embedding a 2000-token advisory into one vector averages away
-the specific sentence that matters, so retrieval misses. Embedding 400-token
-chunks retrieves precisely but hands the LLM a fragment with no surrounding
-context, which is exactly the condition under which models hallucinate a
-plausible-sounding remediation. The parent-document pattern gets both: search the
-small child, return the large parent.
+Search small, precise children; hand the model large, contextual parents. The
+splitter is hand-written rather than LangChain's because chunk budgets and
+sentence separators both have to be script-aware.
 
-Why a hand-written splitter instead of LangChain's. Two reasons, both about the
-Japanese half of the corpus:
-
-*   Token estimation has to be script-aware. A character-count splitter
-    configured for English produces Japanese chunks roughly four times over
-    budget, because Japanese is close to one token per character. ``lang.estimate_tokens``
-    handles that; a naive ``len(text)`` does not.
-*   Sentence separators have to include Japanese punctuation. Splitting Japanese
-    on ``". "`` finds nothing and falls through to a hard character cut, which
-    slices mid-sentence and mid-word. ``。``, ``、``, and ``\\u3001`` are in the
-    separator list for that reason.
-
-The engine still uses LangChain for orchestration where it earns its keep; this
-particular 150 lines is load-bearing enough to own.
+See docs/design/retrieval.md.
 """
 
 from __future__ import annotations

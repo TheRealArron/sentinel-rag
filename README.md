@@ -728,6 +728,55 @@ sentinel-ingestor -in /var/log/auth.log -follow \
 
 ---
 
+### 14. Hardening: the hole a CORS allowlist would not have closed
+
+A pre-flight security pass, run against the live server rather than reasoned about.
+
+**The finding.** The dashboard is unauthenticated by default, and a *simple*
+cross-origin POST reached `/api/response/block` and was acted on:
+
+```
+curl -X POST http://127.0.0.1:8000/api/response/block \
+     -H 'Content-Type: text/plain' -H 'Origin: https://evil.example' \
+     -d '{"ip":"203.0.113.45","score":99}'
+-> {"allowed": true, ...}
+```
+
+Any page the operator visited could trigger a firewall action. **A CORS
+allowlist would not have fixed this** — CORS governs whether a page may *read* a
+response, not whether the request is sent or acted on. The project already had
+the strictest CORS policy possible (no middleware, so no
+`Access-Control-Allow-Origin` at all); adding an allowlist would have *loosened*
+it. The fixes that work are requiring `Content-Type: application/json` on
+mutating routes — which forces a preflight that is never satisfied — and
+rejecting a mismatched `Origin`.
+
+**Rate limiting is in the shared router, not middleware.** SlowAPI is
+FastAPI-specific and would have left `serve --stdlib` completely unmetered. A
+control absent from a supported deployment path is not a control. Token bucket,
+priced per endpoint: an LLM analysis costs 30, a health check 1.
+
+**Already in place before this pass**, verified rather than reimplemented:
+constant-time token comparison (`hmac.compare_digest`), citation validation, the
+output-token cap, and the responder's allowlist. What was genuinely missing was
+rate limiting, CSRF, an *input* token budget, and a machine-readable grounding
+verdict.
+
+| Control | Where |
+|---|---|
+| `POTENTIALLY_HALLUCINATED` verdict | `Alert.grounding` — filterable, not prose |
+| Prompt budget (not just completion) | truncates log text first; advisories are trusted |
+| Responder audit trail | separate append-only JSONL, records refusals too |
+| Never-block ranges | RFC1918 + your `$SSH_CLIENT`, auto-detected |
+| AppArmor + seccomp | `security/` — path policy and 41 denied syscalls |
+| Hash-pinned dependencies | `make lock` / `make install-locked` |
+
+The responder's allowlist deliberately ships **without** a guessed institutional
+range. A wrong guess is worse than no guess: the operator believes they are
+protected and is not. Set `SENTINEL_RESPONDER_EXTRA_ALLOW` for your own.
+
+---
+
 <a name="performance"></a>
 ## 📊 Performance
 
@@ -780,7 +829,7 @@ Measured, not asserted: a 4 MiB single log line is consumed in full
 (`bytes_read=4194387`) at **5.9 MB peak RSS** with `-max-line 1024`, and
 `-follow` survives a rename-and-create logrotate cycle without losing an event.
 
-**Python:** 388 tests covering language detection on ASCII-heavy Japanese,
+**Python:** 411 tests covering language detection on ASCII-heavy Japanese,
 script-aware chunking, the hashing embedder's persistence-safe determinism,
 storage, the bilingual retrieval floor, pseudonymisation round-trips, every
 analyst guard rail, every response guard rail, and the full HTTP surface.

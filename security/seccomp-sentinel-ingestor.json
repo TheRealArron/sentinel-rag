@@ -1,0 +1,67 @@
+{
+  "_comment": [
+    "Seccomp profile for the Sentinel Go ingestor.",
+    "",
+    "  docker run --security-opt seccomp=security/seccomp-sentinel-ingestor.json ...",
+    "  compose:  security_opt: ['seccomp=./security/seccomp-sentinel-ingestor.json']",
+    "",
+    "Deliberately a DENY list layered on a permissive default, not a hand-written",
+    "allow list. A Go binary's syscall surface includes the runtime's scheduler,",
+    "GC and netpoller, which varies by Go version and kernel; an allow list built",
+    "by guesswork breaks on the next toolchain bump in a way that looks like a",
+    "hang. The syscalls named here are the ones a log parser has no business",
+    "making, and blocking them costs nothing.",
+    "",
+    "NOT TESTED ON THIS MACHINE - Docker was unavailable while writing it.",
+    "Verify with: docker run --security-opt seccomp=... sentinel-rag/ingestor:dev -version"
+  ],
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "archMap": [
+    { "architecture": "SCMP_ARCH_X86_64", "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"] },
+    { "architecture": "SCMP_ARCH_AARCH64", "subArchitectures": ["SCMP_ARCH_ARM"] }
+  ],
+  "syscalls": [
+    {
+      "_comment": "Kernel module and kexec: a log parser loading kernel code is never legitimate.",
+      "names": ["init_module", "finit_module", "delete_module", "kexec_load", "kexec_file_load"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_comment": "Tracing and process injection. ptrace is how one process reads another's memory.",
+      "names": ["ptrace", "process_vm_readv", "process_vm_writev", "kcmp"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_comment": "Namespace and root manipulation - container escape primitives.",
+      "names": ["mount", "umount", "umount2", "pivot_root", "chroot", "unshare", "setns"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_comment": "Privilege changes. The container already runs as 65532 and must stay there.",
+      "names": ["setuid", "setgid", "setreuid", "setregid", "setresuid", "setresgid", "setgroups"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_comment": "BPF, perf and raw kernel tuning.",
+      "names": ["bpf", "perf_event_open", "_sysctl", "swapon", "swapoff", "reboot"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_comment": "Clock and quota changes: moving the clock would rewrite every event timestamp.",
+      "names": ["settimeofday", "clock_settime", "adjtimex", "clock_adjtime", "quotactl"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "_comment": "Legacy and rarely-needed surface with a history of CVEs.",
+      "names": ["userfaultfd", "add_key", "request_key", "keyctl", "personality", "uselib", "acct"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}

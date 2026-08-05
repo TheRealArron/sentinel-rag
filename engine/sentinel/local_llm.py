@@ -1,35 +1,10 @@
-"""Phase 7 — local inference, so nothing has to leave the host at all.
+"""Local inference: Ollama and OpenAI-compatible servers (vLLM, llama.cpp, LM Studio).
 
-Two backends, both spoken over the standard library's HTTP client:
+Both speak HTTP through ``urllib``, so local inference needs no third-party
+package — which matters, because the host this is for may have no way to install
+one.
 
-*   **Ollama** (``/api/chat``) — the easiest way to run Llama, Qwen, Gemma or
-    Mistral on a home server. One binary, one ``ollama pull``.
-*   **OpenAI-compatible** (``/v1/chat/completions``) — which is not one server but
-    a family. **vLLM**, **llama.cpp's** ``llama-server``, **LM Studio**, **text-
-    generation-webui** and Ollama's own compatibility endpoint all speak it. One
-    client covers all of them, so "which local runtime" becomes a URL rather than
-    a code change.
-
-# Why urllib and not the openai package
-
-Both backends here talk to ``localhost``. Pulling in an HTTP client library to
-POST one JSON document to a socket on the same machine would make the *air-gap*
-feature — the one whose entire point is self-sufficiency — depend on PyPI being
-reachable to install it. ``urllib.request`` is in the standard library, so local
-inference works on a machine that has never had network access.
-
-The consequence is that this module is the only LLM backend that needs **no
-third-party package at all**. On an air-gapped host, `pip install` may not be an
-option, and that is exactly the host this is for.
-
-# The timeout is the interesting parameter
-
-A 7B model on a laptop CPU answers in 10-60 seconds. The same model on a busy
-host, or a 70B model on the same hardware, may take ten minutes. The engine
-therefore treats "too slow" as a distinct outcome from "failed", because they
-have different correct responses: a failure means try something else, whereas
-slowness on a local model usually means the hardware is simply not up to the
-model, and the right answer is a smaller model rather than a different provider.
+See docs/design/dependencies.md.
 """
 
 from __future__ import annotations

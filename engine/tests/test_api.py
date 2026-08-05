@@ -22,13 +22,19 @@ def router(indexed_engine) -> Router:
 
 
 def get(router: Router, path: str, **query) -> tuple[int, dict]:
-    response = router.dispatch(Request(method="GET", path=path, query={k: str(v) for k, v in query.items()}))
+    response = router.dispatch(Request(
+        method="GET", path=path,
+        query={k: str(v) for k, v in query.items()}, client="127.0.0.1",
+    ))
     return response.status, response.payload
 
 
 def post(router: Router, path: str, body: dict | None = None, headers: dict | None = None) -> tuple[int, dict]:
+    # Real clients send this; the CSRF guard requires it on mutating routes.
+    merged = {"content-type": "application/json"}
+    merged.update(headers or {})
     response = router.dispatch(
-        Request(method="POST", path=path, body=body or {}, headers=headers or {})
+        Request(method="POST", path=path, body=body or {}, headers=merged, client="127.0.0.1")
     )
     return response.status, response.payload
 

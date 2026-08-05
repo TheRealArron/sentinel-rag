@@ -1,28 +1,10 @@
-"""Pseudonymisation of log data before it leaves the machine.
+"""Reversible pseudonymisation of log data before it leaves the host.
 
-The project's privacy claim is that raw logs stay on the home server and only the
-minimum needed for reasoning reaches a hosted model. This module is that claim's
-implementation, so it is worth being precise about what it does and does not do.
+Hostnames, local usernames, private IPs, MACs and emails become stable
+placeholders; the mapping is in-memory only and ``restore`` reverses it locally.
+The attacker's public IP is deliberately left intact.
 
-**What is pseudonymised:** internal hostnames, local usernames, private and
-link-local IP addresses, MAC addresses, and email addresses. Each is replaced
-with a stable placeholder (``HOST_1``, ``USER_2``, ``IP_PRIVATE_1``) and the
-mapping is held in memory only, never written to disk and never sent anywhere.
-``restore`` reverses the substitution locally, so the operator reads a normal
-alert while the model only ever saw placeholders.
-
-**What is deliberately *not* pseudonymised:** the attacker's public IP address.
-It is not the operator's personal data, it is the single most actionable field in
-the whole alert, and masking it would make the LLM's remediation advice
-unusable and break the Phase 4 firewall response. ``SENTINEL_ANONYMIZE_PUBLIC_IPS=1``
-turns it on for anyone whose threat model differs.
-
-**Detection strategy:** hostnames and usernames are matched from a *learned
-vocabulary* — the exact host and user strings the Go ingestor already extracted —
-not from a regex guessing at what looks like a username. Guessing at usernames in
-prose produces both misses and absurd false positives ("Failed" as a username);
-matching known values is exact. IPs, MACs, and emails are structural enough to
-regex safely.
+See docs/design/privacy.md.
 """
 
 from __future__ import annotations
