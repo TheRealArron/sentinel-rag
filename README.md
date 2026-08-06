@@ -903,6 +903,10 @@ quietly rotted, and that is worth failing a build over.
 - [x] **Phase 9: Distributed Sentinel (mTLS)** — a private CA, Go probes
       shipping over mutually authenticated TLS to a Python hub, certificate
       identity pinned to log content, and hot-reloaded revocation.
+- [x] **Phase 12: The write-up** — a long-form postmortem of the five hardest
+      defects and the mechanism that caught each one, as a single self-contained
+      page for the Ubuntu server. `make site-check`, then
+      `sudo ./site/deploy.sh`. See [`site/`](site/).
 - [x] **Phase 11: Sigma interoperability** — a Sentinel-subset transpiler that
       compiles Sigma YAML into a predicate tree the Go ingestor hot-loads, with
       bilingual ATT&CK tagging, explicit refusals for what it cannot faithfully
@@ -938,6 +942,22 @@ tell. Knowing which one the problem calls for is the actual skill.
 </details>
 
 ---
+
+## 📝 The postmortem
+
+[`site/index.html`](site/index.html) is a long-form write-up of the five hardest
+bugs in this project — the CSRF hole that let any website drive the firewall, a
+blast radius that walked backwards through time, a bilingual guarantee that
+guaranteed nothing, a correlator that cited itself as evidence, and a single
+field whose overwrite silently switched off brute-force detection.
+
+It is filed by *how each one was caught*, because that was the scarce thing:
+only one of the five was found by reading code. There is also a coda on the two
+verification failures that produced confident green output while checking
+nothing.
+
+One HTML file, no build step, no external requests. `sudo ./site/deploy.sh`
+installs it behind nginx.
 
 ## 🛡 Security & ethics
 

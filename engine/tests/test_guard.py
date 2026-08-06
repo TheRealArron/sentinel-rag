@@ -173,3 +173,64 @@ class TestGuardIntegration:
         engine.settings = replace(engine.settings, api_rate_limit_enabled=False)
         router = Router(engine)
         assert all(post(router, "/api/analyze").status == 200 for _ in range(15))
+
+
+class TestOriginMatchesTheBoundAddress:
+    """The allowlist has to describe the port the server actually bound.
+
+    These tests exist because the unit tests above hardcode port 8000 and so
+    could not see the bug: `serve --port N` bound N while the allowlist was
+    still built from settings.api_port, and the dashboard's own POSTs were
+    refused by a control meant to stop *other* sites. Anything that only checks
+    CSRFPolicy in isolation will keep missing this — the defect is in the wiring,
+    so the test has to go through the wiring.
+    """
+
+    @staticmethod
+    def _free_port() -> int:
+        # make_server treats port=0 as "unset" and falls back to settings, so an
+        # ephemeral port has to be chosen here and passed explicitly.
+        import socket
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return int(probe.getsockname()[1])
+
+    def _bind(self, engine, port):
+        from sentinel.server import make_server
+
+        server = make_server(engine, host="127.0.0.1", port=port)
+        host, bound = server.server_address[:2]
+        return server, server.RequestHandlerClass.router, str(host), int(bound)
+
+    def test_a_non_default_port_is_trusted(self, indexed_engine):
+        port = self._free_port()
+        assert port != indexed_engine.settings.api_port, "test needs a non-default port"
+
+        server, router, host, bound = self._bind(indexed_engine, port)
+        try:
+            assert bound == port
+            ok, reason = router.csrf.check("POST", "application/json", f"http://{host}:{bound}")
+            assert ok is True, f"the server refused its own origin: {reason}"
+        finally:
+            server.server_close()
+
+    def test_a_foreign_origin_is_still_refused_on_that_port(self, indexed_engine):
+        """The widening must not turn into 'trust everything'."""
+        server, router, host, bound = self._bind(indexed_engine, self._free_port())
+        try:
+            assert router.csrf.check("POST", "application/json", "https://evil.example")[0] is False
+            # Same host, different port is a different origin and must not pass.
+            other = bound - 1 if bound > 1024 else bound + 1
+            assert router.csrf.check("POST", "application/json", f"http://{host}:{other}")[0] is False
+        finally:
+            server.server_close()
+
+    def test_the_configured_port_still_works(self, indexed_engine):
+        """The default path must not regress while fixing the override path."""
+        from sentinel.routes import Router
+
+        router = Router(indexed_engine)
+        settings = indexed_engine.settings
+        origin = f"http://127.0.0.1:{settings.api_port}"
+        assert router.csrf.check("POST", "application/json", origin)[0] is True

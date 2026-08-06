@@ -121,9 +121,21 @@ def make_server(engine: SentinelEngine | None = None, host: str = "", port: int 
     host = host or engine.settings.api_host
     port = port or engine.settings.api_port
 
-    handler = type("SentinelHandler", (_Handler,), {"router": Router(engine)})
+    router = Router(engine)
+    handler = type("SentinelHandler", (_Handler,), {"router": router})
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
+
+    # Trust the address we actually bound, not the one in settings.
+    #
+    # The CSRF allowlist is built from settings.api_port, but `serve --port N`
+    # and `port=0` both bind somewhere else — so on any non-default port the
+    # dashboard's own POSTs arrived with an Origin that was not on the list and
+    # were refused. The block button 403'd against a control meant to stop
+    # *other* sites, not this one. Binding is the only moment the real origin is
+    # known, so the allowlist is completed here.
+    bound_host, bound_port = server.server_address[:2]
+    router.csrf.allowed_origins |= router.csrf.default_origins(str(bound_host), int(bound_port))
     return server
 
 

@@ -245,8 +245,7 @@ class AttackGraph:
 
         **access_only** follows only edges that actually granted something.
         Counting failed logins would report every account the attacker *tried* as
-        compromised. On the demo intrusion that is the difference between 9
-        entities reached and 16 touched.
+        compromised.
 
         **respect_time** refuses to traverse an edge that last occurred *before*
         the attacker arrived at its source. Without it, reachability walks
@@ -255,6 +254,18 @@ class AttackGraph:
         /usr/bin/certbot. Shared high-traffic nodes like `root` make this failure
         mode the norm rather than an edge case, and it is why a plain graph
         traversal over-reports so badly on real data.
+
+        Measured on a week of baseline traffic plus the demo intrusion
+        (``scripts/generate-baseline-log.py --days 7 --seed 42`` concatenated
+        with ``data/samples/sample_syslog.log``): 16 entities with both
+        constraints off, 13 with the temporal constraint alone, 9 with both. The
+        three the clock removes are ``/usr/bin/certbot``,
+        ``/usr/lib/sysstat/debian-sa1`` and ``/var/tmp`` — all touched by cron
+        via root *before* the attacker ever authenticated.
+
+        The 25-event sample fixture alone shows 7 and 12: it has no history, so
+        there is no "before the attacker arrived" for the clock to exclude. The
+        constraint only earns its keep once there is a past to walk into.
         """
         if seed not in self.nodes:
             return {}

@@ -1,0 +1,805 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Five bugs, and how each one was caught — Sentinel RAG</title>
+<meta name="description" content="Postmortems from Sentinel RAG, a bilingual SecOps engine: the five hardest defects, and the mechanism that caught each one.">
+<style>
+:root {
+  --paper:      #eff2f3;
+  --panel:      #e6eaec;
+  --ink:        #14181f;
+  --ink-soft:   #4a545f;
+  --ink-faint:  #6f7986;
+  --rule:       #c8cfd4;
+  --rule-soft:  #d9dfe3;
+  --accent:     #2c4a78;
+  --accent-dim: #5b7aa8;
+  --critical:   #a8332a;
+  --high:       #8f5d20;
+  --code-bg:    #e7ebed;
+  --code-ink:   #1b2028;
+  --add:        #2f6b4f;
+  --del:        #a8332a;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper:      #101318;
+    --panel:      #171b23;
+    --ink:        #dde2e9;
+    --ink-soft:   #9aa5b3;
+    --ink-faint:  #7b8593;
+    --rule:       #2b323d;
+    --rule-soft:  #232932;
+    --accent:     #7fa3de;
+    --accent-dim: #5d7cb0;
+    --critical:   #e0736a;
+    --high:       #d3a065;
+    --code-bg:    #161a21;
+    --code-ink:   #ccd4de;
+    --add:        #6fb894;
+    --del:        #e0736a;
+  }
+}
+:root[data-theme="light"] {
+  --paper:#eff2f3; --panel:#e6eaec; --ink:#14181f; --ink-soft:#4a545f;
+  --ink-faint:#6f7986; --rule:#c8cfd4; --rule-soft:#d9dfe3; --accent:#2c4a78;
+  --accent-dim:#5b7aa8; --critical:#a8332a; --high:#8f5d20;
+  --code-bg:#e7ebed; --code-ink:#1b2028; --add:#2f6b4f; --del:#a8332a;
+}
+:root[data-theme="dark"] {
+  --paper:#101318; --panel:#171b23; --ink:#dde2e9; --ink-soft:#9aa5b3;
+  --ink-faint:#7b8593; --rule:#2b323d; --rule-soft:#232932; --accent:#7fa3de;
+  --accent-dim:#5d7cb0; --critical:#e0736a; --high:#d3a065;
+  --code-bg:#161a21; --code-ink:#ccd4de; --add:#6fb894; --del:#e0736a;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  font-size: 18px;
+  line-height: 1.62;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 clamp(20px, 5vw, 56px); }
+.col  { max-width: 66ch; }
+
+/* ---------- utility face ---------- */
+.u {
+  font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  text-transform: uppercase;
+  letter-spacing: .13em;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* ---------- masthead ---------- */
+header.masthead { border-bottom: 1px solid var(--rule); padding: clamp(40px,7vh,84px) 0 34px; }
+.eyebrow { color: var(--accent); display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.eyebrow .sep { color: var(--rule); }
+.eyebrow .ja { font-family: inherit; text-transform: none; letter-spacing: .04em; font-size: 13px; color: var(--ink-faint); }
+
+h1 {
+  font-size: clamp(2.1rem, 5.6vw, 3.5rem);
+  line-height: 1.08;
+  font-weight: 600;
+  margin: 22px 0 0;
+  letter-spacing: -0.017em;
+  text-wrap: balance;
+  max-width: 20ch;
+}
+h1 em { font-style: italic; color: var(--accent); }
+
+.standfirst {
+  margin: 24px 0 0;
+  font-size: 1.19rem;
+  line-height: 1.55;
+  color: var(--ink-soft);
+  max-width: 56ch;
+  text-wrap: pretty;
+}
+
+.byline {
+  margin-top: 30px; padding-top: 18px;
+  border-top: 1px solid var(--rule-soft);
+  display: flex; flex-wrap: wrap; gap: 10px 28px;
+  color: var(--ink-faint);
+}
+.byline b { color: var(--ink-soft); font-weight: 600; }
+
+/* ---------- findings matrix ---------- */
+.matrix-shell { margin: 52px 0 0; overflow-x: auto; }
+table.matrix { border-collapse: collapse; width: 100%; min-width: 620px; font-size: 15px; }
+table.matrix caption {
+  text-align: left; color: var(--ink-faint); padding-bottom: 12px;
+}
+table.matrix th, table.matrix td {
+  text-align: left; padding: 13px 18px 13px 0; border-bottom: 1px solid var(--rule-soft);
+  vertical-align: baseline;
+}
+table.matrix thead th { border-bottom: 1px solid var(--rule); color: var(--ink-faint); padding-bottom: 9px; }
+table.matrix td.num { font-variant-numeric: tabular-nums; color: var(--ink-faint); width: 3ch; }
+table.matrix td.what a { color: var(--ink); text-decoration: none; border-bottom: 1px solid var(--rule); }
+table.matrix td.what a:hover { border-bottom-color: var(--accent); color: var(--accent); }
+table.matrix td.how {
+  font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  font-size: 13.5px; color: var(--ink-soft);
+}
+
+.sev { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
+.sev::before { content: ""; width: 9px; height: 9px; border-radius: 1px; background: currentColor; flex: none; }
+.sev.critical { color: var(--critical); }
+.sev.high     { color: var(--high); }
+.sev-label {
+  font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  font-size: 12px; text-transform: uppercase; letter-spacing: .1em; font-weight: 600;
+}
+
+/* ---------- thesis ---------- */
+.thesis { margin: 56px 0 0; padding: 30px 0 0; border-top: 3px solid var(--ink); }
+.thesis p { font-size: 1.24rem; line-height: 1.5; margin: 0; max-width: 54ch; text-wrap: pretty; }
+.thesis p + p { margin-top: 18px; font-size: 1.05rem; color: var(--ink-soft); }
+
+/* ---------- entries ---------- */
+article.entry { padding: clamp(52px,8vh,88px) 0 0; }
+article.entry + article.entry { border-top: 1px solid var(--rule); margin-top: clamp(52px,8vh,88px); }
+
+.entry-head { display: flex; gap: 20px; align-items: baseline; flex-wrap: wrap; margin-bottom: 6px; }
+.entry-num {
+  font-variant-numeric: tabular-nums; color: var(--accent);
+  font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  font-weight: 700; font-size: 13px; letter-spacing: .1em;
+}
+h2 {
+  font-size: clamp(1.55rem, 3.5vw, 2.15rem); line-height: 1.16; font-weight: 600;
+  margin: 4px 0 0; letter-spacing: -0.012em; text-wrap: balance; max-width: 24ch;
+}
+
+.caught {
+  margin: 22px 0 30px; padding-left: 16px; border-left: 2px solid var(--accent);
+  color: var(--ink-soft); font-size: 15.5px; max-width: 58ch;
+}
+.caught .u { color: var(--accent); display: block; margin-bottom: 4px; }
+
+.entry p { margin: 0 0 1.05em; max-width: 66ch; text-wrap: pretty; }
+.entry h3 {
+  font-size: 1.02rem; margin: 2.1em 0 .7em; font-weight: 700; letter-spacing: -0.004em;
+  color: var(--ink);
+}
+.entry h3::before { content: "— "; color: var(--accent); }
+.entry ul { max-width: 66ch; padding-left: 1.15em; margin: 0 0 1.05em; }
+.entry li { margin-bottom: .5em; }
+.entry a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent-dim); }
+.entry a:hover { border-bottom-width: 2px; }
+
+code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: .875em; background: var(--code-bg); color: var(--code-ink);
+  padding: .12em .38em; border-radius: 2px;
+}
+
+/* evidence blocks break out of the reading column */
+.evidence { margin: 26px 0 30px; max-width: 900px; }
+.evidence-label {
+  color: var(--ink-faint); display: flex; justify-content: space-between;
+  gap: 16px; align-items: baseline; margin-bottom: 8px; flex-wrap: wrap;
+}
+.evidence pre {
+  margin: 0; overflow-x: auto; background: var(--panel);
+  border: 1px solid var(--rule-soft); border-left: 2px solid var(--rule);
+  padding: 17px 20px; border-radius: 2px;
+}
+.evidence pre code {
+  background: none; padding: 0; font-size: 13.4px; line-height: 1.66;
+  color: var(--code-ink); white-space: pre;
+}
+.evidence.diff pre { border-left-color: var(--accent); }
+.ln-add { color: var(--add); }
+.ln-del { color: var(--del); }
+.ln-dim { color: var(--ink-faint); }
+.ln-key { color: var(--accent); }
+.ln-crit { color: var(--critical); }
+
+.takeaway {
+  margin: 30px 0 4px; padding: 20px 24px; background: var(--panel);
+  border: 1px solid var(--rule-soft); border-radius: 2px; max-width: 66ch;
+}
+.takeaway .u { color: var(--accent); display: block; margin-bottom: 7px; }
+.takeaway p { margin: 0; font-size: 1.04rem; }
+
+/* ---------- coda ---------- */
+section.coda { margin-top: clamp(56px,9vh,96px); padding-top: 40px; border-top: 3px solid var(--ink); }
+section.coda h2 { max-width: 26ch; }
+
+/* ---------- colophon ---------- */
+footer.colophon {
+  margin-top: clamp(56px,9vh,96px); border-top: 1px solid var(--rule);
+  padding: 38px 0 72px; color: var(--ink-faint); font-size: 15px;
+}
+.stats { display: flex; flex-wrap: wrap; gap: 26px 44px; margin-bottom: 26px; }
+.stat .n {
+  display: block; font-size: 1.6rem; color: var(--ink); font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+.stat .u { color: var(--ink-faint); margin-top: 4px; display: block; }
+footer.colophon a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent-dim); }
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 1px; }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+@media (max-width: 620px) {
+  body { font-size: 17px; }
+  .entry p, .entry ul, .takeaway { max-width: none; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="masthead">
+  <div class="eyebrow u">
+    <span>Sentinel RAG</span><span class="sep">/</span><span>Postmortem</span>
+    <span class="sep">/</span><span class="ja">バイリンガル SecOps エンジン</span>
+  </div>
+  <h1>Five bugs, and <em>how each one was caught</em></h1>
+  <p class="standfirst">
+    A bilingual security-operations engine: a dependency-free Go log ingestor feeding a
+    Python retrieval engine. These are the five defects that were hardest to find — and,
+    more usefully, the mechanism that found each.
+  </p>
+  <div class="byline u">
+    <span><b>12,518</b> lines Go + Python</span>
+    <span><b>5,638</b> lines of tests</span>
+    <span><b>0</b> Go dependencies</span>
+  </div>
+</header>
+
+<div class="matrix-shell">
+  <table class="matrix">
+    <caption class="u">Findings</caption>
+    <thead>
+      <tr>
+        <th class="u">#</th><th class="u">Defect</th>
+        <th class="u">Severity</th><th class="u">Mechanism that caught it</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="num">01</td>
+        <td class="what"><a href="#b1">The API took orders from any website</a></td>
+        <td><span class="sev critical"><span class="sev-label">Critical</span></span></td>
+        <td class="how">A live probe against the running server</td>
+      </tr>
+      <tr>
+        <td class="num">02</td>
+        <td class="what"><a href="#b2">Blast radius walked backwards through time</a></td>
+        <td><span class="sev high"><span class="sev-label">High</span></span></td>
+        <td class="how">Disbelieving a plausible-looking result</td>
+      </tr>
+      <tr>
+        <td class="num">03</td>
+        <td class="what"><a href="#b3">The bilingual floor guaranteed nothing</a></td>
+        <td><span class="sev high"><span class="sev-label">High</span></span></td>
+        <td class="how">Testing the promise at its boundary, not its middle</td>
+      </tr>
+      <tr>
+        <td class="num">04</td>
+        <td class="what"><a href="#b4">The correlator graded its own homework</a></td>
+        <td><span class="sev high"><span class="sev-label">High</span></span></td>
+        <td class="how">Reading the evidence, not the score</td>
+      </tr>
+      <tr>
+        <td class="num">05</td>
+        <td class="what"><a href="#b5">One field switched off detection</a></td>
+        <td><span class="sev critical"><span class="sev-label">Critical</span></span></td>
+        <td class="how">Drift in a committed golden fixture</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="thesis col">
+  <p>
+    Only one of these five was found by reading code. The rest were found by running the
+    system and refusing to accept output that looked reasonable.
+  </p>
+  <p>
+    That is the thread worth pulling. Each defect below is filed with the mechanism that
+    exposed it, because in every case the mechanism was the scarce thing — the bug itself
+    was obvious the moment anything was pointed at it.
+  </p>
+</div>
+
+<!-- ============================================================= 01 -->
+<article class="entry" id="b1">
+  <div class="entry-head"><span class="entry-num">01</span></div>
+  <h2>The API that took orders from any website</h2>
+
+  <div class="caught">
+    <span class="u">Caught by</span>
+    Probing the running server with <code>curl</code> instead of reasoning about the
+    threat model. The reasoning had already concluded it was fine.
+  </div>
+
+  <p>
+    Sentinel's dashboard exposes <code>POST /api/response/block</code>. It records a
+    decision to firewall an address; a host-side responder running as root reads that
+    record and calls <code>ufw</code>. The endpoint is unauthenticated by design, because
+    it binds to localhost and "localhost only" felt like a boundary.
+  </p>
+  <p>
+    It is not a boundary. A browser running on that host is already inside it. Any page
+    the operator visits in another tab can issue cross-origin <code>POST</code> requests
+    to <code>127.0.0.1</code>, and the browser will send them.
+  </p>
+
+  <div class="evidence">
+    <div class="evidence-label"><span class="u">The exploit, before the fix</span><span class="u">200 OK</span></div>
+<pre><code>curl -X POST http://127.0.0.1:8000/api/response/block \
+  -H 'Content-Type: text/plain' \
+  -H 'Origin: https://evil.example' \
+  --data '{"target":"192.0.2.66","score":99,"reason":"csrf"}'
+
+<span class="ln-crit">HTTP 200 — decision recorded, responder will enforce it</span></code></pre>
+  </div>
+
+  <p>
+    An attacker who can get an operator to open a tab can make the security engine
+    firewall arbitrary addresses. Point it at the operator's own gateway, or at the
+    upstream resolver, and the tool becomes the outage.
+  </p>
+
+  <h3>The fix that would not have worked</h3>
+  <p>
+    The instinctive answer is a CORS allowlist. It does not help. CORS does not stop the
+    request from being <em>sent</em> or the side effect from happening; it stops the
+    attacker from <em>reading the response</em>. For a request whose entire purpose is the
+    side effect, the attacker never needed to read anything. A CORS policy here buys
+    exactly nothing and feels like it buys everything, which is worse than no policy at
+    all.
+  </p>
+
+  <h3>What actually closes it</h3>
+  <p>
+    Two checks, and the first one is the load-bearing one. A browser can only send a
+    cross-origin request without a preflight if it qualifies as a
+    <em>simple request</em> — and a simple request cannot set
+    <code>Content-Type: application/json</code>. Requiring that header forces a preflight,
+    and the preflight is refused. The <code>Origin</code> check is defence in depth on top.
+  </p>
+
+  <div class="evidence diff">
+    <div class="evidence-label"><span class="u">engine/sentinel/guard.py</span></div>
+<pre><code>def check(self, method, content_type, origin) -&gt; tuple[bool, str]:
+    if method.upper() not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return True, ""
+
+    <span class="ln-dim"># No Origin means the caller is not a browser page, so not a CSRF vector.</span>
+    if origin and self._normalise(origin) not in self.allowed_origins:
+        return False, f"cross-origin request from {origin!r} refused. ..."
+
+    if self.require_json:
+        base = (content_type or "").split(";")[0].strip().lower()
+        if base != "application/json":
+            <span class="ln-dim"># Forces a cross-origin preflight, which is never satisfied.</span>
+            return False, "mutating requests must send Content-Type: application/json"
+    return True, ""</code></pre>
+  </div>
+
+  <div class="evidence">
+    <div class="evidence-label"><span class="u">Same request, after</span><span class="u">403</span></div>
+<pre><code><span class="ln-add">HTTP 403</span>
+{"error": "cross-origin request from 'https://evil.example' refused.
+           The dashboard API is same-origin only; use the API token
+           from a non-browser client."}</code></pre>
+  </div>
+
+  <div class="takeaway">
+    <span class="u">Generalises to</span>
+    <p>
+      A control that stops you seeing the answer is not a control that stops the action.
+      And a network boundary that a browser sits inside is not a boundary at all — it is a
+      shared address space with a friendly name.
+    </p>
+  </div>
+</article>
+
+<!-- ============================================================= 02 -->
+<article class="entry" id="b2">
+  <div class="entry-head"><span class="entry-num">02</span></div>
+  <h2>The blast radius that walked backwards through time</h2>
+
+  <div class="caught">
+    <span class="u">Caught by</span>
+    Looking at a correct-looking answer and asking why a TLS renewal binary was in an
+    attacker's blast radius. The graph was right; the question was wrong.
+  </div>
+
+  <p>
+    Given a compromised entity, Sentinel answers "what else could they have reached?" by
+    walking a typed graph of hosts, accounts, processes and files. The first version was a
+    plain breadth-first search, and it reported that the attacker had reached
+    <code>/usr/bin/certbot</code>.
+  </p>
+  <p>
+    They had not. The path was real: attacker → <code>root</code> → <code>certbot</code>.
+    But the second edge was a cron job that ran <em>last week</em>. Graph reachability has
+    no notion of a clock, so it happily walks an edge that only ever fired before the
+    attacker existed.
+  </p>
+  <p>
+    This is not an edge case. High-degree shared nodes — <code>root</code>, the host
+    itself — connect nearly everything to nearly everything, so an untimed traversal
+    over-reports catastrophically on real data. The number stops meaning anything and the
+    operator learns to ignore it.
+  </p>
+
+  <div class="evidence">
+    <div class="evidence-label">
+      <span class="u">A week of baseline + the demo intrusion</span><span class="u">seed 42, 617 events</span>
+    </div>
+<pre><code>python3 scripts/generate-baseline-log.py --days 7 --seed 42 --out base.log
+cat base.log data/samples/sample_syslog.log | sentinel-ingestor -out combined.jsonl
+
+blast_radius("source_ip:203.0.113.45", max_hops=3)
+
+  access_only=False  respect_time=False  →  <span class="ln-crit">16 entities</span>
+  access_only=False  respect_time=True   →  13 entities
+  access_only=True   respect_time=True   →  <span class="ln-add">9 entities</span>
+
+excluded by the clock alone:
+  file:/usr/bin/certbot
+  file:/usr/lib/sysstat/debian-sa1
+  file:/var/tmp                     <span class="ln-dim">← all cron-via-root, before the intrusion</span></code></pre>
+  </div>
+
+  <h3>The first fix was also wrong</h3>
+  <p>
+    The obvious repair is to refuse any edge whose activity predates the attacker's
+    arrival, and to arrive at the edge's <em>last</em> occurrence. That over-constrains:
+    it pushed arrival times artificially late and dropped a file the attacker genuinely
+    had touched. Tightening a wrong answer in the right direction still leaves a wrong
+    answer.
+  </p>
+  <p>
+    The correct traversal arrives at the <em>earliest</em> occurrence that is not before
+    the attacker was present — and, critically, uses relaxation rather than
+    first-visit-wins. A node's arrival time can improve when a second route reaches it
+    sooner, and an earlier arrival unlocks onward edges that a later one forbids. Plain
+    BFS freezes the first arrival it finds and silently truncates the radius.
+  </p>
+
+  <div class="evidence diff">
+    <div class="evidence-label"><span class="u">engine/sentinel/graph.py</span></div>
+<pre><code>if respect_time and here and edge.last_seen:
+    <span class="ln-dim"># Nothing this edge ever did happened after the attacker got</span>
+    <span class="ln-dim"># here, so it cannot be part of what they reached.</span>
+    if edge.last_seen &lt; here:
+        continue
+    <span class="ln-dim"># Arrive at the edge's earliest occurrence that is not before</span>
+    <span class="ln-dim"># the attacker was present. last_seen would over-constrain</span>
+    <span class="ln-dim"># every onward hop.</span>
+    there = edge.first_seen if edge.first_seen &gt;= here else here
+
+<span class="ln-key">improved</span> = (known_hop is None
+            or hop + 1 &lt; known_hop
+            or (known_arrival is not None and there &lt; known_arrival))</code></pre>
+  </div>
+
+  <p>
+    One honest footnote: on the 25-event sample fixture the clock changes nothing (7 and
+    12 either way). That fixture is five minutes of intrusion with no history, so there is
+    no "before" to walk into. The constraint only earns its keep once there is a past —
+    which is exactly when it matters and exactly when a small test fixture will not show
+    you.
+  </p>
+
+  <div class="takeaway">
+    <span class="u">Generalises to</span>
+    <p>
+      Reachability on a graph whose edges have timestamps is not reachability. If shared
+      high-degree nodes exist — and in security data they always do — an untimed traversal
+      answers a question nobody asked.
+    </p>
+  </div>
+</article>
+
+<!-- ============================================================= 03 -->
+<article class="entry" id="b3">
+  <div class="entry-head"><span class="entry-num">03</span></div>
+  <h2>The bilingual floor that guaranteed nothing</h2>
+
+  <div class="caught">
+    <span class="u">Caught by</span>
+    Writing a test that asserted the feature's actual promise — "a Japanese source appears"
+    — at the smallest interesting <code>k</code>, rather than asserting the code path ran.
+  </div>
+
+  <p>
+    The retrieval engine indexes English and Japanese advisories together and promises a
+    per-language floor: an English query must still surface the Japanese advisory that
+    explains the attack. Without it, an English query against a mostly-English corpus
+    returns English-only results essentially always, and the bilingual claim is decoration.
+  </p>
+  <p>
+    The floor was implemented, the code path executed, and the guarantee did not hold.
+    Two independent bugs, each of which alone would have been enough.
+  </p>
+
+  <h3>Bug one: the sort undid the top-up</h3>
+  <p>
+    The pipeline topped up under-represented languages with extra candidates, then merged
+    everything, sorted by score, and truncated to <code>k</code>. But the topped-up hits
+    are <em>by definition</em> lower-scoring than the ones that crowded them out — that is
+    why they needed topping up. A score-ordered cut removes precisely the results the
+    floor just added. The feature paid the retrieval cost and then deleted its own output.
+  </p>
+
+  <h3>Bug two: the quota starved the second language</h3>
+  <p>
+    Reserved slots were allocated language-by-language: fill English's quota, then
+    Japanese's. With a floor of 2 and <code>k=2</code>, English consumed both slots and
+    Japanese got none — an English-only result set, which is the exact failure the floor
+    exists to prevent. The mechanism was most broken precisely where it mattered most.
+  </p>
+
+  <div class="evidence diff">
+    <div class="evidence-label"><span class="u">engine/sentinel/retriever.py</span></div>
+<pre><code><span class="ln-dim"># Collapse the *whole* candidate pool, then select. Truncating the pool</span>
+<span class="ln-dim"># before selection would silently discard the language top-ups.</span>
+parents = self._collapse_to_parents(hits)
+return self._select_with_language_floor(parents, k, languages)
+
+<span class="ln-dim"># ...and allocate round-robin, not language-by-language. Filling English's</span>
+<span class="ln-dim"># whole quota first consumes every slot when k is small.</span>
+for _round in range(floor):
+    for lang in languages:
+        if len(selected) &gt;= limit:
+            break
+        <span class="ln-key">...take the best unselected parent in this language...</span></code></pre>
+  </div>
+
+  <div class="takeaway">
+    <span class="u">Generalises to</span>
+    <p>
+      A quota applied before a global sort is not a quota. And a guarantee should be
+      tested at its boundary — <code>k=2</code>, one slot per language — not in the
+      comfortable middle where any implementation looks correct.
+    </p>
+  </div>
+</article>
+
+<!-- ============================================================= 04 -->
+<article class="entry" id="b4">
+  <div class="entry-head"><span class="entry-num">04</span></div>
+  <h2>The correlator that graded its own homework</h2>
+
+  <div class="caught">
+    <span class="u">Caught by</span>
+    Reading the cited evidence rather than the confidence score. The scores were high. The
+    citations were the same event, restated.
+  </div>
+
+  <p>
+    Shadow Search is an unattended daily worker. It ranks the last 24 hours by statistical
+    surprise against a learned baseline, then retrieves supporting intelligence for each
+    anomaly from the corpus and writes it up.
+  </p>
+  <p>
+    The corpus contains two kinds of document: CVE and JPCERT advisories, and windows of
+    log events. Nobody told the retriever which kind constituted evidence. So for an
+    anomaly derived from log lines, the nearest neighbours were — inevitably — other log
+    lines from the same host at the same time.
+  </p>
+  <p>
+    The output was well-formed and confident. "This activity is suspicious, and here is
+    the supporting intelligence: this activity." The system was citing itself, and the
+    similarity scores were <em>high</em> precisely because the match was circular. Worse,
+    those self-citations crowded out the advisories that are the entire point of
+    correlating against a corpus.
+  </p>
+
+  <div class="evidence diff">
+    <div class="evidence-label"><span class="u">engine/sentinel/shadow.py</span></div>
+<pre><code><span class="ln-dim"># Restricted to advisories on purpose. The index also holds log windows,</span>
+<span class="ln-dim"># and without this filter the "supporting intelligence" for an anomaly is</span>
+<span class="ln-dim"># other log lines from the same host — circular, and it crowds out the</span>
+<span class="ln-dim"># JPCERT/CVE documents that are the entire point of correlating.</span>
+retrieved = self.engine.search(
+    self.query_for(anomaly), k=self.settings.shadow_k, <span class="ln-add">doc_types=["advisory"]</span>
+)</code></pre>
+  </div>
+
+  <p>
+    The fix is one argument. The bug was invisible to every test that asserted retrieval
+    returned <code>k</code> results with scores above a threshold — which it did, happily,
+    forever.
+  </p>
+
+  <div class="takeaway">
+    <span class="u">Generalises to</span>
+    <p>
+      Retrieval that can return the query's own source is not evidence. Any RAG system
+      indexing both the thing being explained and the things that explain it needs that
+      distinction enforced at the query, because similarity will never make it for you —
+      it will do the opposite.
+    </p>
+  </div>
+</article>
+
+<!-- ============================================================= 05 -->
+<article class="entry" id="b5">
+  <div class="entry-head"><span class="entry-num">05</span></div>
+  <h2>The one field that switched off detection</h2>
+
+  <div class="caught">
+    <span class="u">Caught by</span>
+    A committed golden fixture changing from 25 events to 23. Nothing errored. Two alerts
+    simply stopped existing.
+  </div>
+
+  <p>
+    Sentinel imports Sigma rules — the industry-standard YAML detection format — by
+    transpiling them into a predicate tree the Go ingestor evaluates. Sigma rules carry a
+    <code>level</code> (informational … critical), which maps cleanly onto Sentinel's
+    0–100 score.
+  </p>
+  <p>
+    Sigma has no concept of an <em>outcome</em>. Sentinel does: every event is
+    <code>success</code>, <code>failure</code>, or <code>attempt</code>, read off the log
+    line by the built-in rules. So the transpiler derived an outcome from the rule's level
+    and assigned it. Reasonable-looking, and wrong, because that assignment was
+    unconditional — it overwrote a value that had been read from the actual log text with
+    one that had been guessed from a YAML field.
+  </p>
+  <p>
+    Elsewhere in the pipeline, the stateful correlator keys brute-force detection on
+    exactly that field:
+  </p>
+
+  <div class="evidence">
+    <div class="evidence-label"><span class="u">ingestor/internal/correlate/correlate.go</span></div>
+<pre><code>isAuthFailure := ev.Outcome == <span class="ln-key">"failure"</span> &amp;&amp;
+    (ev.Category == enrich.CatAuth || ev.Category == enrich.CatPrivilege)</code></pre>
+  </div>
+
+  <p>
+    So importing a well-formed, industry-standard brute-force rule silently disabled
+    brute-force and post-compromise correlation. The per-line detections still fired. The
+    two aggregate incidents — the ones that turn six failures and a success into "this
+    host was compromised" — vanished without a warning.
+  </p>
+
+  <div class="evidence">
+    <div class="evidence-label"><span class="u">How it surfaced</span><span class="u">make sample</span></div>
+<pre><code>regenerated data/samples/events.sample.jsonl (<span class="ln-crit">23 events</span>)
+<span class="ln-dim"># expected 25: 23 parsed lines + 2 correlated incidents</span>
+
+- correlated_brute_force
+- correlated_successful_login_after_bruteforce</code></pre>
+  </div>
+
+  <div class="evidence diff">
+    <div class="evidence-label"><span class="u">ingestor/internal/enrich/enrich.go</span></div>
+<pre><code><span class="ln-dim">// Outcome is deliberately NOT overwritten when the pipeline already derived</span>
+<span class="ln-dim">// one. Sigma has no outcome concept, so the transpiler's value is a guess</span>
+<span class="ln-dim">// from the rule's level — whereas a built-in rule read success/failure off</span>
+<span class="ln-dim">// the log line itself.</span>
+<span class="ln-add">if ev.Outcome == "" {</span>
+    ev.Outcome = rule.Outcome
+<span class="ln-add">}</span></code></pre>
+  </div>
+
+  <div class="takeaway">
+    <span class="u">Generalises to</span>
+    <p>
+      Know which of your fields are load-bearing. A field that reads like metadata in one
+      module can be a control input in another, and the coupling is invisible from either
+      end. A fabricated value must never overwrite a derived one.
+    </p>
+  </div>
+</article>
+
+<!-- ============================================================= CODA -->
+<section class="coda" id="coda">
+  <div class="entry-head"><span class="entry-num u">Coda</span></div>
+  <h2>A sixth, found while writing this page</h2>
+
+  <article class="entry" style="padding-top:22px">
+    <p>
+      Verifying the claim in defect 01 for this write-up meant standing the server up and
+      re-running the attack. It was correctly refused. Then the <em>legitimate</em> request
+      was also refused:
+    </p>
+
+    <div class="evidence">
+      <div class="evidence-label"><span class="u">Same-origin request from the dashboard itself</span><span class="u">403</span></div>
+<pre><code>curl -X POST http://127.0.0.1:8137/api/response/block \
+  -H 'Content-Type: application/json' \
+  -H 'Origin: http://127.0.0.1:8137'
+
+<span class="ln-crit">HTTP 403 — cross-origin request from 'http://127.0.0.1:8137' refused</span></code></pre>
+    </div>
+
+    <p>
+      The allowlist was built from <code>settings.api_port</code>. The server had been
+      started with <code>--port 8137</code>. On any non-default port the dashboard's own
+      block button was refused by a control designed to stop <em>other</em> sites — the
+      same control as defect 01, wrong in the opposite direction.
+    </p>
+    <p>
+      The existing tests could not have caught it. They exercised the policy object
+      directly with a hard-coded port 8000, and the defect was in the wiring between the
+      bound socket and the policy. The fix completes the allowlist at the only moment the
+      real origin is known:
+    </p>
+
+    <div class="evidence diff">
+      <div class="evidence-label"><span class="u">engine/sentinel/server.py</span></div>
+<pre><code><span class="ln-dim"># Trust the address we actually bound, not the one in settings.</span>
+bound_host, bound_port = server.server_address[:2]
+router.csrf.allowed_origins |= router.csrf.default_origins(
+    str(bound_host), int(bound_port))</code></pre>
+    </div>
+
+    <h3>The tests that tested nothing</h3>
+    <p>
+      Two verification failures from this project are worth more than any of the defects
+      above, because both produced confident green output while checking nothing.
+    </p>
+    <ul>
+      <li>
+        <b>CI was reported green while it was red.</b> The check used
+        <code>gh run list --limit 1</code>, which raced the push and returned the
+        <em>previous</em> commit's run. The status was true, about the wrong commit. The
+        fix is to match runs by commit SHA and poll until that specific run completes.
+      </li>
+      <li>
+        <b>A test proving the zero-dependency YAML fallback worked was proving nothing.</b>
+        It blocked the import with a <code>find_module</code> meta-path hook — an API
+        removed in Python 3.12, so the hook was silently ignored and PyYAML stayed
+        available throughout. The fallback parser was in fact broken on all four sample
+        rules. CI, which installs no dependencies at all, found it immediately. The
+        replacement sets <code>sys.modules["yaml"] = None</code>, and a guard test asserts
+        the block is real <em>before</em> the tests that depend on it run.
+      </li>
+    </ul>
+
+    <div class="takeaway">
+      <span class="u">The actual lesson</span>
+      <p>
+        A passing test is a claim about your test, not about your code — until you have
+        watched it fail for the right reason. Every regression test in this project is now
+        written by breaking the fix, confirming the test goes red, then restoring it.
+      </p>
+    </div>
+  </article>
+</section>
+
+<footer class="colophon">
+  <div class="stats">
+    <div class="stat"><span class="n">500</span><span class="u">Python tests</span></div>
+    <div class="stat"><span class="n">7</span><span class="u">Go packages, race-clean</span></div>
+    <div class="stat"><span class="n">0</span><span class="u">Go dependencies</span></div>
+    <div class="stat"><span class="n">2</span><span class="u">Languages, EN / 日本語</span></div>
+  </div>
+  <p>
+    Sentinel RAG — a bilingual AI-powered SecOps engine. Go ingestor (standard library
+    only) → Python retrieval and analysis, with every third-party package optional and a
+    degraded path that still works when none are installed.
+    Source: <a href="https://github.com/TheRealArron/sentinel-rag">github.com/TheRealArron/sentinel-rag</a>.
+  </p>
+  <p class="u" style="margin-top:22px">
+    Every figure on this page was measured on the committed fixtures, not estimated.
+  </p>
+</footer>
+
+</div>
+</body>
+</html>

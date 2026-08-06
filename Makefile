@@ -111,6 +111,10 @@ sample: build ## Regenerate the committed sample fixture from the ingestor
 	@echo "regenerated data/samples/events.sample.jsonl ($$(wc -l < data/samples/events.sample.jsonl) events)"
 	@git diff --stat data/samples/events.sample.jsonl 2>/dev/null || true
 
+.PHONY: site-check
+site-check: ## Verify the write-up is publishable (self-contained, complete)
+	./site/deploy.sh --check
+
 .PHONY: sigma
 sigma: ## Compile rules/sigma/*.yml into the bundle the ingestor loads (Phase 11)
 	@# The ingestor reads the JSON this produces at startup, so a new detection
