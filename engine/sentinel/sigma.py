@@ -213,49 +213,98 @@ def load_yaml(text: str) -> dict[str, Any]:
 
 
 def _minimal_yaml(text: str) -> dict[str, Any]:
-    """Indentation-based parser for the Sigma subset, used only without PyYAML."""
+    """Indentation-based parser for the Sigma subset, used only without PyYAML.
+
+    Handles what Sigma rules actually contain: nested maps, block sequences,
+    inline flow sequences, and folded/literal block scalars. Anything else
+    raises — a half-understood YAML parser silently mis-reading a detection is
+    the outcome to avoid.
+
+    A container's type is not known when its key is read: ``tags:`` could open a
+    map or a sequence, and only the first child line says which. So the key is
+    recorded as pending and materialised when that line arrives.
+    """
     root: dict[str, Any] = {}
+    # Each frame is (indent, container). A container is a dict, a list, or a
+    # _Pending standing in for one whose type is not yet known.
     stack: list[tuple[int, Any]] = [(-1, root)]
 
-    for raw in text.splitlines():
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        i += 1
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
         indent = len(raw) - len(raw.lstrip())
         line = raw.strip()
 
-        while stack and indent <= stack[-1][0]:
+        while len(stack) > 1 and indent <= stack[-1][0]:
             stack.pop()
-        if not stack:
-            raise SigmaError("malformed indentation")
         parent = stack[-1][1]
 
-        if line.startswith("- "):
-            value = _scalar(line[2:])
+        if isinstance(parent, _Pending):
+            parent = parent.resolve(list if line.startswith("- ") else dict)
+            stack[-1] = (stack[-1][0], parent)
+
+        if line.startswith("- ") or line == "-":
             if not isinstance(parent, list):
                 raise SigmaError(f"list item outside a list: {line!r}")
-            parent.append(value)
+            parent.append(_scalar(line[2:]) if len(line) > 2 else None)
             continue
 
         if ":" not in line:
             raise SigmaError(f"cannot parse line: {line!r}")
+        if not isinstance(parent, dict):
+            raise SigmaError(f"mapping key inside a sequence: {line!r}")
+
         key, _, rest = line.partition(":")
         key, rest = key.strip(), rest.strip()
+
+        if rest in {"|", ">", "|-", ">-", "|+", ">+"}:
+            block, i = _block_scalar(lines, i, indent)
+            parent[key] = block if rest[0] == "|" else " ".join(block.split())
+            continue
+
         if rest:
             parent[key] = _scalar(rest)
-        else:
-            child: Any = {}
-            parent[key] = child
-            stack.append((indent, child))
-            # A following "- " line turns it into a list; patch lazily.
-            parent[key] = child
+            continue
 
-    return _promote_lists(root)
+        pending = _Pending(parent, key)
+        parent[key] = None
+        stack.append((indent, pending))
+
+    return root
 
 
-def _promote_lists(node: Any) -> Any:
-    if isinstance(node, dict):
-        return {k: _promote_lists(v) for k, v in node.items()}
-    return node
+class _Pending:
+    """A container whose type is decided by its first child line."""
+
+    __slots__ = ("parent", "key")
+
+    def __init__(self, parent: dict[str, Any], key: str) -> None:
+        self.parent = parent
+        self.key = key
+
+    def resolve(self, kind: type) -> Any:
+        container = kind()
+        self.parent[self.key] = container
+        return container
+
+
+def _block_scalar(lines: list[str], start: int, parent_indent: int) -> tuple[str, int]:
+    """Collect the body of a `|` or `>` block scalar, returning it and the next index."""
+    body: list[str] = []
+    i = start
+    while i < len(lines):
+        raw = lines[i]
+        if raw.strip() and (len(raw) - len(raw.lstrip())) <= parent_indent:
+            break
+        body.append(raw.strip())
+        i += 1
+    while body and not body[-1]:
+        body.pop()
+    return "\n".join(body), i
 
 
 def _scalar(text: str) -> Any:

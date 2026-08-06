@@ -7,6 +7,9 @@ refuses. Most of these tests are about the refusals.
 from __future__ import annotations
 
 import json
+import sys
+from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 
@@ -313,7 +316,6 @@ def test_rule_names_are_namespaced(tmp_path):
 
 
 def test_the_shipped_rules_compile():
-    from pathlib import Path
     repo = Path(__file__).resolve().parents[2]
     report = compile_directory(repo / "rules" / "sigma")
     assert report.failed == [], f"shipped rules failed to compile: {report.failed}"
@@ -324,7 +326,129 @@ def test_the_shipped_rules_compile():
 
 
 def test_scores_stay_in_range():
-    from pathlib import Path
     repo = Path(__file__).resolve().parents[2]
     for rule in compile_directory(repo / "rules" / "sigma").rules:
         assert 0 <= rule.score <= 100
+
+
+# --------------------------------------------------------------------------- #
+# the no-PyYAML fallback parser
+# --------------------------------------------------------------------------- #
+#
+# CI installs no runtime dependencies, so the Python job runs these tests with
+# PyYAML absent — but a developer machine usually has it, which is exactly how
+# the fallback parser shipped broken on all four sample rules while every local
+# run was green. These tests force the fallback on regardless.
+
+@contextmanager
+def no_pyyaml():
+    """Make `import yaml` fail, the way a dependency-free install behaves.
+
+    Setting the entry to None is what actually blocks the import; an import-hook
+    approach using find_module silently does nothing on Python 3.12, which is
+    how the first version of this check passed while testing nothing.
+    """
+    saved = sys.modules.get("yaml", "absent")
+    sys.modules["yaml"] = None
+    try:
+        yield
+    finally:
+        if saved == "absent":
+            sys.modules.pop("yaml", None)
+        else:
+            sys.modules["yaml"] = saved
+
+
+def test_the_fallback_parser_is_actually_engaged():
+    """Guard the guard: if this passes trivially, every test below is vacuous."""
+    with no_pyyaml(), pytest.raises(ImportError):
+        import yaml  # noqa: F401
+
+
+def test_shipped_rules_compile_without_pyyaml():
+    repo = Path(__file__).resolve().parents[2]
+    with no_pyyaml():
+        report = compile_directory(repo / "rules" / "sigma")
+    assert report.failed == [], f"fallback parser failed on: {report.failed}"
+    assert len(report.rules) >= 3
+
+
+def _pyyaml_available() -> bool:
+    # Not pytest.importorskip: that skips only on ModuleNotFoundError, so a
+    # PyYAML that is present but broken becomes an error rather than a skip.
+    # Here either one means the same thing — there is nothing to compare against.
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(not _pyyaml_available(), reason="no PyYAML to compare against")
+def test_both_parsers_produce_identical_rules():
+    """The fallback is only safe if it means the same thing as PyYAML."""
+    repo = Path(__file__).resolve().parents[2]
+
+    with_yaml = compile_directory(repo / "rules" / "sigma")
+    with no_pyyaml():
+        without_yaml = compile_directory(repo / "rules" / "sigma")
+
+    assert [r.to_dict() for r in with_yaml.rules] == [r.to_dict() for r in without_yaml.rules]
+    assert [n for n, _ in with_yaml.skipped] == [n for n, _ in without_yaml.skipped]
+
+
+def test_fallback_parses_a_block_sequence_under_a_key():
+    """`tags:` followed by `- item` — the shape that broke every sample rule.
+
+    A key's container type is unknown until its first child line arrives, and
+    the original parser assumed a map.
+    """
+    with no_pyyaml():
+        doc = load_yaml("tags:\n  - attack.persistence\n  - attack.t1098.004\n")
+    assert doc == {"tags": ["attack.persistence", "attack.t1098.004"]}
+
+
+def test_fallback_parses_a_folded_block_scalar():
+    with no_pyyaml():
+        doc = load_yaml("description: >\n  one line\n  and another\nlevel: high\n")
+    assert doc == {"description": "one line and another", "level": "high"}
+
+
+def test_fallback_parses_a_literal_block_scalar():
+    with no_pyyaml():
+        doc = load_yaml("description: |\n  line one\n  line two\nlevel: low\n")
+    assert doc == {"description": "line one\nline two", "level": "low"}
+
+
+def test_fallback_parses_nested_maps_and_inline_sequences():
+    with no_pyyaml():
+        doc = load_yaml(
+            "detection:\n"
+            "  selection:\n"
+            "    message|contains:\n"
+            "      - 'a'\n"
+            "      - 'b'\n"
+            "    user: root\n"
+            "  condition: selection\n"
+            "flow: [x, y]\n"
+        )
+    assert doc == {
+        "detection": {
+            "selection": {"message|contains": ["a", "b"], "user": "root"},
+            "condition": "selection",
+        },
+        "flow": ["x", "y"],
+    }
+
+
+def test_fallback_refuses_what_it_cannot_parse():
+    with no_pyyaml(), pytest.raises(SigmaError):
+        load_yaml("detection:\n  - item\n    stray text without a colon\n")
+
+
+def test_fallback_transpiles_an_end_to_end_rule():
+    with no_pyyaml():
+        rule = compile_text(BASE)
+    assert rule.mitre == ["T1110.001"]
+    assert rule.processes == ["sshd"]
+    assert rule.score == 55
