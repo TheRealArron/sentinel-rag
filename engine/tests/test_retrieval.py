@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 import pytest
 
 from sentinel.corpus import events_to_documents, group_events, load_advisories, parse_front_matter
@@ -147,6 +149,107 @@ class TestLocalVectorStore:
         with path.open("a", encoding="utf-8") as fh:
             fh.write("{not json\n")
         assert LocalVectorStore(path).count() == 1
+
+    # -- append-log behaviour ------------------------------------------------
+    #
+    # These pin the fix for what was the worst scalability defect in the engine.
+    # `add` used to rewrite the whole file, and the indexer calls it once per
+    # embedding batch of 16, so indexing was quadratic: 4,000 vectors took 50.9 s
+    # and wrote 1.66 GB to produce a 13.2 MB file. At the documented 50,000-vector
+    # soft limit that extrapolated to ~2.2 hours and ~258 GB, meaning the limit
+    # could never actually be reached. After the change the same 4,000 vectors
+    # take 0.70 s, and 50,000 take 13.8 s.
+
+    def test_add_appends_instead_of_rewriting(self, tmp_path, monkeypatch):
+        """The regression that matters: a plain add must not rewrite the file.
+
+        Counting full rewrites rather than timing the run — a wall-clock
+        assertion tight enough to catch quadratic growth is also tight enough to
+        flake on a busy CI runner.
+        """
+        store = LocalVectorStore(tmp_path / "v.jsonl")
+        rewrites = {"n": 0}
+        original = LocalVectorStore._flush
+
+        def counting(self):
+            rewrites["n"] += 1
+            original(self)
+
+        monkeypatch.setattr(LocalVectorStore, "_flush", counting)
+        for i in range(50):
+            store.add([self._chunk(f"c{i}")], [[1.0, 0.0]])
+
+        assert rewrites["n"] == 0, (
+            f"{rewrites['n']} full rewrites for 50 distinct adds — the write path "
+            f"is quadratic again"
+        )
+        assert store.count() == 50
+
+    def test_file_grows_linearly_with_added_vectors(self, tmp_path):
+        path = tmp_path / "v.jsonl"
+        store = LocalVectorStore(path)
+        sizes = []
+        for batch in range(4):
+            store.add(
+                [self._chunk(f"b{batch}_{i}") for i in range(25)],
+                [[1.0, 0.0]] * 25,
+            )
+            sizes.append(path.stat().st_size)
+        # Equal-sized batches must produce roughly equal-sized growth. Under the
+        # old rewrite-everything scheme the deltas grew with the file.
+        deltas = [b - a for a, b in pairwise(sizes)]
+        assert max(deltas) <= min(deltas) * 1.5, f"growth is not linear: {deltas}"
+
+    def test_updating_a_vector_wins_after_reload(self, tmp_path):
+        """An append-only log records an update by writing the id again, so the
+        last row read must win. Getting this backwards would silently serve a
+        stale vector for every re-indexed chunk."""
+        path = tmp_path / "v.jsonl"
+        store = LocalVectorStore(path)
+        store.add([self._chunk("a")], [[1.0, 0.0]])
+        store.add([self._chunk("a")], [[0.0, 1.0]])
+
+        reloaded = LocalVectorStore(path)
+        assert reloaded.count() == 1
+        results = reloaded.query([0.0, 1.0], k=1)
+        assert results[0][1] == pytest.approx(1.0), "the superseded vector was served"
+
+    def test_compaction_reclaims_space_from_superseded_rows(self, tmp_path):
+        """Appending forever would grow the file without bound when chunks are
+        re-indexed. Compaction runs once dead rows outnumber live ones, which
+        bounds the file at roughly twice its minimum size."""
+        path = tmp_path / "v.jsonl"
+        store = LocalVectorStore(path)
+        store.add([self._chunk(f"c{i}") for i in range(20)], [[1.0, 0.0]] * 20)
+        baseline = path.stat().st_size
+
+        # Rewrite the same 20 ids repeatedly; every write supersedes a row.
+        for _ in range(6):
+            store.add([self._chunk(f"c{i}") for i in range(20)], [[1.0, 0.0]] * 20)
+
+        assert store.count() == 20
+        assert path.stat().st_size <= baseline * 2.5, (
+            "superseded rows are never reclaimed; the file grows without bound"
+        )
+        assert LocalVectorStore(path).count() == 20
+
+    def test_torn_final_line_is_repaired_not_just_skipped(self, tmp_path):
+        """A crash mid-append leaves a partial line. Skipping it at read time is
+        not enough — the bytes stay on disk and the next append lands directly
+        after them, welding two half-records into one corrupt line and losing a
+        vector that was written successfully."""
+        path = tmp_path / "v.jsonl"
+        LocalVectorStore(path).add([self._chunk("a")], [[1.0, 0.0]])
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write('{"chunk_id": "torn", "text": "hal')  # no newline
+
+        store = LocalVectorStore(path)
+        assert store.count() == 1
+        store.add([self._chunk("b")], [[0.0, 1.0]])
+
+        reloaded = LocalVectorStore(path)
+        assert reloaded.count() == 2, "the append after a torn line corrupted a record"
+        assert reloaded.existing_ids(["a", "b"]) == {"a", "b"}
 
 
 class TestParentStore:

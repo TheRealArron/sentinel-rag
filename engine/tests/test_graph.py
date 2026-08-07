@@ -319,3 +319,144 @@ class TestAgainstTheDemoFixture:
     def test_summary_is_compact(self, engine):
         info = summarise(engine.attack_graph())
         assert info["nodes"] > 0 and len(info["shapes"]) <= 5
+
+
+class TestShapeDetectionScales:
+    """Shape detection runs synchronously on every /api/graph request, over a
+    buffer of up to 20,000 events, and the quantities driving its cost — distinct
+    source addresses, distinct accounts — are chosen by whoever is attacking the
+    host.
+
+    The original implementation was cubic: _chains asked for a fresh traversal
+    per (source, target) pair, and three other detectors scanned every edge once
+    per node. Measured 0.06s at 100 events, 4.5s at 400, 40s at 800, 330s at
+    1600. A dashboard poll during a distributed scan would have hung the server
+    for hours — a denial of service triggered by the attack the graph exists to
+    display.
+
+    These tests pin the work bound rather than the wall clock, because a timing
+    assertion tight enough to catch a regression is also tight enough to flake on
+    a loaded CI runner.
+    """
+
+    @staticmethod
+    def _scan(n_sources: int, succeed: bool) -> list[LogEvent]:
+        """A scan from n distinct addresses, all failing or all succeeding."""
+        out = []
+        for i in range(n_sources):
+            ip = f"203.0.{i // 256 % 256}.{i % 256}"
+            out.append(event(
+                at(i % 60, i % 60),
+                raw_sha256=f"{i:064x}",
+                source_ip=ip,
+                user=f"user{i % 20}",
+                rule="ssh_accepted_login" if succeed else "ssh_failed_password",
+                outcome="success" if succeed else "failure",
+                category="authentication",
+                message=f"{'Accepted' if succeed else 'Failed'} password for user{i % 20} from {ip}",
+                fields={"command": f"/usr/bin/tool{i} /var/data/file{i}"},
+            ))
+        return out
+
+    def _count_traversals(self, graph, monkeypatch) -> int:
+        calls = {"n": 0}
+        original = type(graph)._deepest_route
+
+        def counting(self, src, targets):
+            calls["n"] += 1
+            return original(self, src, targets)
+
+        monkeypatch.setattr(type(graph), "_deepest_route", counting)
+        graph.shapes()
+        return calls["n"]
+
+    def test_sources_that_never_got_access_cost_no_traversal(self, monkeypatch):
+        """The realistic explosion: thousands of addresses that only ever failed.
+
+        A failed login grants nothing, so such a source cannot begin a chain and
+        must be rejected by a dict lookup. The old code still paid a function
+        call per (source, target) pair to reach the same conclusion, and that
+        overhead alone was the bulk of the 330 seconds.
+        """
+        graph = build_graph(self._scan(2000, succeed=False))
+        assert self._count_traversals(graph, monkeypatch) == 0
+
+    def test_traversals_are_bounded_when_every_source_succeeds(self, monkeypatch):
+        """Pruning handles the scan; it does not bound credential stuffing that
+        works. Chains are a ranked finding, so the work is capped where the
+        output stops being readable.
+
+        The bound asserted here is deliberately *not* MAX_CHAIN_SOURCES. Checking
+        the work against the very constant that limits it is circular — raising
+        the constant raises the assertion with it, so the test would keep passing
+        as the cap was loosened to uselessness. The first version of this test
+        did exactly that, and was confirmed to still pass with the cap set to
+        100,000. What matters is that the work is sub-linear in the number of
+        attacker-supplied sources, so that is what is measured.
+        """
+        n_sources = 2000
+        graph = build_graph(self._scan(n_sources, succeed=True))
+        assert len([n for n, node in graph.nodes.items() if node.kind == "source_ip"]) == n_sources
+
+        calls = self._count_traversals(graph, monkeypatch)
+        assert calls < n_sources, (
+            f"{calls} traversals for {n_sources} successful sources — the work "
+            f"still grows with attacker-controlled input. The cap is gone."
+        )
+        # An absolute ceiling too, so a cap that exists but is set absurdly high
+        # is still a failure.
+        assert calls <= 500, f"{calls} traversals is more work than any analyst will read"
+
+    def test_shape_output_is_capped_and_ranked(self):
+        """Ten thousand shapes would be unreadable as well as expensive, and the
+        cut must drop the least severe rather than an arbitrary slice."""
+        from sentinel.graph import MAX_SHAPES
+
+        graph = build_graph(self._scan(2000, succeed=True))
+        shapes = graph.shapes()
+        assert len(shapes) <= MAX_SHAPES
+        scores = [s.score for s in shapes]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_truncation_is_deterministic(self):
+        """Two runs over the same events must truncate to the same findings.
+        Sorting on score alone left ties in dict order, so the dashboard could
+        show a different 'top' shape on each poll with nothing having changed."""
+        events = self._scan(500, succeed=True)
+        first = [(s.name, s.centre, s.score) for s in build_graph(events).shapes()]
+        second = [(s.name, s.centre, s.score) for s in build_graph(events).shapes()]
+        assert first == second
+
+    def test_deepest_route_matches_the_pairwise_definition(self):
+        """The optimisation must not change the answer.
+
+        The shape wanted is the longest access route from a source to any file or
+        process. This checks the single-traversal implementation against the
+        definition it replaced — asking for each target's path and keeping the
+        longest.
+        """
+        events = [
+            event(at(1), source_ip="203.0.113.9", user="svc", outcome="success",
+                  category="authentication", rule="ssh_accepted_login",
+                  message="Accepted password for svc from 203.0.113.9"),
+            event(at(2), user="svc", rule="sudo_command_executed",
+                  category="privilege-escalation", outcome="success",
+                  message="svc : COMMAND=/usr/bin/id",
+                  fields={"target_user": "root", "command": "/usr/bin/id"}),
+            event(at(3), user="root", rule="sudo_command_executed",
+                  category="privilege-escalation", outcome="success",
+                  message="root : COMMAND=/bin/cat /etc/shadow",
+                  fields={"command": "/bin/cat /etc/shadow"}),
+        ]
+        graph = build_graph(events)
+        targets = {n for n, node in graph.nodes.items() if node.kind in {"file", "process"}}
+        for src, node in graph.nodes.items():
+            if node.kind != "source_ip":
+                continue
+            reference: list[str] = []
+            for dst in targets:
+                route = graph.path(src, dst, access_only=True)
+                if len(route) > len(reference):
+                    reference = route
+            got = graph._deepest_route(src, targets)
+            assert len(got) == len(reference), f"{src}: {got} vs {reference}"

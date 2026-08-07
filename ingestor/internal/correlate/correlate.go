@@ -49,12 +49,39 @@ func DefaultConfig() Config {
 	}
 }
 
+// Per-source caps.
+//
+// MaxTrackedIPs bounds how many sources are tracked, but said nothing about how
+// much state each one may accumulate — and both of the fields below are grown by
+// attacker-controlled input. A single address supplying a fresh SSH username per
+// attempt could grow `users` without limit, and the sanitiser caps a username at
+// 256 bytes, so a sustained attempt from the 8192 permitted sources had no upper
+// bound on memory at all. Bounding the outer map while leaving the inner state
+// unbounded is not a bound.
+//
+// Both caps are set well above the values any detection here actually reads:
+// spraying is declared at 3 distinct users and the alert lists 10, while the
+// brute-force threshold defaults to 5 failures. So saturating either changes no
+// verdict — it only makes the reported detail approximate, and only in the case
+// where the exact figure has long stopped being interesting.
+const (
+	maxUsersPerSource    = 64
+	maxFailuresPerSource = 128
+)
+
 type sourceState struct {
-	failures   []time.Time
-	users      map[string]struct{}
-	lastSeen   time.Time
-	lastAlert  time.Time
-	totalFails int
+	// failures holds the timestamps of recent authentication failures inside the
+	// window. Saturates at maxFailuresPerSource; totalFails stays exact.
+	failures  []time.Time
+	saturated bool
+	// users is the distinct set of accounts this source has targeted, capped at
+	// maxUsersPerSource. usersOverflow records that the real set is larger, so
+	// the alert can say so rather than quietly understating the spread.
+	users         map[string]struct{}
+	usersOverflow bool
+	lastSeen      time.Time
+	lastAlert     time.Time
+	totalFails    int
 }
 
 // Correlator holds per-source sliding-window state. Not safe for concurrent use.
@@ -98,12 +125,28 @@ func (c *Correlator) Observe(ev *event.Event, ts time.Time) []*event.Event {
 
 	switch {
 	case isAuthFailure:
-		st.failures = append(st.failures, ts)
 		st.totalFails++
-		if ev.User != "" {
-			st.users[ev.User] = struct{}{}
-		}
+		// Expire first, then record. The order matters: pruning afterwards would
+		// let a buffer still full of *stale* timestamps reject the new one, so a
+		// source that saturated once could never register another failure even
+		// after its window had completely drained — it would sit at a count of
+		// zero while being actively attacked. Trimming first means the cap only
+		// ever discards events that are genuinely concurrent.
 		c.prune(st, ts)
+		if len(st.failures) < maxFailuresPerSource {
+			st.failures = append(st.failures, ts)
+		} else {
+			st.saturated = true
+		}
+		if ev.User != "" {
+			if _, known := st.users[ev.User]; !known {
+				if len(st.users) < maxUsersPerSource {
+					st.users[ev.User] = struct{}{}
+				} else {
+					st.usersOverflow = true
+				}
+			}
+		}
 		if len(st.failures) >= c.cfg.FailureThreshold && c.offCooldown(st, ts) {
 			st.lastAlert = ts
 			out = append(out, c.bruteForceIncident(ev, st, ts))
@@ -165,6 +208,12 @@ func (c *Correlator) prune(st *sourceState, now time.Time) {
 		}
 	}
 	st.failures = keep
+	// Once the retained timestamps have drained below the cap the source is no
+	// longer saturated, so its counts become exact again rather than reporting a
+	// floor forever after one busy minute.
+	if len(st.failures) < maxFailuresPerSource {
+		st.saturated = false
+	}
 }
 
 func (c *Correlator) offCooldown(st *sourceState, now time.Time) bool {
@@ -178,16 +227,32 @@ func (c *Correlator) userList(st *sourceState) string {
 	}
 	sort.Strings(users)
 	if len(users) > 10 {
-		users = append(users[:10], fmt.Sprintf("+%d more", len(st.users)-10))
+		remainder := fmt.Sprintf("+%d more", len(st.users)-10)
+		if st.usersOverflow {
+			// The set is capped, so "+54 more" would be a false precision about
+			// an attacker who tried thousands of names.
+			remainder = fmt.Sprintf("+%d more (tracking capped)", len(st.users)-10)
+		}
+		users = append(users[:10], remainder)
 	}
 	return join(users, ", ")
 }
 
+// failureCount renders the in-window count, marked as a floor when the per-source
+// cap has been reached. Reporting a saturated 128 as though it were exact would
+// understate a flood by an arbitrary amount; the true running total is carried
+// separately in total_failures_seen and is never capped.
+func (c *Correlator) failureCount(st *sourceState) string {
+	if st.saturated {
+		return fmt.Sprintf(">=%d", len(st.failures))
+	}
+	return fmt.Sprint(len(st.failures))
+}
+
 func (c *Correlator) bruteForceIncident(trigger *event.Event, st *sourceState, ts time.Time) *event.Event {
-	count := len(st.failures)
 	msg := fmt.Sprintf(
-		"INCIDENT brute-force: %d authentication failures from %s within %s (targeted users: %s)",
-		count, trigger.SourceIP, c.cfg.Window, orNone(c.userList(st)))
+		"INCIDENT brute-force: %s authentication failures from %s within %s (targeted users: %s)",
+		c.failureCount(st), trigger.SourceIP, c.cfg.Window, orNone(c.userList(st)))
 
 	inc := c.newIncident(trigger, ts, msg)
 	inc.Rule = "correlated_brute_force"
@@ -205,7 +270,7 @@ func (c *Correlator) bruteForceIncident(trigger *event.Event, st *sourceState, t
 	inc.MITRE = []string{"T1110.001", "T1110.003"}
 	inc.AddTags("brute-force", "ブルートフォース", "incident", "インシデント",
 		"correlated", "相関検知", enrich.CatAuth)
-	inc.SetField("failure_count", fmt.Sprint(count))
+	inc.SetField("failure_count", c.failureCount(st))
 	inc.SetField("window", c.cfg.Window.String())
 	inc.SetField("targeted_users", c.userList(st))
 	inc.SetField("total_failures_seen", fmt.Sprint(st.totalFails))
@@ -226,7 +291,7 @@ func (c *Correlator) compromiseIncident(trigger *event.Event, st *sourceState, t
 	inc.MITRE = []string{"T1110.001", "T1078.003"}
 	inc.AddTags("account-compromise", "アカウント侵害", "incident", "インシデント",
 		"correlated", "相関検知", "brute-force", "ブルートフォース", enrich.CatAuth)
-	inc.SetField("preceding_failures", fmt.Sprint(len(st.failures)))
+	inc.SetField("preceding_failures", c.failureCount(st))
 	inc.SetField("targeted_users", c.userList(st))
 	return inc
 }

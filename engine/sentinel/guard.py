@@ -14,6 +14,12 @@ import time
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+# Hard cap on tracked clients. One bucket plus its key costs a few hundred bytes,
+# so this bounds the limiter at low single-digit megabytes no matter how many
+# addresses it is shown. See RateLimiter._evict for why a cap is needed rather
+# than an idle sweep alone.
+MAX_TRACKED_CLIENTS = 4096
+
 
 @dataclass
 class _Bucket:
@@ -56,13 +62,44 @@ class RateLimiter:
             return False, deficit / self.refill
 
     def _evict(self, now: float) -> None:
-        """Drop long-idle buckets. Unbounded growth is attacker-controlled, since
-        the key is a source address."""
-        if len(self._buckets) < 4096:
+        """Keep the client table under a hard cap.
+
+        The key is a source address, so the number of entries is chosen by
+        whoever is sending requests. An earlier version dropped only buckets that
+        had been idle longer than ``capacity / refill`` — 60 seconds at the
+        defaults — and described that as bounding growth. It does not. A caller
+        rotating source addresses *faster* than the idle threshold leaves every
+        bucket looking fresh, so nothing is ever evicted and the table grows for
+        as long as the addresses keep changing.
+
+        That is not a theoretical rotation budget. A single host with a routed
+        IPv6 /64 can source from 2^64 distinct addresses, all of which reach this
+        server and each of which mints a bucket. The control meant to protect the
+        API became a way to exhaust its memory.
+
+        So: sweep the genuinely idle first, and if that is not enough, evict by
+        least-recently-used until the table is back under the cap.
+
+        Evicting LRU rather than refusing new clients is deliberate, and it is
+        the safe direction here. An attacker mid-flood is by definition
+        *recently* used, so they are the last to be evicted and stay throttled;
+        what gets dropped is idle clients, who were not being throttled anyway.
+        Refusing to track new clients instead would let an attacker who filled
+        the table lock every subsequent visitor out of rate limiting entirely.
+        """
+        if len(self._buckets) < MAX_TRACKED_CLIENTS:
             return
+
         idle_for_full = self.capacity / self.refill
-        stale = [k for k, b in self._buckets.items() if now - b.updated > idle_for_full]
-        for key in stale:
+        for key in [k for k, b in self._buckets.items() if now - b.updated > idle_for_full]:
+            del self._buckets[key]
+        if len(self._buckets) < MAX_TRACKED_CLIENTS:
+            return
+
+        # Everything is active. Drop the oldest tenth, so the O(n log n) sort is
+        # amortised over the next n/10 insertions rather than run per request.
+        ordered = sorted(self._buckets.items(), key=lambda kv: kv[1].updated)
+        for key, _bucket in ordered[: max(1, len(ordered) // 10)]:
             del self._buckets[key]
 
     def snapshot(self) -> dict[str, object]:

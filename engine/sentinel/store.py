@@ -33,6 +33,17 @@ from .schemas import Chunk, Document
 
 # Past this many vectors, exact brute-force search stops being a reasonable
 # default and the operator should install ChromaDB.
+#
+# Measured on this machine, 384-dimension vectors: indexing 50,000 takes 13.8 s
+# and produces a 165 MB file, reloading it takes 6.2 s, and one exact query takes
+# 1.74 s. The query is what the limit is about — it is O(n) by construction, and
+# 1.74 s is past what a dashboard should ask of anyone.
+#
+# That was not previously true. Until the write path was made append-only this
+# limit was unreachable for a different reason entirely: indexing 50,000 vectors
+# would have taken about 2.2 hours and written roughly 258 GB. The constant
+# documented a search cost while the ceiling was really in the writer, which is
+# the kind of gap that only shows up when the numbers are actually taken.
 LOCAL_BACKEND_SOFT_LIMIT = 50_000
 
 
@@ -68,6 +79,20 @@ def _chunk_metadata(chunk: Chunk) -> dict[str, Any]:
         if isinstance(value, (bool, str, int, float)):
             meta[key] = value
     return meta
+
+
+def _encode_row(chunk: Chunk, vector: Sequence[float]) -> str:
+    """One newline-terminated JSONL record. The single definition of the on-disk
+    row, so the append path and the compaction path cannot drift."""
+    return json.dumps(
+        {
+            "chunk_id": chunk.chunk_id,
+            "text": chunk.text,
+            "metadata": _chunk_metadata(chunk),
+            "vector": list(vector),
+        },
+        ensure_ascii=False,
+    ) + "\n"
 
 
 def _chunk_from_row(chunk_id: str, text: str, meta: dict[str, Any]) -> Chunk:
@@ -226,7 +251,49 @@ class ParentStore:
 # --------------------------------------------------------------------------- #
 
 class LocalVectorStore:
-    """Exact cosine search over vectors persisted as JSONL."""
+    """Exact cosine search over vectors persisted as an append-only JSONL log.
+
+    # Why the file is appended to rather than rewritten
+
+    The obvious implementation writes the whole file after every ``add``, via the
+    temp-file-and-rename dance used elsewhere in this module. That is what this
+    class did, and it made indexing quadratic: the indexer embeds in batches of
+    16, so a run of *n* vectors performed *n/16* full rewrites of a file that was
+    growing towards *n*.
+
+    Measured before the change, embedding a synthetic corpus:
+
+    ======  =========  ==================  ==============
+    vectors  wall time  bytes written       amplification
+    ======  =========  ==================  ==============
+    500      0.9 s      27.8 MB             16.9x
+    1000     2.3 s      106.3 MB            32.2x
+    2000     10.6 s     415.3 MB            63.0x
+    4000     50.9 s     1655.1 MB           125.5x
+    ======  =========  ==================  ==============
+
+    Every doubling quadrupled the work. Extrapolated to
+    ``LOCAL_BACKEND_SOFT_LIMIT``, a 50,000-vector index would have taken roughly
+    2.2 hours and written about 258 GB to reach a 165 MB file — so the documented
+    limit was not reachable, and the constant was describing a query cost while
+    the write path failed far earlier.
+
+    JSONL is an append-friendly format; the old code simply was not using it that
+    way. Now ``add`` appends only the new rows, and duplicate ids are resolved
+    last-wins at load time. The file is compacted when superseded rows outnumber
+    live ones, which bounds it at roughly twice its minimum size and keeps writes
+    amortised O(1) per vector.
+
+    # Durability
+
+    Compaction still goes through temp-file-and-rename, so it is atomic. A plain
+    append is not: a crash mid-write can leave a partial final line. That is
+    strictly better than what it replaced — existing rows are never rewritten, so
+    only the newest append is ever at risk — and ``_load`` repairs the file by
+    truncating back to the last complete record. Without that repair the next
+    append would concatenate onto the partial line and corrupt a second record
+    too.
+    """
 
     backend = "local"
 
@@ -236,6 +303,8 @@ class LocalVectorStore:
         self._chunks: dict[str, Chunk] = {}
         self._vectors: dict[str, list[float]] = {}
         self._loaded = False
+        # Rows present on disk that a later row has superseded. Drives compaction.
+        self._dead = 0
         self.warning: str | None = None
 
     def _load(self) -> None:
@@ -245,6 +314,7 @@ class LocalVectorStore:
             if self._loaded:
                 return
             if self.path.exists():
+                self._repair_partial_tail()
                 with self.path.open("r", encoding="utf-8") as fh:
                     for line in fh:
                         line = line.strip()
@@ -253,12 +323,46 @@ class LocalVectorStore:
                         try:
                             row = json.loads(line)
                             chunk = _chunk_from_row(row["chunk_id"], row["text"], row.get("metadata", {}))
+                            # Later rows win: an append-only log records updates
+                            # by writing them again, so the last one read is the
+                            # current value and the earlier ones are dead weight.
+                            if chunk.chunk_id in self._vectors:
+                                self._dead += 1
                             self._chunks[chunk.chunk_id] = chunk
                             self._vectors[chunk.chunk_id] = [float(x) for x in row["vector"]]
                         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                             continue
             self._loaded = True
             self._check_size()
+
+    def _repair_partial_tail(self) -> None:
+        """Truncate a torn final line left by a crash mid-append.
+
+        Skipping the unparseable line at read time is not enough: the bytes stay
+        on disk, and the next append lands directly after them, producing one
+        corrupt record from two halves of different ones. The file has to be
+        repaired, not merely tolerated.
+        """
+        try:
+            size = self.path.stat().st_size
+            if size == 0:
+                return
+            with self.path.open("rb+") as fh:
+                fh.seek(-1, os.SEEK_END)
+                if fh.read(1) == b"\n":
+                    return
+                # Walk back to the last newline and cut there. Reading the tail in
+                # one chunk is enough: a single record is far smaller than this.
+                window = min(size, 1 << 20)
+                fh.seek(size - window)
+                tail = fh.read(window)
+                cut = tail.rfind(b"\n")
+                fh.truncate(size - window + cut + 1 if cut >= 0 else 0)
+        except OSError:
+            # A store that cannot be repaired is handled the same way as one that
+            # cannot be parsed: degrade to an empty index rather than refuse to
+            # start. Re-indexing rebuilds it.
+            return
 
     def _check_size(self) -> None:
         if len(self._vectors) > LOCAL_BACKEND_SOFT_LIMIT:
@@ -274,14 +378,40 @@ class LocalVectorStore:
         self._load()
         added = 0
         with self._lock:
+            rows: list[str] = []
             for chunk, vector in zip(chunks, vectors, strict=True):
                 if chunk.chunk_id not in self._chunks:
                     added += 1
+                else:
+                    # The row already on disk is now superseded.
+                    self._dead += 1
+                values = [float(x) for x in vector]
                 self._chunks[chunk.chunk_id] = chunk
-                self._vectors[chunk.chunk_id] = [float(x) for x in vector]
-            self._flush()
+                self._vectors[chunk.chunk_id] = values
+                rows.append(_encode_row(chunk, values))
+            self._append(rows)
+            if self._dead > len(self._vectors):
+                # More garbage than data. Compacting here keeps the file within
+                # about twice its minimum size while leaving writes amortised
+                # O(1): each compaction costs O(n) but at least n rows were
+                # appended since the last one.
+                self._compact()
             self._check_size()
         return added
+
+    def _append(self, rows: Sequence[str]) -> None:
+        if not rows:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write("".join(rows))
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def _compact(self) -> None:
+        """Rewrite the file with one row per live vector."""
+        self._flush()
+        self._dead = 0
 
     def query(
         self, vector: Sequence[float], k: int, where: dict[str, Any] | None = None
@@ -308,29 +438,23 @@ class LocalVectorStore:
         with self._lock:
             self._chunks.clear()
             self._vectors.clear()
+            self._dead = 0
             self._loaded = True
             self.warning = None
             self._flush()
 
     def _flush(self) -> None:
+        """Write the whole file atomically. Used by reset and by compaction only.
+
+        This is no longer on the ``add`` path — see the class docstring for why
+        calling it per batch made indexing quadratic.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix=".vectors-", suffix=".jsonl")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 for chunk_id, vector in self._vectors.items():
-                    chunk = self._chunks[chunk_id]
-                    fh.write(
-                        json.dumps(
-                            {
-                                "chunk_id": chunk_id,
-                                "text": chunk.text,
-                                "metadata": _chunk_metadata(chunk),
-                                "vector": vector,
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
+                    fh.write(_encode_row(self._chunks[chunk_id], vector))
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)

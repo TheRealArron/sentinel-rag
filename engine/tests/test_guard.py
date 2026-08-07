@@ -234,3 +234,71 @@ class TestOriginMatchesTheBoundAddress:
         settings = indexed_engine.settings
         origin = f"http://127.0.0.1:{settings.api_port}"
         assert router.csrf.check("POST", "application/json", origin)[0] is True
+
+
+class TestRateLimiterMemoryIsBounded:
+    """The limiter keys on the source address, so the size of its table is chosen
+    by whoever is sending requests.
+
+    The original sweep dropped only buckets idle longer than capacity/refill —
+    60 seconds at the defaults — and was described as bounding growth. It did
+    not: a caller rotating addresses faster than that leaves every bucket looking
+    fresh, so nothing is evicted. A single host with a routed IPv6 /64 has 2^64
+    addresses to rotate through, which turned the control protecting the API into
+    a way to exhaust its memory.
+    """
+
+    def test_rapid_address_rotation_cannot_grow_the_table(self):
+        from sentinel.guard import MAX_TRACKED_CLIENTS, RateLimiter
+
+        limiter = RateLimiter(capacity=240, refill_per_second=4.0)
+        # Every request at the same instant, so no bucket is ever idle — this is
+        # exactly the case the idle sweep could not handle.
+        limiter._now = lambda: 1000.0  # type: ignore[method-assign]
+        for i in range(MAX_TRACKED_CLIENTS * 3):
+            limiter.check(f"2001:db8::{i:x}", cost=1)
+
+        tracked = limiter.snapshot()["tracked_clients"]
+        assert tracked <= MAX_TRACKED_CLIENTS, (
+            f"{tracked} buckets tracked with a cap of {MAX_TRACKED_CLIENTS}; "
+            f"address rotation can still exhaust memory"
+        )
+
+    def test_idle_clients_are_reclaimed_before_active_ones(self):
+        """Eviction must not hand an attacker a fresh allowance. The flooding
+        client is the most recently used, so it has to be the last evicted."""
+        from sentinel.guard import MAX_TRACKED_CLIENTS, RateLimiter
+
+        limiter = RateLimiter(capacity=10, refill_per_second=1.0)
+        clock = {"t": 1000.0}
+        limiter._now = lambda: clock["t"]  # type: ignore[method-assign]
+
+        # An attacker who has spent their allowance and keeps knocking.
+        for _ in range(10):
+            limiter.check("attacker", cost=1)
+        allowed, _ = limiter.check("attacker", cost=1)
+        assert not allowed, "precondition: the attacker should be throttled"
+
+        # Fill the table from fresh addresses, all at the same instant.
+        for i in range(MAX_TRACKED_CLIENTS * 2):
+            clock["t"] += 0.0001
+            limiter.check(f"filler-{i}", cost=1)
+            limiter.check("attacker", cost=1)  # keeps the attacker recently-used
+
+        still_blocked, _ = limiter.check("attacker", cost=1)
+        assert not still_blocked, (
+            "the attacker's bucket was evicted and their allowance reset — "
+            "flooding from other addresses now clears your own throttle"
+        )
+
+    def test_a_returning_client_is_still_limited_normally(self):
+        """The cap must not break the ordinary path."""
+        from sentinel.guard import RateLimiter
+
+        limiter = RateLimiter(capacity=5, refill_per_second=1.0)
+        limiter._now = lambda: 500.0  # type: ignore[method-assign]
+        for _ in range(5):
+            assert limiter.check("client", cost=1)[0]
+        allowed, retry_after = limiter.check("client", cost=1)
+        assert not allowed
+        assert retry_after > 0

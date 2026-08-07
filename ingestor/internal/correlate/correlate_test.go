@@ -1,6 +1,8 @@
 package correlate
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -175,4 +177,83 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(buf[i:])
+}
+
+// Bounding the number of tracked sources is not the same as bounding memory.
+// Both fields below are grown by attacker-supplied input — the SSH username is
+// chosen by whoever is connecting — so a single address could previously grow
+// the correlator's heap without limit, and MaxTrackedIPs permits 8192 of them.
+func TestPerSourceStateIsBounded(t *testing.T) {
+	t.Run("distinct usernames cannot grow the heap without limit", func(t *testing.T) {
+		c := New(Config{FailureThreshold: 5, Window: time.Hour, Cooldown: time.Hour})
+		for i := 0; i < 10000; i++ {
+			c.Observe(failure("203.0.113.9", fmt.Sprintf("user%d", i)), base.Add(time.Duration(i)*time.Millisecond))
+		}
+		st := c.state["203.0.113.9"]
+		if got := len(st.users); got > maxUsersPerSource {
+			t.Errorf("tracked %d usernames from one source, cap is %d", got, maxUsersPerSource)
+		}
+		if !st.usersOverflow {
+			t.Error("overflow not recorded, so the alert would understate the spread")
+		}
+		// The alert must say the figure is capped rather than assert a precise
+		// count it no longer knows.
+		if list := c.userList(st); !strings.Contains(list, "tracking capped") {
+			t.Errorf("user list %q does not disclose that tracking was capped", list)
+		}
+	})
+
+	t.Run("failure timestamps cannot grow the heap without limit", func(t *testing.T) {
+		c := New(Config{FailureThreshold: 5, Window: time.Hour, Cooldown: time.Hour})
+		for i := 0; i < 10000; i++ {
+			c.Observe(failure("203.0.113.9", "root"), base.Add(time.Duration(i)*time.Millisecond))
+		}
+		st := c.state["203.0.113.9"]
+		if got := len(st.failures); got > maxFailuresPerSource {
+			t.Errorf("retained %d timestamps from one source, cap is %d", got, maxFailuresPerSource)
+		}
+		// The running total is a counter, not a collection, so it stays exact.
+		if st.totalFails != 10000 {
+			t.Errorf("totalFails = %d, want 10000 — the true volume must not be lost", st.totalFails)
+		}
+		if got := c.failureCount(st); !strings.HasPrefix(got, ">=") {
+			t.Errorf("failure_count = %q; a saturated count must read as a floor", got)
+		}
+	})
+
+	t.Run("a saturated source recovers once its window drains", func(t *testing.T) {
+		// Saturation must be a transient state. If it stuck, a source that was
+		// once noisy would keep reporting approximate counts forever.
+		c := New(Config{FailureThreshold: 5, Window: time.Minute, Cooldown: time.Hour})
+		for i := 0; i < 500; i++ {
+			c.Observe(failure("203.0.113.9", "root"), base.Add(time.Duration(i)*time.Millisecond))
+		}
+		st := c.state["203.0.113.9"]
+		if !st.saturated {
+			t.Fatal("expected saturation after 500 failures inside the window")
+		}
+		// One more failure, an hour later: everything before it has expired.
+		c.Observe(failure("203.0.113.9", "root"), base.Add(time.Hour))
+		if st.saturated {
+			t.Error("still saturated after the window drained")
+		}
+		if got := c.failureCount(st); got != "1" {
+			t.Errorf("failure_count = %q, want an exact 1 once the window drained", got)
+		}
+	})
+}
+
+// The caps must sit far above every threshold the detection logic reads, or
+// bounding memory would silently change verdicts.
+func TestCapsDoNotAffectAnyVerdict(t *testing.T) {
+	if maxUsersPerSource < 10 {
+		t.Errorf("maxUsersPerSource %d is below the 10 users the alert lists", maxUsersPerSource)
+	}
+	if maxUsersPerSource < 3 {
+		t.Errorf("maxUsersPerSource %d is below the spraying threshold of 3", maxUsersPerSource)
+	}
+	if def := DefaultConfig(); maxFailuresPerSource <= def.FailureThreshold {
+		t.Errorf("maxFailuresPerSource %d must exceed the brute-force threshold %d",
+			maxFailuresPerSource, def.FailureThreshold)
+	}
 }
