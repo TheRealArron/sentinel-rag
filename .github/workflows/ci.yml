@@ -70,6 +70,40 @@ jobs:
           fi
           mkdir -p /tmp/rules && cp /tmp/sigma.json /tmp/rules/
 
+      - name: Compile the threat feeds
+        # Same contract as the Sigma bundle: rebuilt from source rather than
+        # trusted, so a compiler change that emits a bundle Go cannot read fails
+        # here rather than in production. The bloom is compared byte for byte —
+        # a single differing hash bit produces a filter that matches nothing and
+        # reports no error.
+        working-directory: .
+        run: |
+          cd engine && python3 -m sentinel ioc --feeds ../rules/ioc \
+            --bloom /tmp/ioc.bloom --store /tmp/ioc.store
+          cd ..
+          if ! cmp -s rules/external/ioc.bloom /tmp/ioc.bloom; then
+            echo "::error::rules/external/ioc.bloom is stale — run 'make ioc' and commit"
+            exit 1
+          fi
+          if ! diff -u rules/external/ioc.store /tmp/ioc.store; then
+            echo "::error::rules/external/ioc.store is stale — run 'make ioc' and commit"
+            exit 1
+          fi
+
+      - name: Go and Python agree on the bundle format
+        # The agreement vectors are generated from the Python compiler and
+        # asserted by both sides. Regenerating them here catches the case where
+        # ioc.py changed but the committed vectors did not, which would leave Go
+        # happily agreeing with a stale file.
+        working-directory: .
+        run: |
+          python3 scripts/gen-ioc-vectors.py
+          if ! git diff --quiet ingestor/internal/ioc/testdata/agreement.json; then
+            echo "::error::agreement vectors are stale — run 'make ioc-check' and commit"
+            git diff ingestor/internal/ioc/testdata/agreement.json
+            exit 1
+          fi
+
       - name: Smoke test against the sample log
         env:
           # RFC 3164 timestamps carry no timezone, so the ingestor reads them in
@@ -83,10 +117,11 @@ jobs:
           # be silently unarmed. Naming it also models the production contract: an
           # explicitly-named file that is missing is a hard error, so a broken
           # canary config fails the build instead of quietly disarming.
-          # -sigma="" disables imported rules. The committed fixture describes a
-          # default install, so this step must not depend on them; Phase 11 gets
-          # its own step below.
+          # -sigma="" and -ioc-bloom="" disable imported rules and threat feeds.
+          # The committed fixture describes a default install, so this step must
+          # not depend on either; Phases 10 and 11 get their own steps below.
           /tmp/sentinel-ingestor -honeytokens=../config/honeytokens.json -sigma="" \
+            -ioc-bloom="" \
             -in ../data/samples/sample_syslog.log -out /tmp/events.jsonl -stats 2>/tmp/stats.txt
           cat /tmp/stats.txt
           lines=$(wc -l < /tmp/events.jsonl)
@@ -125,7 +160,7 @@ jobs:
           TZ: UTC
         run: |
           /tmp/sentinel-ingestor -honeytokens=../config/honeytokens.json \
-            -sigma=/tmp/rules \
+            -sigma=/tmp/rules -ioc-bloom="" \
             -in ../data/samples/sample_syslog.log -out /tmp/sigma-events.jsonl \
             -stats 2>/tmp/sigma-stats.txt
           armed=$(jq -r '.sigma_rules' /tmp/sigma-stats.txt)
@@ -143,6 +178,37 @@ jobs:
           [ "$(wc -l < /tmp/sigma-events.jsonl)" -eq 25 ] || {
             echo "::error::sigma import changed the event count"; exit 1; }
           echo "sigma: ${armed} rule(s) armed, ${attributed} distinct rule(s) attributed"
+
+      - name: Threat-feed indicators fire end to end
+        env:
+          TZ: UTC
+        run: |
+          /tmp/sentinel-ingestor -honeytokens=../config/honeytokens.json -sigma="" \
+            -ioc-bloom=/tmp/ioc.bloom -ioc-store=/tmp/ioc.store \
+            -in ../data/samples/sample_syslog.log -out /tmp/ioc-events.jsonl \
+            -stats 2>/tmp/ioc-stats.txt
+          loaded=$(jq -r '.ioc_indicators' /tmp/ioc-stats.txt)
+          [ "${loaded:-0}" -ge 5 ] || { echo "::error::ioc feed not loaded (${loaded:-0})"; exit 1; }
+          # Loaded is not the same as working. The sample log contains
+          # 203.0.113.45, which the demo feed lists, so this must produce hits.
+          hits=$(jq -r '.ioc_events' /tmp/ioc-stats.txt)
+          [ "${hits:-0}" -ge 1 ] || { echo "::error::no ioc events (${hits:-0})"; exit 1; }
+          # Every reported indicator is confirmed against the exact store, so the
+          # output must never contain an unconfirmed bloom hit.
+          confirmed=$(jq -r '.ioc.confirmed' /tmp/ioc-stats.txt)
+          [ "${confirmed:-0}" -ge 1 ] || { echo "::error::no confirmed lookups"; exit 1; }
+          # A feed must never push an event to where the responder would act on
+          # it. This is the Phase 5 invariant, checked on real output rather than
+          # only in a unit test.
+          over=$(jq -r 'select(.fields.ioc != null and .score >= 90)|.score' /tmp/ioc-events.jsonl | wc -l)
+          [ "$over" -eq 0 ] || {
+            echo "::error::$over feed-matched event(s) reached the response threshold"; exit 1; }
+          # Feed matching must not change the event count or break correlation.
+          [ "$(wc -l < /tmp/ioc-events.jsonl)" -eq 25 ] || {
+            echo "::error::ioc matching changed the event count"; exit 1; }
+          grep -q correlated_brute_force /tmp/ioc-events.jsonl || {
+            echo "::error::ioc matching broke brute-force correlation"; exit 1; }
+          echo "ioc: ${loaded} indicator(s) loaded, ${hits} event(s) enriched, ${confirmed} confirmed"
 
   python:
     name: Python engine (${{ matrix.python-version }})

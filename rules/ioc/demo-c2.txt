@@ -1,0 +1,12 @@
+# Sentinel demo feed — fabricated indicators for the sample intrusion.
+#
+# Every address here is from a range RFC 5737 / RFC 3849 reserve for
+# documentation, so this file can never match real infrastructure. A demo feed
+# that shipped a live IP would eventually block someone's DNS resolver.
+#
+# One indicator per line. Blank lines and # comments are ignored, and the type
+# is inferred from the shape.
+203.0.113.45
+198.51.100.77
+2001:db8:dead::1
+c2.malware.example

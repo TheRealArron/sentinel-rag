@@ -12,6 +12,7 @@ Why the code is the way it is. Source files carry short comments for local
 | [privacy.md](privacy.md) | What is pseudonymised, and what deliberately is not |
 | [dependencies.md](dependencies.md) | Why the optional-dependency design, and its limits |
 | [sigma.md](sigma.md) | The Sigma subset, what it refuses, and how the two matchers stay in sync |
+| [ioc.md](ioc.md) | Bloom prefilter over an on-disk exact store, the FPR defect a measurement caught, and why a feed cannot arm the firewall |
 
 These notes explain individual decisions. For the narrative version —
 the five hardest defects and how each was caught — see

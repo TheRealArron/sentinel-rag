@@ -104,10 +104,11 @@ sample: build ## Regenerate the committed sample fixture from the ingestor
 	@# meaning this fixture would otherwise differ between a developer in
 	@# Asia/Tokyo and a CI runner in UTC, and the drift check would cry wolf on
 	@# every machine.
-	@# -sigma="" is deliberate. The fixture describes a DEFAULT install, so it
-	@# must not vary with whatever Sigma rules a given machine has compiled into
-	@# rules/external. Phase 11 is exercised separately, in CI and in the Go tests.
-	TZ=UTC ./$(BIN) -sigma="" -in $(SAMPLE) -out - > data/samples/events.sample.jsonl
+	@# -sigma="" and -ioc-bloom="" are deliberate. The fixture describes a DEFAULT
+	@# install, so it must not vary with whatever Sigma rules or threat feeds a
+	@# given machine has compiled into rules/external. Phases 10 and 11 are
+	@# exercised separately, in CI and in the Go tests.
+	TZ=UTC ./$(BIN) -sigma="" -ioc-bloom="" -in $(SAMPLE) -out - > data/samples/events.sample.jsonl
 	@echo "regenerated data/samples/events.sample.jsonl ($$(wc -l < data/samples/events.sample.jsonl) events)"
 	@git diff --stat data/samples/events.sample.jsonl 2>/dev/null || true
 
@@ -125,6 +126,18 @@ sigma: ## Compile rules/sigma/*.yml into the bundle the ingestor loads (Phase 11
 sigma-check: ## Compile Sigma rules without writing, and refresh the Go/Python agreement vectors
 	cd engine && $(PYTHON) -m sentinel sigma --rules ../rules/sigma --dry-run
 	$(PYTHON) scripts/gen-sigma-vectors.py
+
+.PHONY: ioc
+ioc: ## Compile rules/ioc/ into the bloom+store bundle the ingestor loads (Phase 10)
+	@# Like `make sigma`, the ingestor reads what this produces at startup, so a
+	@# refreshed threat feed needs this target and a restart — never a Go rebuild.
+	cd engine && $(PYTHON) -m sentinel ioc --feeds ../rules/ioc \
+	  --bloom ../rules/external/ioc.bloom --store ../rules/external/ioc.store
+
+.PHONY: ioc-check
+ioc-check: ## Compile threat feeds without writing, and refresh the Go/Python agreement vectors
+	cd engine && $(PYTHON) -m sentinel ioc --feeds ../rules/ioc --dry-run
+	$(PYTHON) scripts/gen-ioc-vectors.py
 
 .PHONY: honeytokens-verify
 honeytokens-verify: build ## Check canaries do not collide with real accounts (run on the host)

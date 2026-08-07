@@ -204,6 +204,79 @@ def cmd_analyze(args, engine: SentinelEngine, printer: Printer) -> int:
     return 0
 
 
+def _human_bytes(n: int) -> str:
+    """Render a byte count at a sensible scale.
+
+    A demo-sized feed should show bytes rather than "0.0 KiB", which reads as a
+    bug in the tool rather than a small input.
+    """
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KiB"
+    return f"{n / 1024 / 1024:.1f} MiB"
+
+
+def cmd_ioc(args, engine: SentinelEngine, printer: Printer) -> int:
+    """Compile threat feeds into the bloom/store bundle the Go ingestor loads.
+
+    Same division of labour as `sigma`: Python parses and normalises, Go matches
+    at ingest speed. See docs/design/ioc.md.
+    """
+    from .ioc import compile_directory, write_bundle
+
+    report = compile_directory(Path(args.feeds), fpr=args.fpr)
+    bloom = report.bloom
+    assert bloom is not None  # compile_directory raises rather than returning None
+
+    if args.json:
+        print(json.dumps({
+            "summary": report.summary(),
+            "indicators": len(report.indicators),
+            "sources": report.sources,
+            "bloom": {
+                "bits": bloom.m, "bytes": (bloom.m + 7) // 8,
+                "probes": bloom.k, "estimated_fpr": bloom.estimated_fpr(),
+            },
+            "duplicates": report.duplicates,
+            "refused": [{"value": v, "reason": w} for v, w in report.refused],
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    printer.header("Threat feeds → Sentinel")
+    printer.kv("source", args.feeds)
+    printer.kv("result", report.summary())
+
+    # The two numbers that justify the design, printed so they can be checked
+    # rather than trusted: what the filter costs in RAM, and how often it will
+    # send a clean candidate to the disk for nothing.
+    printer.kv("bloom", f"{_human_bytes((bloom.m + 7) // 8)}, {bloom.k} probes, "
+                        f"est. FPR {bloom.estimated_fpr():.2e}")
+    raw = sum(len(i.value) for i in report.indicators)
+    printer.kv("vs. exact set", f"{_human_bytes(raw)} of indicator text alone, "
+                                f"before string and map overhead")
+
+    # Refusals are printed, never swallowed. Compiling a feed and silently
+    # dropping part of it is how you come to believe you have coverage you do
+    # not have.
+    if report.refused:
+        printer.header("Refused")
+        for value, why in report.refused[:20]:
+            printer.line(f"  {value}: {why}")
+        if len(report.refused) > 20:
+            printer.line(f"  ... and {len(report.refused) - 20} more")
+
+    if args.dry_run:
+        printer.line("")
+        printer.line("dry run: nothing written")
+        return 0
+
+    write_bundle(report, Path(args.bloom), Path(args.store))
+    printer.line("")
+    printer.kv("wrote", f"{args.bloom}, {args.store}")
+    return 0
+
+
 def cmd_sigma(args, engine: SentinelEngine, printer: Printer) -> int:
     """Compile Sigma YAML into the JSON bundle the Go ingestor loads.
 
@@ -570,6 +643,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="bundle the Go ingestor loads")
     p.add_argument("--dry-run", action="store_true", help="report only, do not write")
     p.set_defaults(func=cmd_sigma)
+
+    p = sub.add_parser("ioc", help="compile threat feeds for the ingestor (Phase 10)")
+    p.add_argument("--feeds", default="rules/ioc", help="directory of indicator feeds")
+    p.add_argument("--bloom", default="rules/external/ioc.bloom",
+                   help="bloom filter the ingestor keeps in memory")
+    p.add_argument("--store", default="rules/external/ioc.store",
+                   help="sorted store that confirms bloom hits")
+    p.add_argument("--fpr", type=float, default=1e-4,
+                   help="target bloom false-positive rate (costs memory, not accuracy)")
+    p.add_argument("--dry-run", action="store_true", help="report only, do not write")
+    p.set_defaults(func=cmd_ioc)
 
     p = sub.add_parser("graph", help="attack-path graph and blast radius (Phase 8)")
     p.add_argument("--seed", default="", metavar="ID",

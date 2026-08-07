@@ -27,7 +27,9 @@ import (
 	"time"
 
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/correlate"
+	"github.com/TheRealArron/sentinel-rag/ingestor/internal/enrich"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/honeytoken"
+	"github.com/TheRealArron/sentinel-rag/ingestor/internal/ioc"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/pipeline"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/ship"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sigma"
@@ -66,6 +68,8 @@ func run() error {
 		bfCooldown    = flag.Duration("brute-cooldown", 5*time.Minute, "minimum gap between repeat incidents for one source")
 		honeyPath     = flag.String("honeytokens", defaultHoneytokenPath, "canary config (JSON), resolved relative to the working directory")
 		sigmaDir      = flag.String("sigma", defaultSigmaDir, "directory of compiled Sigma bundles; empty disables them (see `make sigma`)")
+		iocBloom      = flag.String("ioc-bloom", defaultIOCBloom, "compiled IOC bloom filter; empty disables feed matching (see `make ioc`)")
+		iocStore      = flag.String("ioc-store", defaultIOCStore, "sorted IOC store that confirms bloom hits")
 		honeyCheck    = flag.String("honeytokens-verify", "", "verify canaries against a passwd file (use /etc/passwd, on the host) and exit")
 		remote        = flag.String("remote", "", "ship events to a Sentinel hub over mTLS, e.g. https://hub.lan:8443")
 		remoteCert    = flag.String("remote-cert", "", "client certificate (this probe's identity)")
@@ -110,6 +114,15 @@ func run() error {
 	if sigmaRules.Len() > 0 && !*stats {
 		fmt.Fprintf(os.Stderr, "sentinel-ingestor: sigma %s from %s\n",
 			sigmaRules.Summary(), strings.Join(sigmaRules.Sources(), ", "))
+	}
+
+	iocFeed, err := loadIOC(*iocBloom, *iocStore, flagWasSet("ioc-bloom") || flagWasSet("ioc-store"))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = iocFeed.Close() }()
+	if iocFeed.Len() > 0 && !*stats {
+		fmt.Fprintf(os.Stderr, "sentinel-ingestor: ioc %s\n", iocFeed.Summary())
 	}
 
 	// SIGINT/SIGTERM cancel the context so -follow shuts down cleanly and the
@@ -184,8 +197,11 @@ func run() error {
 		MinScore:           *minScore,
 		IncludeRaw:         *keepRaw,
 		DisableCorrelation: *noCorr,
-		Honeytokens:        tokens,
-		Sigma:              sigmaRules,
+		Detectors: enrich.Detectors{
+			Honeytokens: tokens,
+			Sigma:       sigmaRules,
+			IOC:         iocFeed,
+		},
 		Correlation: correlate.Config{
 			FailureThreshold: *bfThresh,
 			Window:           *bfWindow,
@@ -201,6 +217,13 @@ func run() error {
 			s := shipper.Stats()
 			shipStats, shipErr = &s, shipper.LastError()
 		}
+		// Reported only when a feed was loaded: an all-zero block on every run
+		// would read as "the feed found nothing" rather than "there was no feed".
+		var iocStats *ioc.Stats
+		if iocFeed.Len() > 0 {
+			s := iocFeed.Stats()
+			iocStats = &s
+		}
 		enc := json.NewEncoder(os.Stderr)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(struct {
@@ -210,9 +233,12 @@ func run() error {
 			HoneytokensArmed int         `json:"honeytokens_armed"`
 			HoneytokensPath  string      `json:"honeytokens_path,omitempty"`
 			SigmaRules       int         `json:"sigma_rules"`
+			IOCIndicators    int64       `json:"ioc_indicators"`
+			IOC              *ioc.Stats  `json:"ioc,omitempty"`
 			Remote           *ship.Stats `json:"remote,omitempty"`
 			RemoteError      string      `json:"remote_error,omitempty"`
-		}{st, version, *workers, tokens.Len(), tokens.Path(), sigmaRules.Len(), shipStats, shipErr})
+		}{st, version, *workers, tokens.Len(), tokens.Path(), sigmaRules.Len(),
+			iocFeed.Len(), iocStats, shipStats, shipErr})
 	}
 	return runErr
 }
@@ -286,6 +312,35 @@ func loadSigma(dir string, explicit bool) (*sigma.Set, error) {
 		return nil, fmt.Errorf("-sigma %s: no rules loaded (run `make sigma` to compile rules/sigma)", dir)
 	}
 	return set, nil
+}
+
+// The compiled IOC bundle, like the Sigma bundle, lives outside the binary so
+// refreshing a threat feed is a file drop and a restart rather than a rebuild.
+const (
+	defaultIOCBloom = "rules/external/ioc.bloom"
+	defaultIOCStore = "rules/external/ioc.store"
+)
+
+// loadIOC opens the compiled feed bundle, following the same auto-versus-explicit
+// contract as honeytokens and Sigma: a missing default is silent because most
+// installs have no feeds compiled, but a missing *explicit* path is an error.
+//
+// The asymmetry matters more here than elsewhere. An operator who has pointed the
+// ingestor at a threat feed and sees it start cleanly will assume indicators are
+// being checked; starting anyway with feed matching silently off is the failure
+// that gets noticed after an incident, not during one.
+func loadIOC(bloomPath, storePath string, explicit bool) (*ioc.Feed, error) {
+	if bloomPath == "" || storePath == "" {
+		return nil, nil
+	}
+	feed, err := ioc.Load(bloomPath, storePath)
+	if err != nil {
+		if !explicit && errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return feed, nil
 }
 
 func flagWasSet(name string) bool {

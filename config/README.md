@@ -99,4 +99,5 @@ event scores 100 and is the only thing permitted to trigger an automated firewal
 block. "Probably a honeytoken" is not a basis for cutting off a network. The
 Bloom filter belongs in Phase 10's IOC matching, where the set is millions of
 indicators, memory is the binding constraint, and a positive can afford a
-confirmation lookup.
+confirmation lookup. Built in `ingestor/internal/ioc`; see
+[`docs/design/ioc.md`](../docs/design/ioc.md).

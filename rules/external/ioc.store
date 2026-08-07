@@ -1,0 +1,11 @@
+#sentinel-ioc-store v1 count=10
+198.51.100.203	ip	demo-phishing	untyped: classified by shape
+198.51.100.77	ip	demo-c2	
+2001:db8:dead::1	ip	demo-c2	
+203.0.113.45	ip	demo-c2	
+c2.malware.example	domain	demo-c2	
+d41d8cd98f00b204e9800998ecf8427e	hash	demo-malware	MD5 of the same empty file
+dropper.example.net	domain	demo-malware	staging host for the demo payload
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	hash	demo-malware	empty file - placeholder digest for the demo
+login-verify.example.org	domain	demo-phishing	credential harvesting
+mail-secure.example.com	domain	demo-phishing	

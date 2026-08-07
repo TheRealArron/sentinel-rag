@@ -37,7 +37,7 @@ func enrichSigma(t *testing.T, msg, process string, set *sigma.Set) *event.Event
 	t.Helper()
 	ev := &event.Event{Message: msg, Process: process}
 	env := parser.Envelope{Message: msg, Process: process, Severity: -1, Format: "rfc3164"}
-	ApplyWithSigma(ev, env, sanitize.Result{}, nil, set)
+	ApplyWith(ev, env, sanitize.Result{}, Detectors{Sigma: set})
 	return ev
 }
 
@@ -123,12 +123,12 @@ func TestNilSigmaSetChangesNothing(t *testing.T) {
 	msg := "Failed password for root from 203.0.113.9 port 22 ssh2"
 	viaApply := &event.Event{Message: msg, Process: "sshd"}
 	env := parser.Envelope{Message: msg, Process: "sshd", Severity: -1, Format: "rfc3164"}
-	Apply(viaApply, env, sanitize.Result{}, nil)
+	Apply(viaApply, env, sanitize.Result{})
 
 	viaSigma := enrichSigma(t, msg, "sshd", nil)
 
 	if viaApply.Rule != viaSigma.Rule || viaApply.Score != viaSigma.Score {
-		t.Errorf("Apply and ApplyWithSigma(nil) disagree: %q/%d vs %q/%d",
+		t.Errorf("Apply and ApplyWith(no Sigma) disagree: %q/%d vs %q/%d",
 			viaApply.Rule, viaApply.Score, viaSigma.Rule, viaSigma.Score)
 	}
 }
@@ -171,7 +171,7 @@ func TestHoneytokenStillOverridesSigma(t *testing.T) {
 	msg := "Failed password for admin_backup from 203.0.113.9 port 22 ssh2"
 	ev := &event.Event{Message: msg, Process: "sshd", User: "admin_backup"}
 	env := parser.Envelope{Message: msg, Process: "sshd", Severity: -1, Format: "rfc3164"}
-	ApplyWithSigma(ev, env, sanitize.Result{}, honeySet(t), loadRules(t, 95))
+	ApplyWith(ev, env, sanitize.Result{}, Detectors{Honeytokens: honeySet(t), Sigma: loadRules(t, 95)})
 
 	if ev.Rule != "honeytoken_referenced" {
 		t.Errorf("sigma displaced the honeytoken verdict: rule=%q", ev.Rule)

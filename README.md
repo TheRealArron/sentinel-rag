@@ -493,7 +493,10 @@ false positives; this set is 5–50 entries, a few hundred bytes. False positive
 are exactly what cannot be tolerated at the one position wired to the firewall —
 "probably a honeytoken" is not a basis for cutting off a network. The Bloom
 filter is kept for Phase 10's IOC matching, where the set is millions of
-indicators and a positive can afford a confirmation lookup.
+indicators and a positive can afford a confirmation lookup. That phase is now
+built: 2.3 MiB per million indicators against 73.9 MiB for a map, with every
+filter hit confirmed against an on-disk store so the output still has no false
+positives. See [`docs/design/ioc.md`](docs/design/ioc.md).
 
 **The rule engine still runs first.** The obvious design short-circuits the
 regexes on a canary hit. Measured, the check is ~500 ns/line against ~65,000
@@ -903,6 +906,11 @@ quietly rotted, and that is worth failing a build over.
 - [x] **Phase 9: Distributed Sentinel (mTLS)** — a private CA, Go probes
       shipping over mutually authenticated TLS to a Python hub, certificate
       identity pinned to log content, and hot-reloaded revocation.
+- [x] **Phase 10: IOC matching at feed scale** — a RAM-resident Bloom prefilter
+      over an on-disk sorted store, so millions of indicators cost 2.3 MiB per
+      million instead of 73.9 MiB, with every filter hit confirmed exactly so the
+      output has no false positives. Python compiles the feeds, Go hot-loads
+      them. `make ioc`. See [`docs/design/ioc.md`](docs/design/ioc.md).
 - [x] **Phase 12: The write-up** — a long-form postmortem of the five hardest
       defects and the mechanism that caught each one, as a single self-contained
       page for the Ubuntu server. `make site-check`, then
@@ -936,6 +944,12 @@ where it actually pays — Phase 10's IOC matching, where the candidate set is
 millions of indicators pulled from threat feeds, memory is the binding
 constraint, and a positive can afford a confirmation lookup before it means
 anything.
+
+Phase 10 delivered exactly that, and the confirmation lookup turned out to be
+the load-bearing half of the idea: the exact tier had to live *on disk*, because
+a Bloom filter in front of an in-memory exact set saves nothing at all. Measured
+at a million indicators — 73.9 MiB as a Go map, 2.3 MiB as a filter, and no
+false positives in the output either way.
 
 Choosing the fancier structure where the simple one is strictly better is a
 tell. Knowing which one the problem calls for is the actual skill.

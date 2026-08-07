@@ -10,19 +10,11 @@ import (
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sanitize"
 )
 
-// enrichLine runs the real path a line takes: sanitize -> parse -> enrich.
+// enrichLine runs the real path a line takes: sanitize -> parse -> enrich, with
+// no optional detectors. See enrichWith in ioc_test.go for the configured form.
 func enrichLine(t *testing.T, line string) *event.Event {
 	t.Helper()
-	san := sanitize.Line(line, 0)
-	env := parser.Parse(san.Clean)
-	ev := &event.Event{
-		Host:    env.Host,
-		Process: env.Process,
-		PID:     env.PID,
-		Message: env.Message,
-	}
-	Apply(ev, env, san, nil)
-	return ev
+	return enrichWith(t, line, Detectors{})
 }
 
 func TestSSHFailedPasswordExtraction(t *testing.T) {
@@ -203,7 +195,7 @@ func enrichWithHoney(t *testing.T, line string) *event.Event {
 	san := sanitize.Line(line, 0)
 	env := parser.Parse(san.Clean)
 	ev := &event.Event{Host: env.Host, Process: env.Process, PID: env.PID, Message: env.Message}
-	Apply(ev, env, san, honeySet(t))
+	ApplyWith(ev, env, san, Detectors{Honeytokens: honeySet(t)})
 	return ev
 }
 

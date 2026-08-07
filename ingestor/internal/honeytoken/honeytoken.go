@@ -30,7 +30,9 @@
 // automated firewall block. "Probably a honeytoken" is not a basis for cutting
 // off a network. The Bloom filter belongs in IOC matching, where the candidate
 // set is millions of indicators, memory is the binding constraint, and a
-// positive can afford a confirmation lookup before it means anything.
+// positive can afford a confirmation lookup before it means anything — see the
+// ioc package, which does exactly that, and had to put the exact tier on disk to
+// make the trade pay at all.
 //
 // # Why JSON and not YAML
 //

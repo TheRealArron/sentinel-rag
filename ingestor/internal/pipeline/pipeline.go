@@ -31,10 +31,8 @@ import (
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/correlate"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/enrich"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/event"
-	"github.com/TheRealArron/sentinel-rag/ingestor/internal/honeytoken"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/parser"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sanitize"
-	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sigma"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sink"
 )
 
@@ -52,10 +50,9 @@ type Options struct {
 	IncludeRaw         bool
 	DisableCorrelation bool
 	Correlation        correlate.Config
-	// Honeytokens may be nil, which disables deception detection.
-	Honeytokens *honeytoken.Set
-	// Sigma holds detections transpiled from Sigma YAML. nil disables them.
-	Sigma *sigma.Set
+	// Detectors carries the optional detection sources (honeytokens, Sigma,
+	// IOC feeds). Any of them may be nil, which disables that detector.
+	Detectors enrich.Detectors
 }
 
 // Stats is the run summary printed with -stats.
@@ -68,6 +65,7 @@ type Stats struct {
 	Sanitised     int64         `json:"lines_sanitised"`
 	Unparsed      int64         `json:"lines_unparsed"`
 	Honeytokens   int64         `json:"honeytoken_hits"`
+	IOCEvents     int64         `json:"ioc_events"`
 	Duration      time.Duration `json:"duration_ns"`
 	LinesPerSec   float64       `json:"lines_per_sec"`
 	MaxReorderGap int           `json:"max_reorder_gap"`
@@ -178,6 +176,13 @@ func Run(ctx context.Context, r io.Reader, out sink.Sink, opts Options) (Stats, 
 		if res.ev.Rule == "honeytoken_referenced" {
 			st.Honeytokens++
 		}
+		// Counted off the field rather than the rule name: an event that matched a
+		// built-in rule keeps that rule's verdict and carries the indicator as
+		// context, so keying on Rule == "ioc_match" would undercount exactly the
+		// events an analyst most wants to see.
+		if res.ev.Fields["ioc"] != "" {
+			st.IOCEvents++
+		}
 		if res.ev.Score >= opts.MinScore {
 			if err := out.Write(res.ev); err != nil && sinkErr == nil {
 				sinkErr = err
@@ -273,7 +278,7 @@ func process(j job, opts Options) result {
 	ev.Timestamp = ts.UTC().Format(time.RFC3339Nano)
 	ev.Stamp()
 
-	enrich.ApplyWithSigma(ev, env, san, opts.Honeytokens, opts.Sigma)
+	enrich.ApplyWith(ev, env, san, opts.Detectors)
 	return result{seq: j.seq, ev: ev, ts: ts}
 }
 

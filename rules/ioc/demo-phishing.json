@@ -1,0 +1,5 @@
+[
+  {"indicator": "login-verify.example.org", "type": "domain", "note": "credential harvesting"},
+  {"indicator": "198.51.100.203", "note": "untyped: classified by shape"},
+  "mail-secure.example.com"
+]

@@ -16,6 +16,7 @@ import (
 
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/event"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/honeytoken"
+	"github.com/TheRealArron/sentinel-rag/ingestor/internal/ioc"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/parser"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sanitize"
 	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sigma"
@@ -26,15 +27,27 @@ var (
 	ipv6Re = regexp.MustCompile(`\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b`)
 )
 
-// Apply enriches ev in place using the parsed envelope and the sanitised message.
-// tokens may be nil, in which case honeytoken detection is disabled.
-func Apply(ev *event.Event, env parser.Envelope, san sanitize.Result, tokens *honeytoken.Set) {
-	ApplyWithSigma(ev, env, san, tokens, nil)
+// Detectors bundles the optional detection sources. Every field may be nil,
+// which disables that detector; the built-in rule set always runs.
+//
+// This is a struct rather than more parameters because the list had grown by one
+// on each phase — honeytokens, then Sigma, then IOC feeds — and a call site
+// passing four nils in the right order is a defect waiting to happen. Named
+// fields also mean a new detector does not touch existing callers.
+type Detectors struct {
+	Honeytokens *honeytoken.Set
+	Sigma       *sigma.Set
+	IOC         *ioc.Feed
 }
 
-// ApplyWithSigma is Apply plus detections transpiled from Sigma YAML.
-func ApplyWithSigma(ev *event.Event, env parser.Envelope, san sanitize.Result,
-	tokens *honeytoken.Set, sig *sigma.Set) {
+// Apply enriches ev in place using the parsed envelope and the sanitised
+// message, running only the built-in rule set.
+func Apply(ev *event.Event, env parser.Envelope, san sanitize.Result) {
+	ApplyWith(ev, env, san, Detectors{})
+}
+
+// ApplyWith is Apply plus whichever optional detectors are configured.
+func ApplyWith(ev *event.Event, env parser.Envelope, san sanitize.Result, det Detectors) {
 	ev.Category = CatUnknown
 	ev.Score = 5
 
@@ -66,9 +79,13 @@ func ApplyWithSigma(ev *event.Event, env parser.Envelope, san sanitize.Result,
 		ev.SourceIP = firstIP(env.Message)
 	}
 
-	applySigma(ev, env, sig, matched)
+	applySigma(ev, env, det.Sigma, matched)
 	applyModifiers(ev, env, san)
-	applyHoneytokens(ev, env, tokens)
+	// IOC enrichment runs before honeytokens so that an event which is both a
+	// canary reference and a feed hit still ends at a flat 100: honeytokens
+	// replace the scoring model rather than adding to it.
+	applyIOC(ev, env, det.IOC)
+	applyHoneytokens(ev, env, det.Honeytokens)
 
 	ev.Score = clamp(ev.Score, 0, 100)
 	ev.Severity = event.SeverityFor(ev.Score)
@@ -139,6 +156,136 @@ func applySigma(ev *event.Event, env parser.Envelope, sig *sigma.Set, builtinMat
 	if ev.Outcome == "" {
 		ev.Outcome = rule.Outcome
 	}
+}
+
+// iocWeight is the score added for a confirmed indicator, by indicator type.
+//
+// The three are deliberately not equal, because their evidential value is not
+// equal:
+//
+//   - A file hash identifies the artefact itself. It is immutable, and a
+//     SHA-256 on a malware feed means this exact file, not something adjacent to
+//     it. Strongest.
+//   - A domain is chosen by the operator of the thing it names, so it carries
+//     intent, but domains get parked, sinkholed and resold.
+//   - An IP is the weakest indicator in common use and is routinely treated as
+//     though it were the strongest. Addresses are shared by NAT, CDNs and
+//     hosting providers, are reassigned constantly, and a blocklist entry that
+//     was accurate last month may now point at a bystander. A hit is worth
+//     noting; it is not worth much on its own.
+var iocWeight = map[ioc.Type]int{
+	ioc.TypeHash:   45,
+	ioc.TypeDomain: 35,
+	ioc.TypeIP:     25,
+}
+
+// iocMaxScore caps an event whose severity comes from a feed hit.
+//
+// # Why a cap exists at all
+//
+// The ioc package has no false positives in the sense that matters to it: every
+// filter hit is confirmed against the exact store, so a reported indicator is
+// genuinely in the feed. That is a narrower guarantee than it sounds. It says
+// the *lookup* was right, not that the *feed* was — and feed contents are
+// external, mutable, and outside this system's control. A mistaken or poisoned
+// entry for a DNS resolver or a CDN address is a normal occurrence in threat
+// intelligence, not an exotic attack.
+//
+// Phase 5 established that a honeytoken is the only signal permitted to reach
+// the score that triggers an automated firewall block, precisely because it is
+// the only one with no benign explanation and no external dependency. Letting a
+// feed hit stack on top of a rule match and cross that line would have quietly
+// revoked that property — the auto-blocker would start acting on third-party
+// data, and the first sign of trouble would be a blocked upstream resolver.
+//
+// So the cap is drawn at the *actuating* threshold, not at a severity label. A
+// feed hit may take an event all the way to critical severity — a confirmed
+// known-malware hash on a root command line is critical, and under-reporting it
+// would be its own failure — but it can never reach the score that makes the
+// responder act without a human. Blocking still requires a canary or a
+// correlated incident, both derived from this host's own observations.
+//
+// 89 is one below the default SENTINEL_RESPONSE_MIN_SCORE;
+// TestIOCCannotReachTheResponseThreshold pins the relationship so a change to
+// either number fails loudly rather than silently arming the firewall from a
+// third-party feed.
+const iocMaxScore = 89
+
+// applyIOC annotates an event with confirmed threat-feed indicators.
+//
+// Multiple hits take the maximum weight rather than summing. Summing is the
+// obvious implementation and it is wrong here: a single outbound connection log
+// can legitimately mention a source IP, a destination IP and a hostname, so three
+// additive weights would let one ordinary line reach the cap on nothing more
+// than a verbose message. The extra hits are still recorded — they are context
+// for the analyst — but they do not compound the score.
+func applyIOC(ev *event.Event, env parser.Envelope, feed *ioc.Feed) {
+	if feed == nil || feed.Len() == 0 {
+		return
+	}
+	entities := map[string]string{"source_ip": ev.SourceIP, "dest_ip": ev.DestIP}
+	hits, err := feed.Match(entities, env.Message)
+	if err != nil {
+		// The store became unreadable mid-run. Losing enrichment on this event is
+		// survivable; dropping the event is not, so the failure is recorded on the
+		// event and ingestion continues.
+		ev.AddTags("ioc-lookup-error")
+		ev.SetField("ioc_error", sanitize.Field(err.Error(), 200))
+		return
+	}
+	if len(hits) == 0 {
+		return
+	}
+
+	values := make([]string, 0, len(hits))
+	types := make([]string, 0, len(hits))
+	feeds := make([]string, 0, len(hits))
+	fields := make([]string, 0, len(hits))
+	best := 0
+	for _, hit := range hits {
+		values = append(values, hit.Record.Indicator)
+		types = append(types, string(hit.Record.Type))
+		feeds = append(feeds, hit.Record.Feed)
+		fields = append(fields, hit.Candidate.Field)
+		if w := iocWeight[hit.Record.Type]; w > best {
+			best = w
+		}
+		if hit.Record.Note != "" {
+			ev.SetField("ioc_note", hit.Record.Note)
+		}
+	}
+
+	ev.Score += best
+	ev.SetField("score_ioc", "+"+strconv.Itoa(best))
+	if ev.Score > iocMaxScore {
+		ev.Score = iocMaxScore
+		ev.SetField("score_ioc_capped", "="+strconv.Itoa(iocMaxScore))
+	}
+
+	// An event that matched no built-in rule is still worth reporting if it
+	// touched a known-bad indicator — that is most of the value of a feed. One
+	// that did match keeps its verdict, with the indicator as added context,
+	// because "failed SSH password from a known C2" is a better alert than
+	// "known C2".
+	if ev.Rule == "" {
+		ev.Rule = "ioc_match"
+		ev.Category = CatNetwork
+	}
+	ev.SetField("ioc", strings.Join(values, ", "))
+	ev.SetField("ioc_type", strings.Join(types, ", "))
+	ev.SetField("ioc_feed", strings.Join(feeds, ", "))
+	ev.SetField("ioc_field", strings.Join(fields, ", "))
+
+	// No ATT&CK technique is attached. A feed hit says an indicator was seen, not
+	// what was done with it — the same IP can appear in reconnaissance, C2 or
+	// exfiltration — and inventing a technique here would put an unearned
+	// attribution into the graph and the analyst's prompt. Where the technique is
+	// actually known, the built-in or Sigma rule that matched has already
+	// supplied it.
+	ev.AddTags(
+		"ioc", "侵害指標",
+		"threat-intel", "脅威インテリジェンス",
+	)
 }
 
 // applyHoneytokens overrides the rule verdict when a canary is referenced.
