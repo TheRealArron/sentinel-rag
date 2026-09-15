@@ -209,6 +209,12 @@ the two languages.
 > The likeliest reason cross-lingual lags is a same-language preference: on every
 > query with a relevant document in each language where both were retrieved, the
 > one in the query's language scored higher — 22 of 22 with e5-large.
+>
+> **A known defect was present in every number above.** The token-count estimator
+> that sizes chunks underestimates English, so 9 of 93 child chunks exceed e5's
+> 512-token input limit and are silently truncated when embedded. It affects both
+> e5 runs equally and is unfixed, because fixing it moves chunk boundaries and
+> would invalidate this table rather than just correct it.
 > [`docs/design/retrieval.md`](docs/design/retrieval.md) has the tables, the
 > method, the remaining misses and the caveats;
 > [`docs/design/corpus.md`](docs/design/corpus.md) has the corpus provenance.
