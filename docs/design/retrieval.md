@@ -198,6 +198,14 @@ the fallback); with e5-large the two are the same size (+0.375 and +0.374). The
 model contributes real cross-lingual signal, and the floor is still what makes
 the guarantee.
 
+**The two directions are not symmetric.** Split by query language (e5-large,
+floor off), English queries find the Japanese answer in the top five in 6 of 20
+cases (0.300) and Japanese queries find the English answer in 12 of 12 (1.000);
+at rank 1 it is 0 of 20 and 3 of 12. Part of that is corpus composition rather
+than the model: an English query competes with 42 English documents for five
+slots, a Japanese query with five Japanese ones. The overall 0.929 hit@1 for
+Japanese queries is mostly same-language hits and says nothing about this.
+
 With 32 cross-lingual queries, the difference between 0.438 and 0.562 is four
 queries. Nothing in this section has been tested for significance.
 
