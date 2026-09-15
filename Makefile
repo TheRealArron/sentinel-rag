@@ -71,6 +71,34 @@ cover-go: ## Go tests with a coverage report
 bench: ## Benchmark the ingest pipeline
 	cd ingestor && $(GO) test -bench=. -benchmem -run '^$$' ./...
 
+.PHONY: feeds
+feeds: ## Fetch a real advisory corpus from NVD (public domain)
+	cd engine && $(PYTHON) -m sentinel feeds --source nvd --days 90 --limit 40 \
+		--out ../data/advisories/nvd
+
+.PHONY: feeds-jvn
+feeds-jvn: ## Fetch JVN advisories LOCALLY — see the notice it prints before redistributing
+	@# Deliberately a separate target from `feeds`. JVN content is (c) JPCERT/CC
+	@# and IPA: citation is free with attribution, redistribution requires prior
+	@# email coordination. The output directory is gitignored.
+	cd engine && $(PYTHON) -m sentinel feeds --source jvn --limit 40 \
+		--out ../data/advisories/jvn-local
+
+.PHONY: retrieval-report
+retrieval-report: ## recall@k for the bilingual retriever on the current embedder
+	@# Runs on whatever SENTINEL_EMBEDDING_BACKEND resolves to. The default is the
+	@# dependency-free hashing embedder; set SENTINEL_EMBEDDING_BACKEND=e5 with
+	@# sentence-transformers installed to measure the real model.
+	cd engine && $(PYTHON) -m sentinel eval-retrieval --k 5
+
+.PHONY: detection-report
+detection-report: ## Per-rule coverage and the false-positive count on the benign corpus
+	@# The gate itself runs in `make test`. This target is the readable form:
+	@# which rules are covered, and what still fires on ordinary host traffic.
+	cd ingestor && $(GO) test ./internal/enrich/ -v -count=1 \
+		-run 'TestEveryRuleHasAPositiveAndANegativeCase|TestDetectionCasesHold|TestPositiveCasesAlsoWinTheVerdict|TestBenignCorpusStaysQuiet' \
+		2>&1 | grep -E '^(=== RUN|--- (PASS|FAIL)|    (---|corpus_test))' || true
+
 .PHONY: fmt
 fmt: ## Format Go sources
 	cd ingestor && $(GO) fmt ./...

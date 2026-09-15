@@ -6,9 +6,17 @@ translated copy of the same text.
 
 ```
 advisories/
-├── cve/       English — vulnerability advisories and technique notes
-└── jpcert/    日本語 — Japanese-language advisories and 注意喚起
+├── nvd/          English — 37 real CVE records fetched from NVD (public domain)
+├── cve/          English — hand-written vulnerability and technique notes
+├── jpcert/       日本語 — representative samples, NOT real JPCERT/CC publications
+└── jvn-local/    日本語 — real JVN, fetched on demand, gitignored (see below)
 ```
+
+Refresh the real English corpus with `make feeds`. Fetch real Japanese
+advisories with `make feeds-jvn` — they land in `jvn-local/`, which git ignores,
+because JVN content is © JPCERT/CC and IPA and redistribution requires prior
+coordination with `office@jpcert.or.jp`. See
+[`docs/design/corpus.md`](../../docs/design/corpus.md).
 
 ## Provenance — read this before citing anything here
 

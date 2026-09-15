@@ -178,6 +178,41 @@ ingestor attaches **bilingual tag pairs** to every event (`brute-force` /
 the indexed text. When the semantic model is unavailable, the tags still connect
 the two languages.
 
+> **What is actually evidenced here, and what is not.** The corpus is 47
+> documents — 37 real CVE records fetched from NVD (public domain), five
+> hand-written English summaries, and five Japanese documents written in
+> JPCERT/CC's house style *for this repository*. It is not a real Japanese feed:
+> JVN content is © JPCERT/CC and IPA and redistribution requires prior
+> coordination, so `make feeds-jvn` fetches it to a gitignored directory and
+> stops.
+>
+> On the default zero-dependency backend the bilingual behaviour is **entirely
+> lexical**. Measured: the same Japanese advisory scores **0.0093** against an
+> English query without its bilingual keyword list and **0.3114** with it. It is
+> still returned in both cases — but by the per-language *floor*, which reserves
+> a slot regardless of score, not by any cross-lingual match. The existing
+> retrieval tests pass for that reason and would pass with a random embedder.
+>
+> **CI does not load a semantic embedder** — it runs without `requirements.txt`
+> on purpose, to keep the fallback path honest.
+>
+> `make retrieval-report` now measures this against 47 hand-built queries, each
+> with one to three expected documents. With the floor off, **cross-lingual
+> hit@5 is 0.188 on the fallback, 0.438 with `multilingual-e5-small`, and 0.562
+> with `multilingual-e5-large`**, the project default. So the model does carry
+> genuine cross-lingual signal, and more of it at the larger size. It is also
+> still only about half at k=5, and the per-language floor lifts it to 0.938,
+> which means the *floor* is still the thing making the guarantee. Overall hit@5
+> is 0.830 / 0.936 / 0.915 — large ranks better at the top (MRR 0.858 against
+> 0.839) but misses one more query at k=5.
+>
+> The likeliest reason cross-lingual lags is a same-language preference: on every
+> query with a relevant document in each language where both were retrieved, the
+> one in the query's language scored higher — 22 of 22 with e5-large.
+> [`docs/design/retrieval.md`](docs/design/retrieval.md) has the tables, the
+> method, the remaining misses and the caveats;
+> [`docs/design/corpus.md`](docs/design/corpus.md) has the corpus provenance.
+
 ### 3. Hierarchical indexing to suppress hallucination
 
 Embedding a 2000-token advisory into one vector averages away the sentence that
@@ -191,9 +226,12 @@ unchanged corpus embeds nothing.
 
 <a name="why-a-hand-written-splitter"></a>
 **Why a hand-written splitter.** LangChain's character-count splitter, tuned for
-English, produces Japanese chunks roughly **four times over budget**, because
-Japanese is close to one token per character while English is about four
-characters per token. And splitting Japanese on `". "` finds nothing, so it falls
+English, produces Japanese chunks roughly **twice over budget**. Measured with
+multilingual-e5's own tokenizer on this corpus, English prose runs 3.4 characters
+per token and Japanese script 1.6, so a character budget sized for English holds
+about 2.2× its tokens once the text is Japanese. (This used to say four times,
+from the rule of thumb of one token per Japanese character; the tokenizer merges
+more than that.) And splitting Japanese on `". "` finds nothing, so it falls
 through to a hard character cut mid-word. `sentinel/chunking.py` uses a
 script-aware token estimate and a separator list that includes `。`, `、`, `！`,
 `？`. LangChain still earns its place in orchestration; this particular 150 lines
@@ -211,6 +249,14 @@ are handled in `ingestor/internal/sanitize`:
 | **Terminal escape injection** — ANSI CSI/OSC sequences rewrite what `tail -f` shows, hide lines, or smuggle OSC 52 clipboard writes | Escape sequences stripped |
 | **Trojan Source** (CVE-2021-42574) — bidi overrides make `user=attacker` *display* as `user=root` | Bidi and zero-width code points dropped |
 | **Memory exhaustion** — a single 500 MB line | Length capped, truncation recorded |
+
+A fifth followed from the same premise and was missed for longer, because it is
+not about the *characters* in the username but about where that username is
+allowed to have effects: the rule engine matched keyword detections against the
+whole log line, so a username of `xmrig` chose the verdict, and one of
+`8.8.8.8.xmrig` chose the source address too. Rules now declare which text they
+may read, and the attacker-chosen spans are blanked before the keyword rules see
+them — [`docs/design/detection.md`](docs/design/detection.md).
 
 The important part: **sanitiser activity is itself a detection.** Clean log lines
 do not contain control characters. When one does, Sentinel adds +25 to the risk
@@ -257,7 +303,19 @@ attacker rotating source addresses cannot grow the heap):
 |---|---|
 | One failed password from a public address | 54 |
 | Five failures from one source in 60s, across ≥3 usernames | **92** — `correlated_brute_force` |
-| A **success** immediately after that burst | **97** — `correlated_successful_login_after_bruteforce` |
+| A success for **an account that source was guessing at** | **97** — `correlated_successful_login_after_bruteforce` |
+| A success for an account it never touched | **74** — `correlated_login_from_attacking_source` |
+
+That last row is a false positive the audit found and the fix removed. Behind
+CGNAT or a corporate NAT, an attacker's failures and a colleague's login share
+one address — and the detection wired to the firewall was the one treating an IP
+as an identity. It is still reported, because going blind there would be worse;
+it just no longer scores high enough to act without a human.
+
+The sliding window is also no longer driven by whatever timestamp arrives. A
+single line dated ahead of the stream used to expire every accumulated failure,
+which is an NTP step or a concatenated log file away from happening by accident
+and a crafted timestamp away from being an evasion.
 
 The last one is the whole point. The guessing stopped because it worked. That is
 the transition from T1110.001 to T1078.003, and it is the only event in the
@@ -380,7 +438,11 @@ correct even if the engine is entirely compromised:
   server is worse than the attack it was defending against, and unlike the attack
   it is self-inflicted.
 - **Score threshold of 90**, checked against the *deterministic ingestor score*,
-  never the model's opinion. Only correlated incidents qualify.
+  never the model's opinion — and the score is **looked up, not asserted**. The
+  API takes an address, finds the highest-scoring event the Go ingestor actually
+  recorded for it, and uses that. There is no parameter a caller can pass to
+  supply a score, because there used to be one and it made the threshold a
+  convention rather than a control.
 - **Rate limited**, so a misfiring detection loop cannot fill the ruleset.
 - **Every decision audited, including the refusals** — "the system decided not to
   act" is exactly what you need evidence of during an incident review.
@@ -398,7 +460,7 @@ python -m sentinel search "SSH総当たり攻撃"    # bilingual retrieval
 python -m sentinel analyze --min-score 60   # triage the most severe events
 python -m sentinel serve                    # dashboard + JSON API
 python -m sentinel stats                    # which backends are actually live
-python -m sentinel block 203.0.113.45 --score 97
+python -m sentinel block 203.0.113.45          # score resolved from the event store
 python -m sentinel sigma                    # compile Sigma rules for the ingestor
 ```
 
@@ -459,7 +521,7 @@ Imported rules can escalate a verdict but never quietly lower one.
 | `POST` | `/api/analyze` | Generate a bilingual cited alert |
 | `POST` | `/api/index` | Build or rebuild the index |
 | `GET` | `/api/response/status` · `/history` | Guard rails and audit trail |
-| `POST` | `/api/response/block` · `/unblock` | Firewall action |
+| `POST` | `/api/response/block` · `/unblock` | Firewall action. `block` takes `ip` and an optional `event_id`; it does **not** accept a `score` |
 
 Set `SENTINEL_API_TOKEN` and the `POST` endpoints require
 `Authorization: Bearer <token>` (compared in constant time). Reads stay open so
@@ -475,8 +537,8 @@ credential. A honeytoken has no such ambiguity. Nothing on the host references
 `admin_backup`; no legitimate process reads `/etc/.backup_credentials`. A log
 line containing one is attacker activity by construction.
 
-That is what makes it **the only single event in the system that clears the
-firewall-response threshold** without correlation:
+That is what makes it the only detection here that reaches **100**, and the only
+one with no benign explanation:
 
 ```
 score=100  ->  block allowed=True   (honeytoken admin_backup)
@@ -485,6 +547,16 @@ score=54   ->  block allowed=False  (score below threshold)
 
 Both lines are the same `ssh_failed_password` rule. The only difference is which
 username was tried.
+
+> **Correction.** This section used to claim the honeytoken was *the only single
+> event in the system that clears the firewall-response threshold without
+> correlation*. That was wrong twice over. `reverse_shell_bash_devtcp` (96),
+> `cryptominer_indicator` (92) and `log_tampering` (90) are base scores at or
+> above the score-90 threshold, so they have always cleared it on one line — and
+> separately, a defect in rule precedence let a remote party reach those rules by
+> choosing an SSH username, then point the resulting score-100 event at an
+> address of their choosing. Both are fixed and tested;
+> [`docs/design/detection.md`](docs/design/detection.md) is the postmortem.
 
 Three design decisions worth reading:
 
@@ -832,6 +904,14 @@ single 4 MiB line — the ingestor is bounded by its buffers, not by its input.
 That is the property that lets it run under a 128 MB container limit against a
 log file of any size.
 
+> **Since this table was taken**, the detection-surface fix
+> ([`docs/design/detection.md`](docs/design/detection.md)) added a redaction pass
+> to the hot path. Measured on different hardware, so not comparable to the row
+> above but comparable to itself: **+9.2%** on a line carrying an attacker-chosen
+> username, **+0.0%** on a line without one, and **+18%** end-to-end on a corpus
+> where *every* line is an SSH auth line — the worst case by construction.
+> `benchmarks/README.md` has the paired numbers and what they do not cover.
+
 **Scaling is 5.2× across 16 workers**, not 16×. The bottleneck is the detection
 rule set: 33 regexes evaluated per line, and RE2 has no backtracking to skip
 cheap non-matches. The obvious next optimisation is a required-literal
@@ -853,13 +933,41 @@ make check       # vet + lint + tests
 make bench       # ingest throughput
 ```
 
+**Retrieval is measured, not asserted.** `make retrieval-report` runs 47
+query→expected-document pairs over the 47-document corpus and reports hit@1/3/5
+and MRR, split by query language, by cross-lingual answerability, and by whether
+the query was derived from an *event* (32 of them, written from the rule set and
+sample log before the corpus was consulted) or from *software* (15, the weaker
+half, labelled so). It reports with the per-language floor on and off, because
+with the floor on a cross-lingual "hit" is the floor, not the model.
+
+**Detection is measured, not asserted.** `make detection-report` runs the corpus
+in `ingestor/internal/enrich/testdata/detection/`: 66 cases pinning, for every one
+of the 33 rules, a line it must catch and a near-miss it must not — plus 108 lines
+of ordinary Ubuntu host traffic that must stay below `warning`. Adding a rule
+without both cases fails the build.
+
+Its first run found **13 false positives in 108 benign lines**, including
+`systemd_unit_installed` firing on every `systemctl reload` as a score-56
+*persistence* event and `authorized_keys_modified` firing on sshd's own debug
+output. Six rules changed; the count is now **1**, and that one — Ansible piping
+`curl` to a shell — is documented as irreducible rather than tuned away. The
+benign corpus is hand-authored on purpose: the existing generator emits only log
+shapes the rules were written for, so measuring against it cannot surface a false
+positive. [`docs/design/detection.md`](docs/design/detection.md) has the table.
+
 **Go:** parser (including RFC 3164 year rollover — a December log read in January
 must not be dated eleven months in the future — and local-zone normalisation,
 which is deliberately tested against `Asia/Tokyo` because an assertion that holds
 in UTC CI can still be wrong on the developer's machine), the sanitiser (with a
-fuzz target asserting no control byte ever survives), the rule set, the
-correlator's window and cooldown and memory bound, and the pipeline's order
-guarantee under `-race`.
+fuzz target asserting no control byte ever survives), the rule set, rule
+precedence and the raw/redacted surface split (including a table of hostile
+usernames drawn from every keyword rule's own literals, plus the counter-tests
+that redaction has not blinded those rules on genuine command lines), the
+correlator's window and cooldown and memory bound, the five SSH rules under all
+three OpenSSH syslog tags (`sshd`, and the `sshd-session` / `sshd-auth` split
+9.8 introduced, which an exact-match process filter goes silently dark on), and
+the pipeline's order guarantee under `-race`.
 
 Measured, not asserted: a 4 MiB single log line is consumed in full
 (`bytes_read=4194387`) at **5.9 MB peak RSS** with `-max-line 1024`, and
@@ -985,12 +1093,25 @@ installs it behind nginx.
   threshold, rate limit, full audit — enforced independently on both sides of the
   container boundary.
 
-**Corpus provenance.** The English CVE documents describe real vulnerabilities
-and their technical details are accurate. **The Japanese documents are
-representative samples** written in JPCERT/CC's house style for this corpus —
-their `id` fields are prefixed `sample-ja-` and they do not claim to be real
-JPCERT/CC publications. See [`data/advisories/README.md`](data/advisories/README.md)
-for how to point the indexer at a real feed.
+**Corpus provenance.** 47 documents:
+
+* `data/advisories/nvd/` — **37 real CVE records**, fetched from the NVD 2.0 API.
+  NVD is a work of the United States government and is in the public domain, so
+  these ship with the repo. `make feeds` refreshes them.
+* `data/advisories/cve/` — five hand-written English summaries. The
+  vulnerabilities and technical details are real; the prose is not a copy of NVD
+  or vendor text.
+* `data/advisories/jpcert/` — five **representative samples** written in
+  JPCERT/CC's house style for this corpus. Their ids are prefixed `sample-ja-`
+  and they do not claim to be real JPCERT/CC publications.
+
+There is deliberately **no real Japanese feed in the repository.** JVN content is
+© JPCERT/CC and IPA; citation is free with attribution, but 転載・再配布 requires
+prior email coordination with `office@jpcert.or.jp`, because parts of an advisory
+may be owned by a third party. `make feeds-jvn` fetches JVN to a gitignored
+directory and prints the notice — using it locally is ordinary use, publishing it
+is a conversation you have with JPCERT/CC first. A test fails the build if
+fetched JVN text is ever committed.
 
 **Intended use.** Defensive monitoring of systems you own or are authorised to
 monitor. Log data is sensitive; the pseudonymisation layer reduces exposure but

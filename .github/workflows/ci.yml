@@ -48,6 +48,14 @@ jobs:
         # in that hand-off.
         run: go test -race -count=1 -coverprofile=coverage.out ./...
 
+      - name: Detection corpus report
+        # The pass/fail gate already ran under `go test` above. This surfaces the
+        # numbers in the build log so a rise in false positives is visible in the
+        # diff of a PR rather than only in a failure message.
+        run: |
+          go test ./internal/enrich/ -v -count=1 -run TestBenignCorpusStaysQuiet 2>&1 \
+            | grep -E 'benign corpus|scored >=' || true
+
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
 
@@ -246,6 +254,12 @@ jobs:
           python -c "import json;s=json.load(open('/tmp/stats.json'));assert s['events']['events']==25, s['events']"
 
       - name: Bilingual retrieval check
+        # What this proves is narrower than it looks, and it is worth saying so
+        # next to the assertion rather than only in a design note: it passes
+        # because the per-language floor RESERVES a slot per language, and it
+        # would pass with an embedder that understood nothing. CI runs the
+        # dependency-free hashing backend, whose measured cross-lingual hit@5 is
+        # 0.188. The step below reports that number; this one guards the floor.
         env:
           PYTHONPATH: ${{ github.workspace }}/engine
         run: |
@@ -259,6 +273,19 @@ jobs:
               print(f"{query!r} -> {mix}")
               assert mix.get("en", 0) >= 1 and mix.get("ja", 0) >= 1, f"not bilingual: {mix}"
           PY
+
+      - name: Retrieval evaluation report
+        # The pass/fail gate lives in tests/test_retrieval_eval.py. This prints
+        # the table into the build log so a change in recall is visible in a PR
+        # rather than only when a threshold trips.
+        env:
+          PYTHONPATH: ${{ github.workspace }}/engine
+          SENTINEL_EMBEDDING_BACKEND: hashing
+          SENTINEL_VECTOR_BACKEND: local
+          SENTINEL_LLM_PROVIDER: heuristic
+        run: |
+          python -m sentinel eval-retrieval \
+            --cases ${{ github.workspace }}/data/eval/retrieval.jsonl --k 5
 
   docker:
     name: Docker images

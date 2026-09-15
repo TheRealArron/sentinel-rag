@@ -52,3 +52,10 @@ htmlcov/
 *.swp
 .DS_Store
 attack.svg
+
+# Fetched JVN advisories. JVN content is (c) JPCERT/CC and IPA: citation is free
+# with attribution, but reproduction and redistribution require prior email
+# coordination with office@jpcert.or.jp. Committing fetched text to a public
+# repository is redistribution, so the fetcher writes here and git ignores it.
+# See engine/sentinel/feeds.py and docs/design/corpus.md.
+data/advisories/jvn-local/

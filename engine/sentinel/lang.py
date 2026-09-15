@@ -74,9 +74,14 @@ def estimate_tokens(text: str) -> int:
     """Approximate the token count of ``text`` without a tokenizer.
 
     CJK code points count as one token each; runs of non-CJK characters count as
-    one token per four characters. Empirically within ~15% of the
-    multilingual-e5 tokenizer on this corpus, which is plenty for choosing chunk
-    boundaries.
+    one token per four characters. Measured against the multilingual-e5
+    tokenizer on this corpus it is not uniformly close: it overestimates Japanese
+    script by ~1.6x (the SentencePiece vocabulary merges multi-character pieces,
+    so the real density is ~0.63 tokens per character) and underestimates
+    English by 13% on prose and 26% on NVD records, which are dense with
+    identifiers. Overestimating is the safe direction for a budget;
+    underestimating is not. See "Script-aware chunking" in
+    docs/design/retrieval.md.
     """
     if not text:
         return 0
