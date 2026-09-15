@@ -252,3 +252,77 @@ func BenchmarkRun(b *testing.B) {
 		}
 	}
 }
+
+// adversarialBruteForceLog is bruteForceLog with every username replaced by a
+// string that used to hijack the detection.
+//
+// Each of these matched a higher-scoring rule than ssh_failed_password, which
+// rewrote the event's category and outcome — and the correlator only counts
+// events whose outcome is "failure" in an auth or privilege category. Five
+// failures therefore counted as zero, and no incident was ever raised. The
+// attack cost one word in a wordlist.
+const adversarialBruteForceLog = `Jul 30 05:30:01 sentinel sshd[4001]: Failed password for invalid user xmrig from 203.0.113.45 port 51001 ssh2
+Jul 30 05:30:03 sentinel sshd[4002]: Failed password for invalid user history -c from 203.0.113.45 port 51002 ssh2
+Jul 30 05:30:05 sentinel sshd[4003]: Failed password for invalid user authorized_keys from 203.0.113.45 port 51003 ssh2
+Jul 30 05:30:07 sentinel sshd[4004]: Failed password for invalid user victim : user NOT in sudoers from 203.0.113.45 port 51004 ssh2
+Jul 30 05:30:09 sentinel sshd[4005]: Failed password for invalid user 8.8.8.8.supportxmr from 203.0.113.45 port 51005 ssh2
+Jul 30 05:30:11 sentinel sshd[4006]: Accepted password for arron from 203.0.113.45 port 51006 ssh2
+`
+
+func TestAdversarialUsernamesStillReachCorrelation(t *testing.T) {
+	freezeClock(t)
+	var out capture
+	st, err := Run(context.Background(), strings.NewReader(adversarialBruteForceLog), &out, Options{
+		Workers: 4,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if st.Incidents != 2 {
+		t.Fatalf("Incidents = %d, want 2 (brute force + compromise) — a chosen username "+
+			"can still switch off correlation", st.Incidents)
+	}
+
+	rules := map[string]bool{}
+	for _, ev := range out.events {
+		rules[ev.Rule] = true
+	}
+	// The success here is for `arron`, an account none of the five adversarial
+	// attempts targeted — so this is the shared-egress shape, not a compromise,
+	// and it must report as such rather than at the score that arms the
+	// firewall. `bruteForceLog` covers the other branch, where the account that
+	// succeeded is the one that was being guessed at.
+	for _, want := range []string{
+		"correlated_brute_force",
+		"correlated_login_from_attacking_source",
+	} {
+		if !rules[want] {
+			t.Errorf("missing incident %q", want)
+		}
+	}
+	if rules["correlated_successful_login_after_bruteforce"] {
+		t.Error("a login for an account that was never targeted was reported as a compromise")
+	}
+
+	// Every failure must have stayed an auth failure attributed to the real peer.
+	// The 8.8.8.8 username is the one that used to relabel the event onto an
+	// address the attacker chose, which is what the responder would have blocked.
+	failures := 0
+	for _, ev := range out.events {
+		if ev.Rule != "ssh_failed_password" {
+			continue
+		}
+		failures++
+		if ev.SourceIP != "203.0.113.45" {
+			t.Errorf("failure for user %q has SourceIP %q, want 203.0.113.45", ev.User, ev.SourceIP)
+		}
+		if ev.Score >= 90 {
+			t.Errorf("failure for user %q scored %d, at or above the response threshold",
+				ev.User, ev.Score)
+		}
+	}
+	if failures != 5 {
+		t.Errorf("ssh_failed_password events = %d, want 5", failures)
+	}
+}

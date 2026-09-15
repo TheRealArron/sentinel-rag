@@ -11,6 +11,7 @@ package enrich
 import (
 	"net"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -47,44 +48,72 @@ func Apply(ev *event.Event, env parser.Envelope, san sanitize.Result) {
 }
 
 // ApplyWith is Apply plus whichever optional detectors are configured.
+//
+// Rule evaluation runs in two passes, because the rules that can safely read a
+// raw log line are also the rules that tell us which spans of it the attacker
+// wrote:
+//
+//  1. SurfaceRaw rules match against the message as logged. Their patterns
+//     anchor on daemon-emitted literals, and their `user`/`target_user`
+//     captures locate the attacker-chosen spans.
+//  2. Those spans are blanked, and SurfaceRedacted rules — the keyword hunts —
+//     match against the result. A username of "xmrig" is then just a username.
+//
+// The verdict goes to the highest-scoring match across both passes, ties broken
+// by declaration order. Captures from *every* match are applied, so the entities
+// on the event no longer depend on which rule won.
 func ApplyWith(ev *event.Event, env parser.Envelope, san sanitize.Result, det Detectors) {
 	ev.Category = CatUnknown
 	ev.Score = 5
 
-	matched := false
-	for i := range rules {
-		r := &rules[i]
-		if !r.appliesTo(env.Process) {
-			continue
+	matches, redacted := matchAll(env.Message, env.Process)
+	win := strongest(matches)
+	matched := win >= 0
+
+	// Captures first from the losers, then from the winner, so the winning
+	// rule's view of the line is authoritative while a lower-precedence match
+	// can still supply a field the winner does not capture at all.
+	for i := range matches {
+		if i != win {
+			applyCaptures(ev, matches[i])
 		}
-		m := r.Pattern.FindStringSubmatch(env.Message)
-		if m == nil {
-			continue
-		}
-		if !matched {
-			matched = true
-			ev.Rule = r.Name
-			ev.Category = r.Category
-			ev.Score = r.Score
-			ev.Outcome = r.Outcome
-			ev.MITRE = append(ev.MITRE, r.MITRE...)
-			applyCaptures(ev, r.Pattern, m)
-		}
-		ev.AddTags(r.Tags...)
+	}
+	if matched {
+		applyCaptures(ev, matches[win])
+	}
+
+	// Tags merge in declaration order, unchanged: every matching rule
+	// contributes its bilingual pair regardless of which set the verdict.
+	for i := range matches {
+		ev.AddTags(matches[i].rule.Tags...)
+	}
+
+	if matched {
+		r := matches[win].rule
+		ev.Rule = r.Name
+		ev.Category = r.Category
+		ev.Score = r.Score
+		ev.Outcome = r.Outcome
+		ev.MITRE = append(ev.MITRE, r.MITRE...)
 	}
 
 	// Entity extraction that runs regardless of rule match, so even an
 	// unrecognised line is still pivotable by IP in the dashboard.
+	//
+	// It reads the *redacted* message. An address inside a username is a string
+	// the attacker typed, not the peer sshd was talking to, and taking it as the
+	// source address let a remote party stamp an event of their choosing onto an
+	// address of their choosing.
 	if ev.SourceIP == "" {
-		ev.SourceIP = firstIP(env.Message)
+		ev.SourceIP = firstIP(redacted)
 	}
 
-	applySigma(ev, env, det.Sigma, matched)
+	applySigma(ev, env, redacted, det.Sigma, matched)
 	applyModifiers(ev, env, san)
 	// IOC enrichment runs before honeytokens so that an event which is both a
 	// canary reference and a feed hit still ends at a flat 100: honeytokens
 	// replace the scoring model rather than adding to it.
-	applyIOC(ev, env, det.IOC)
+	applyIOC(ev, redacted, det.IOC)
 	applyHoneytokens(ev, env, det.Honeytokens)
 
 	ev.Score = clamp(ev.Score, 0, 100)
@@ -93,6 +122,40 @@ func ApplyWith(ev *event.Event, env parser.Envelope, san sanitize.Result, det De
 	if ev.SourceIP != "" {
 		ev.AddTags("scope:" + scopeOf(ev.SourceIP))
 	}
+}
+
+// redactedEvent presents an event to the Sigma matcher with the attacker-chosen
+// spans of the message blanked out.
+//
+// An imported rule written as `message|contains: xmrig` has exactly the defect
+// the built-in keyword rules had — a username sets the verdict, and Sigma rules
+// are allowed to escalate one. Rules that genuinely want to inspect an account
+// name should match the `user` field, which is unmodified and is where the
+// transpiler's FIELD_MAP points them.
+//
+// The wrapper lives here rather than in the sigma package on purpose: the
+// matcher's own semantics are pinned by the shared Go/Python agreement vectors,
+// and this is a decision about what text to hand it, not about how it matches.
+type redactedEvent struct {
+	*event.Event
+	message string
+}
+
+func (r redactedEvent) SigmaField(name string) string {
+	switch name {
+	case "message":
+		return r.message
+	case "command":
+		// event.SigmaField falls back to the raw message when no command was
+		// parsed, which would reintroduce the hole through a different field
+		// name. A genuinely captured command is returned as-is: it is a record
+		// of something the host ran, not a string typed at a login prompt.
+		if cmd := r.Event.Fields["command"]; cmd != "" {
+			return cmd
+		}
+		return r.message
+	}
+	return r.Event.SigmaField(name)
 }
 
 // applySigma applies the matching transpiled Sigma rule, if any.
@@ -112,11 +175,11 @@ func ApplyWith(ev *event.Event, env parser.Envelope, san sanitize.Result, det De
 //   - The verdict (rule name, category, score) is taken over only when nothing
 //     built-in matched, or when the Sigma rule scores strictly higher. An
 //     imported rule can escalate an event; it cannot quietly downgrade one.
-func applySigma(ev *event.Event, env parser.Envelope, sig *sigma.Set, builtinMatched bool) {
+func applySigma(ev *event.Event, env parser.Envelope, redacted string, sig *sigma.Set, builtinMatched bool) {
 	if sig.Len() == 0 {
 		return
 	}
-	rule := sig.Match(ev, env.Process)
+	rule := sig.Match(redactedEvent{Event: ev, message: redacted}, env.Process)
 	if rule == nil {
 		return
 	}
@@ -219,12 +282,12 @@ const iocMaxScore = 89
 // additive weights would let one ordinary line reach the cap on nothing more
 // than a verbose message. The extra hits are still recorded — they are context
 // for the analyst — but they do not compound the score.
-func applyIOC(ev *event.Event, env parser.Envelope, feed *ioc.Feed) {
+func applyIOC(ev *event.Event, redacted string, feed *ioc.Feed) {
 	if feed == nil || feed.Len() == 0 {
 		return
 	}
 	entities := map[string]string{"source_ip": ev.SourceIP, "dest_ip": ev.DestIP}
-	hits, err := feed.Match(entities, env.Message)
+	hits, err := feed.Match(entities, redacted)
 	if err != nil {
 		// The store became unreadable mid-run. Losing enrichment on this event is
 		// survivable; dropping the event is not, so the failure is recorded on the
@@ -255,11 +318,22 @@ func applyIOC(ev *event.Event, env parser.Envelope, feed *ioc.Feed) {
 		}
 	}
 
+	before := ev.Score
 	ev.Score += best
 	ev.SetField("score_ioc", "+"+strconv.Itoa(best))
 	if ev.Score > iocMaxScore {
-		ev.Score = iocMaxScore
-		ev.SetField("score_ioc_capped", "="+strconv.Itoa(iocMaxScore))
+		// The cap stops a feed from *raising* an event to where the responder
+		// acts. It must not *lower* one that was already there on this host's
+		// own evidence: a reverse shell scores 96 by itself, and clamping that
+		// to 89 because a threat feed agreed would disarm the responder for the
+		// most serious events in the system — the exact inverse of the intent.
+		if before > iocMaxScore {
+			ev.Score = before
+			ev.SetField("score_ioc", "+0 (already above the feed cap; recorded as context)")
+		} else {
+			ev.Score = iocMaxScore
+			ev.SetField("score_ioc_capped", "="+strconv.Itoa(iocMaxScore))
+		}
 	}
 
 	// An event that matched no built-in rule is still worth reporting if it
@@ -305,6 +379,11 @@ func applyIOC(ev *event.Event, env parser.Envelope, feed *ioc.Feed) {
 //     detail is what an analyst triages on.
 //
 // So the rules run, then their verdict is overridden.
+// Honeytokens deliberately read the *raw* message. Every other detector is
+// handed redacted text because a keyword inside a username is not evidence of
+// anything — but a canary username is the exception that proves it. Nothing on
+// the host is called `admin_backup`, so a login attempt for `admin_backup` is
+// the detection, not a false positive smuggled through a user field.
 func applyHoneytokens(ev *event.Event, env parser.Envelope, tokens *honeytoken.Set) {
 	if tokens == nil || tokens.Len() == 0 {
 		return
@@ -376,28 +455,224 @@ func dedupe(items []string) []string {
 	return out
 }
 
-// appliesTo enforces a rule's optional process filter, case-insensitively.
+// processAliases maps a syslog tag onto the daemon family a rule's Process
+// filter names.
+//
+// OpenSSH 9.8 (July 2024) split `sshd` into per-connection `sshd-session` and
+// `sshd-auth` binaries, which log under their own tags. A rule filtered on
+// `sshd` with an exact-equality check therefore stops matching on Ubuntu 24.10+
+// and Debian 13 — and stops matching *silently*, which is the part that makes it
+// dangerous. Five of the six SSH rules here carry that filter, so the failure
+// mode is "most of the SSH detection is off and nothing says so".
+//
+// An explicit table rather than a prefix or hyphen rule: `systemd-resolved` must
+// not be folded into `systemd`, and a rule that widens itself by accident is the
+// same class of surprise in the other direction. One entry per real-world split,
+// added when a real daemon does it.
+var processAliases = map[string]string{
+	"sshd-session": "sshd",
+	"sshd-auth":    "sshd",
+}
+
+// appliesTo enforces a rule's optional process filter, case-insensitively and
+// after alias folding.
 func (r *Rule) appliesTo(process string) bool {
 	if len(r.Process) == 0 {
 		return true
 	}
+	family := process
+	if alias, ok := processAliases[strings.ToLower(process)]; ok {
+		family = alias
+	}
 	for _, p := range r.Process {
-		if strings.EqualFold(p, process) {
+		if strings.EqualFold(p, process) || strings.EqualFold(p, family) {
 			return true
 		}
 	}
 	return false
 }
 
+// ruleMatch is one rule firing on one line. It keeps the submatch *offsets*
+// rather than the extracted strings, because redaction needs to know where the
+// attacker-chosen spans are, not merely what they said.
+type ruleMatch struct {
+	index int // position in `rules`, for deterministic precedence tie-breaks
+	rule  *Rule
+	text  string // the text this rule was evaluated against
+	loc   []int  // as returned by Regexp.FindStringSubmatchIndex
+}
+
+// group returns capture group i, or "" when the group did not participate.
+func (m ruleMatch) group(i int) string {
+	if 2*i+1 >= len(m.loc) {
+		return ""
+	}
+	lo, hi := m.loc[2*i], m.loc[2*i+1]
+	if lo < 0 || hi < lo {
+		return ""
+	}
+	return m.text[lo:hi]
+}
+
+// matchAll runs both passes and returns every rule that fired, along with the
+// redacted message the second pass and the entity fallbacks were evaluated
+// against. Extracted so the detection corpus test can ask "which rules matched
+// this line" without reimplementing the two-pass logic and drifting from it.
+func matchAll(message, process string) ([]ruleMatch, string) {
+	matches := matchRules(message, process, SurfaceRaw)
+	redacted := redactUntrusted(message, matches)
+	matches = confirmAgainstRedacted(matches, redacted, message)
+	return append(matches, matchRules(redacted, process, SurfaceRedacted)...), redacted
+}
+
+// matchRules evaluates every rule declaring the given surface against text.
+// Results come back in declaration order.
+func matchRules(text, process string, surface Surface) []ruleMatch {
+	var out []ruleMatch
+	for i := range rules {
+		r := &rules[i]
+		if r.Surface != surface || !r.appliesTo(process) {
+			continue
+		}
+		loc := r.Pattern.FindStringSubmatchIndex(text)
+		if loc == nil {
+			continue
+		}
+		out = append(out, ruleMatch{index: i, rule: r, text: text, loc: loc})
+	}
+	return out
+}
+
+// strongest returns the index of the match that sets the verdict, or -1.
+//
+// Precedence is (highest Score, then earliest declaration). Score is the right
+// discriminator because it is already this project's statement of how much a
+// detection matters: a reverse shell found inside a sudo command line should
+// report as a reverse shell, not as "a sudo command ran". Declaration order
+// remains only as a deterministic tie-break, never as the primary rule.
+func strongest(matches []ruleMatch) int {
+	best := -1
+	for i := range matches {
+		if best < 0 ||
+			matches[i].rule.Score > matches[best].rule.Score ||
+			(matches[i].rule.Score == matches[best].rule.Score && matches[i].index < matches[best].index) {
+			best = i
+		}
+	}
+	return best
+}
+
+// confirmAgainstRedacted drops raw-surface matches that only held because of
+// text the attacker supplied.
+//
+// SurfaceRaw is a claim that a pattern is pinned to daemon-emitted literals, and
+// for most rules that claim is true by inspection — but "by inspection" is how
+// the original defect survived review, and the claim has to hold for rules
+// nobody has written yet. The alternative considered was requiring a Process
+// filter on every raw-surface rule. That was rejected: it narrows detection to a
+// hardcoded set of syslog tags, which is precisely the failure mode where an
+// OpenSSH upgrade renaming `sshd` to `sshd-session` silently takes rules dark.
+//
+// So the check is behavioural instead of structural. A rule whose match came
+// from the daemon's own text still matches once the username is blanked —
+// "Failed password for [redacted] from ..." is still a failed password. A rule
+// that only matched because the username *was* "victim : user NOT in sudoers"
+// has nothing left to match, and is dropped.
+//
+// Captures still come from the raw match, so the event keeps the real username
+// rather than the marker. Only the verdict and tags are affected.
+func confirmAgainstRedacted(matches []ruleMatch, redacted, original string) []ruleMatch {
+	if redacted == original {
+		return matches // nothing was attacker-chosen; nothing to re-check
+	}
+	kept := matches[:0]
+	for _, m := range matches {
+		if m.rule.Pattern.MatchString(redacted) {
+			kept = append(kept, m)
+		}
+	}
+	return kept
+}
+
+// redactionFill replaces an attacker-chosen span. It is a fixed literal rather
+// than a same-length run, because nothing downstream of here needs the offsets
+// to line up, and a literal is recognisable if it ever surfaces in a debug dump.
+const redactionFill = "[redacted]"
+
+// untrustedCapture reports whether a capture group holds a value supplied by the
+// remote party rather than described by the host.
+//
+// `command` is deliberately not in this set. A command line is attacker-
+// influenced too, but it is a record of something the host *ran*, and scanning
+// it for reverse shells and pipe-to-shell droppers is the entire purpose of the
+// free-text rules. The distinction that matters is between a string someone
+// typed at a login prompt and a string the machine executed.
+func untrustedCapture(name string) bool {
+	switch name {
+	case "user", "target_user":
+		return true
+	}
+	return false
+}
+
+// redactUntrusted blanks the spans that the raw-surface rules identified as
+// attacker-chosen, so a keyword rule cannot be made to match inside one.
+//
+// Redaction is by byte offset, not by string replacement. Replacing every
+// occurrence of the captured value would also blank innocent text that happens
+// to equal it — a user named "root" would erase "root" from "PWD=/root" — and
+// suppressing real detections is the failure mode this change exists to avoid
+// creating.
+func redactUntrusted(msg string, matches []ruleMatch) string {
+	type span struct{ lo, hi int }
+	var spans []span
+	for _, m := range matches {
+		for gi, name := range m.rule.Pattern.SubexpNames() {
+			if gi == 0 || !untrustedCapture(name) {
+				continue
+			}
+			lo, hi := m.loc[2*gi], m.loc[2*gi+1]
+			if lo >= 0 && hi > lo {
+				spans = append(spans, span{lo, hi})
+			}
+		}
+	}
+	if len(spans) == 0 {
+		return msg
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].lo < spans[j].lo })
+
+	var b strings.Builder
+	b.Grow(len(msg))
+	prev := 0
+	for _, s := range spans {
+		if s.lo < prev {
+			s.lo = prev // two rules captured overlapping spans
+		}
+		if s.hi <= s.lo {
+			continue
+		}
+		b.WriteString(msg[prev:s.lo])
+		b.WriteString(redactionFill)
+		prev = s.hi
+	}
+	b.WriteString(msg[prev:])
+	return b.String()
+}
+
 // applyCaptures copies named capture groups onto the event. Known names map to
 // first-class fields; anything else lands in Fields so new rules can add
 // context without a schema change.
-func applyCaptures(ev *event.Event, re *regexp.Regexp, m []string) {
-	for i, name := range re.SubexpNames() {
-		if i == 0 || name == "" || i >= len(m) || m[i] == "" {
+func applyCaptures(ev *event.Event, m ruleMatch) {
+	for i, name := range m.rule.Pattern.SubexpNames() {
+		if i == 0 || name == "" {
 			continue
 		}
-		v := sanitize.Field(m[i], 256)
+		raw := m.group(i)
+		if raw == "" {
+			continue
+		}
+		v := sanitize.Field(raw, 256)
 		switch name {
 		case "user":
 			ev.User = v

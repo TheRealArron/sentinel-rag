@@ -81,6 +81,29 @@ Two translations are deliberately *not* literal:
 - **Bare equality on a structured field stays exact.** `user: root` must not
   match `rooted`.
 
+## `message` is the redacted message
+
+An imported rule matching `message|contains: xmrig` had the same defect the
+built-in keyword rules did: a remote party picks their own SSH username, that
+username lands in the message, and an imported rule is permitted to escalate a
+verdict. So the matcher is handed a view of the event in which the spans the
+ingestor identified as attacker-chosen — the `user` and `target_user` captures —
+are blanked.
+
+A rule that wants to inspect an account name should match the **`user` field**,
+which is unmodified and is where `FIELD_MAP` points. A rule matching `message`
+sees what the daemon wrote, with the login-prompt input removed.
+
+`command` is not redacted when a command was actually parsed, because a command
+line is a record of something the host ran. When no command was parsed the field
+falls back to the redacted message rather than the raw one, so the same hole
+cannot be reached through a different field name.
+
+This is applied in `enrich`, not in the `sigma` package: the matcher's semantics
+are pinned by the shared Go/Python agreement vectors, and this is a decision
+about what text to hand it rather than about how it matches. The vectors are
+unchanged. See [detection.md](detection.md).
+
 ## How imported rules compose with built-in ones
 
 The first version ran Sigma only when no built-in rule had matched, on the theory

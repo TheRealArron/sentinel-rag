@@ -200,9 +200,14 @@ func enrichWithHoney(t *testing.T, line string) *event.Event {
 }
 
 func TestHoneytokenForcesScore100(t *testing.T) {
-	// A failed password normally scores 54. Against a canary it is 100 — the
-	// only single event in the system that clears the score-90 firewall
-	// threshold without correlation.
+	// A failed password normally scores 54. Against a canary it is 100.
+	//
+	// This used to be commented as "the only single event that clears the
+	// score-90 firewall threshold without correlation". That was never true:
+	// reverse_shell_bash_devtcp (96), cryptominer_indicator (92) and
+	// log_tampering (90) all clear it on one line by design. What is true, and
+	// is what the canary is for, is that it is the only one that reaches 100 and
+	// the only one with no benign explanation.
 	ev := enrichWithHoney(t, "Jul 30 05:30:12 h sshd[1]: Failed password for invalid user admin_backup from 203.0.113.45 port 51001 ssh2")
 
 	if ev.Score != 100 {

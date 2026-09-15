@@ -8,6 +8,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/TheRealArron/sentinel-rag/ingestor/internal/event"
+	"github.com/TheRealArron/sentinel-rag/ingestor/internal/parser"
+	"github.com/TheRealArron/sentinel-rag/ingestor/internal/sanitize"
 )
 
 // This file is the Go half of benchmarks/. It exists to answer one question
@@ -150,4 +154,96 @@ func TestDumpBenchCorpus(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("wrote 10000 lines to %s", corpusOut)
+}
+
+// BenchmarkApplyWith measures the full enrichment path, which is what the
+// surface split changed. BenchmarkRuleSetSingleThread above times the raw regex
+// sweep and is deliberately untouched by it — it calls the patterns directly —
+// so it cannot answer "what did redaction cost".
+//
+// Two corpora, because the answer differs by an order of magnitude between them:
+//
+//	withUser  lines carrying a user/target_user capture. These pay for the
+//	          redaction pass, the confirmation re-match, and a strings.Builder.
+//	noUser    lines with nothing attacker-chosen to blank. redactUntrusted
+//	          returns the input unchanged and confirmAgainstRedacted returns
+//	          immediately, so the surface split costs one comparison.
+func benchApply(b *testing.B, lines []string) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, line := range lines {
+			san := sanitize.Line(line, 0)
+			env := parser.Parse(san.Clean)
+			ev := &event.Event{Message: env.Message, Process: env.Process}
+			ApplyWith(ev, env, san, Detectors{})
+		}
+	}
+}
+
+func BenchmarkApplyWithUserCapture(b *testing.B) {
+	benchApply(b, []string{
+		"Jul 30 05:30:12 h sshd[1]: Failed password for invalid user admin from 203.0.113.45 port 51234 ssh2",
+		"Jul 30 05:30:12 h sshd[1]: Accepted password for arron from 203.0.113.45 port 51234 ssh2",
+		"Jul 30 05:30:12 h sudo[1]: arron : TTY=pts/0 ; PWD=/tmp ; USER=root ; COMMAND=/usr/bin/systemctl status nginx",
+	})
+}
+
+func BenchmarkApplyNoUserCapture(b *testing.B) {
+	benchApply(b, []string{
+		"Jul 30 05:30:12 h kernel: [UFW BLOCK] IN=eth0 OUT= SRC=203.0.113.99 DST=192.168.1.10 PROTO=TCP SPT=44321 DPT=23",
+		"Jul 30 05:30:12 h systemd[1]: Started Daily apt download activities.",
+		"Jul 30 05:30:12 h chronyd[790]: Selected source 162.159.200.123",
+	})
+}
+
+// BenchmarkSurfaceSplit isolates exactly the work the fix added, and nothing
+// else.
+//
+// An earlier version of this compared ApplyWith against a bare two-pass match
+// and reported the difference as "the cost of redaction". That was wrong: the
+// bare match also skipped captures, modifiers, tag merging and scoring, so the
+// delta measured most of enrichment. The honest comparison is the same matching
+// work with and without the redaction machinery around it.
+//
+//	baseline  one pass of every rule over the raw message
+//	split     the same, plus redactUntrusted, confirmAgainstRedacted, and the
+//	          second pass over the redacted text
+func BenchmarkSurfaceSplit(b *testing.B) {
+	const msg = "Failed password for invalid user admin from 203.0.113.45 port 51234 ssh2"
+
+	b.Run("baseline", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = matchRules(msg, "sshd", SurfaceRaw)
+			_ = matchRules(msg, "sshd", SurfaceRedacted)
+		}
+	})
+
+	b.Run("split", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, _ = matchAll(msg, "sshd")
+		}
+	})
+
+	// The no-user case, where both added steps short-circuit. Paired with its
+	// own baseline: it is a different, longer line, so comparing it against the
+	// sshd baseline above would measure the line, not the change.
+	const noUser = "[UFW BLOCK] IN=eth0 OUT= SRC=203.0.113.99 DST=192.168.1.10 PROTO=TCP SPT=44321 DPT=23"
+
+	b.Run("no_span_baseline", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = matchRules(noUser, "kernel", SurfaceRaw)
+			_ = matchRules(noUser, "kernel", SurfaceRedacted)
+		}
+	})
+
+	b.Run("no_span_split", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_, _ = matchAll(noUser, "kernel")
+		}
+	})
 }

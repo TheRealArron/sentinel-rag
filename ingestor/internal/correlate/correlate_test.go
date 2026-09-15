@@ -257,3 +257,195 @@ func TestCapsDoNotAffectAnyVerdict(t *testing.T) {
 			maxFailuresPerSource, def.FailureThreshold)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Clock handling.
+//
+// prune() derives its cutoff from the timestamp of the arriving event, so the
+// window is only as trustworthy as the timestamps in the log. Two ways that went
+// wrong, neither of which needed an attacker.
+// ---------------------------------------------------------------------------
+
+// freezeIngestClock pins event.Now, which is the reference the correlator
+// compares log timestamps against.
+func freezeIngestClock(t *testing.T, at time.Time) {
+	t.Helper()
+	event.Now = func() time.Time { return at }
+	t.Cleanup(func() { event.Now = func() time.Time { return time.Now().UTC() } })
+}
+
+func TestAFutureTimestampCannotResetTheWindow(t *testing.T) {
+	// The evasion: prune() expired everything older than (future - window), so a
+	// single line dated ahead of the stream wiped the accumulated failures.
+	// Interleaving one every few attempts held the count below the threshold for
+	// as long as the attacker cared to keep going.
+	freezeIngestClock(t, base.Add(time.Minute))
+	c := New(Config{FailureThreshold: 5, Window: 60 * time.Second})
+
+	for i := 0; i < 4; i++ {
+		if got := c.Observe(failure("203.0.113.45", fmt.Sprintf("u%d", i)), base.Add(time.Duration(i)*time.Second)); len(got) != 0 {
+			t.Fatalf("unexpected incident at failure %d", i)
+		}
+	}
+
+	// The fifth failure carries a timestamp an hour into the future. Before the
+	// fix, prune() expired all four earlier failures against a cutoff derived
+	// from it, leaving a count of one — so this line both failed to complete the
+	// burst and destroyed the evidence for it.
+	out := c.Observe(failure("203.0.113.45", "skewed"), base.Add(time.Hour))
+	if len(out) != 1 || out[0].Rule != "correlated_brute_force" {
+		t.Fatalf("a future-dated line reset the window; got %d event(s): %v", len(out), out)
+	}
+	if out[0].Fields["clock_skew_events"] == "" {
+		t.Error("the skew should be reported on the incident, not silently corrected")
+	}
+	if !hasTag(out[0], "clock-skew") {
+		t.Errorf("missing clock-skew tag: %v", out[0].Tags)
+	}
+}
+
+func TestAnOutOfOrderTimestampDoesNotWidenTheWindow(t *testing.T) {
+	// Log order is not timestamp order once two files are concatenated, which is
+	// what `make shadow-demo` does and what any multi-host collector does by
+	// definition. Winding the window back would retain failures that had already
+	// expired and manufacture a burst out of hours of background noise.
+	freezeIngestClock(t, base.Add(24*time.Hour))
+	c := New(Config{FailureThreshold: 5, Window: 60 * time.Second})
+
+	// Four failures, then a jump forward well past the window.
+	for i := 0; i < 4; i++ {
+		c.Observe(failure("203.0.113.45", fmt.Sprintf("u%d", i)), base.Add(time.Duration(i)*time.Second))
+	}
+	c.Observe(failure("203.0.113.45", "later"), base.Add(10*time.Minute))
+
+	// A straggler arriving late but stamped back inside the original burst must
+	// not resurrect it.
+	out := c.Observe(failure("203.0.113.45", "straggler"), base.Add(4*time.Second))
+	if len(out) != 0 {
+		t.Fatalf("an out-of-order timestamp rewound the window and raised %v", out[0].Rule)
+	}
+}
+
+func TestALegitimateQuietGapStillAdvancesTheWindow(t *testing.T) {
+	// The counterweight: clamping must not mistake a genuinely idle source for
+	// skew, or failures from hours ago would stay in the window forever.
+	freezeIngestClock(t, base.Add(48*time.Hour))
+	c := New(Config{FailureThreshold: 5, Window: 60 * time.Second})
+
+	for i := 0; i < 4; i++ {
+		c.Observe(failure("203.0.113.45", fmt.Sprintf("u%d", i)), base.Add(time.Duration(i)*time.Second))
+	}
+	// Six hours later, four more. Neither burst alone reaches the threshold.
+	for i := 0; i < 4; i++ {
+		out := c.Observe(failure("203.0.113.45", fmt.Sprintf("v%d", i)), base.Add(6*time.Hour+time.Duration(i)*time.Second))
+		if len(out) != 0 {
+			t.Fatalf("stale failures from six hours earlier were counted: %v", out[0].Message)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The compromise verdict, and the account it is about.
+// ---------------------------------------------------------------------------
+
+func TestSuccessForATargetedAccountIsACompromise(t *testing.T) {
+	freezeIngestClock(t, base.Add(time.Minute))
+	c := New(Config{FailureThreshold: 5, Window: 60 * time.Second})
+
+	for _, user := range []string{"admin", "oracle", "arron"} {
+		c.Observe(failure("203.0.113.45", user), base)
+	}
+	out := c.Observe(success("203.0.113.45", "arron"), base.Add(time.Second))
+
+	if len(out) != 1 || out[0].Rule != "correlated_successful_login_after_bruteforce" {
+		t.Fatalf("got %v, want a compromise incident", out)
+	}
+	if out[0].Score != 97 {
+		t.Errorf("Score = %d, want 97", out[0].Score)
+	}
+	if out[0].Fields["account_was_targeted"] != "true" {
+		t.Errorf("account_was_targeted = %q", out[0].Fields["account_was_targeted"])
+	}
+}
+
+func TestSuccessForAnUntargetedAccountIsNotACompromise(t *testing.T) {
+	// The shared-egress false positive. Behind CGNAT or a corporate NAT an
+	// attacker's failures and a colleague's login share one address, and this
+	// used to score 97 — the number that arms the firewall — on that alone.
+	freezeIngestClock(t, base.Add(time.Minute))
+	c := New(Config{FailureThreshold: 5, Window: 60 * time.Second})
+
+	for _, user := range []string{"admin", "oracle", "test"} {
+		c.Observe(failure("198.51.100.30", user), base)
+	}
+	out := c.Observe(success("198.51.100.30", "colleague"), base.Add(time.Second))
+
+	if len(out) != 1 {
+		t.Fatalf("the event should still be reported, got %d", len(out))
+	}
+	inc := out[0]
+	if inc.Rule != "correlated_login_from_attacking_source" {
+		t.Fatalf("Rule = %q, want correlated_login_from_attacking_source", inc.Rule)
+	}
+	if inc.Score >= 90 {
+		t.Errorf("Score = %d: an untargeted account on a shared address can arm the firewall", inc.Score)
+	}
+	if inc.Fields["account_was_targeted"] != "false" {
+		t.Errorf("account_was_targeted = %q", inc.Fields["account_was_targeted"])
+	}
+	// Reported, not suppressed: going blind here would be the worse failure.
+	if !strings.Contains(inc.Message, "colleague") {
+		t.Errorf("the incident should name the account: %q", inc.Message)
+	}
+}
+
+func TestAnUncertainTargetSetKeepsTheHigherSeverity(t *testing.T) {
+	// Once the per-source user cap is reached the tracked set is a sample, so
+	// "this account was never targeted" stops being knowable. Downgrading on
+	// missing evidence would let an attacker earn the lower score by trying
+	// enough usernames.
+	freezeIngestClock(t, base.Add(time.Minute))
+	c := New(Config{FailureThreshold: 5, Window: 60 * time.Second})
+
+	for i := 0; i < maxUsersPerSource+5; i++ {
+		c.Observe(failure("203.0.113.45", fmt.Sprintf("user%d", i)), base)
+	}
+	out := c.Observe(success("203.0.113.45", "someone-else"), base.Add(time.Second))
+
+	if len(out) != 1 || out[0].Rule != "correlated_successful_login_after_bruteforce" {
+		t.Fatalf("got %v, want the compromise verdict when the target set is capped", out)
+	}
+	if out[0].Fields["targeted_users_capped"] != "true" {
+		t.Error("the incident should record that the target set was a sample")
+	}
+}
+
+func TestCompromiseHasItsOwnCooldown(t *testing.T) {
+	// A busy shared address can log in every few seconds. Without a cooldown
+	// each one re-raised the incident for as long as the failure window stayed
+	// full — and the brute-force cooldown does not cover this path.
+	freezeIngestClock(t, base.Add(time.Minute))
+	c := New(Config{FailureThreshold: 5, Window: 60 * time.Second, Cooldown: 5 * time.Minute})
+
+	for _, user := range []string{"admin", "oracle", "arron"} {
+		c.Observe(failure("203.0.113.45", user), base)
+	}
+	if got := c.Observe(success("203.0.113.45", "arron"), base.Add(time.Second)); len(got) != 1 {
+		t.Fatalf("first success should raise an incident, got %d", len(got))
+	}
+	for _, user := range []string{"admin", "oracle", "arron"} {
+		c.Observe(failure("203.0.113.45", user), base.Add(2*time.Second))
+	}
+	if got := c.Observe(success("203.0.113.45", "arron"), base.Add(3*time.Second)); len(got) != 0 {
+		t.Errorf("a second success inside the cooldown re-alerted: %v", got[0].Rule)
+	}
+}
+
+func hasTag(ev *event.Event, tag string) bool {
+	for _, t := range ev.Tags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
+}

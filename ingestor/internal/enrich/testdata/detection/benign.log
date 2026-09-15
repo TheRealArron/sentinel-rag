@@ -1,0 +1,108 @@
+Jul 30 03:00:01 sentinel systemd[1]: Starting Daily apt download activities...
+Jul 30 03:00:04 sentinel systemd[1]: apt-daily.service: Deactivated successfully.
+Jul 30 03:00:04 sentinel systemd[1]: Finished Daily apt download activities.
+Jul 30 03:00:05 sentinel systemd[1]: Started Daily apt upgrade and clean activities.
+Jul 30 03:00:12 sentinel unattended-upgrade[2201]: Initial blacklist:
+Jul 30 03:00:12 sentinel unattended-upgrade[2201]: Initial whitelist (not strict):
+Jul 30 03:00:14 sentinel unattended-upgrade[2201]: Packages that will be upgraded: libc6 libssl3 openssh-client
+Jul 30 03:00:41 sentinel unattended-upgrade[2201]: All upgrades installed
+Jul 30 03:00:42 sentinel systemd[1]: Reloading OpenBSD Secure Shell server ssh.service...
+Jul 30 03:00:43 sentinel systemd[1]: Reloaded OpenBSD Secure Shell server ssh.service.
+Jul 30 03:00:44 sentinel systemd[1]: Reloading nginx.service - A high performance web server and a reverse proxy server.
+Jul 30 03:00:45 sentinel systemd[1]: Reloaded nginx.service - A high performance web server and a reverse proxy server.
+Jul 30 03:00:46 sentinel systemd[1]: Reloading dbus.service - D-Bus System Message Bus.
+Jul 30 03:00:47 sentinel systemd[1]: man-db.service: Deactivated successfully.
+Jul 30 03:00:48 sentinel systemd[1]: Finished Daily man-db regeneration.
+Jul 30 03:01:00 sentinel CRON[2301]: (root) CMD (/usr/lib/sysstat/debian-sa1 1 1)
+Jul 30 03:01:00 sentinel CRON[2302]: (root) CMD (/usr/bin/certbot renew --quiet)
+Jul 30 03:01:00 sentinel CRON[2303]: (arron) CMD (/home/arron/bin/backup.sh)
+Jul 30 03:05:01 sentinel CRON[2311]: (root) CMD (/usr/bin/find /var/tmp -type f -mtime +7 -delete)
+Jul 30 03:09:01 sentinel CRON[2320]: (root) CMD ([ -x /etc/init.d/anacron ] && /usr/sbin/invoke-rc.d anacron start)
+Jul 30 03:10:01 sentinel CRON[2331]: pam_unix(cron:session): session opened for user root(uid=0) by (uid=0)
+Jul 30 03:10:02 sentinel CRON[2331]: pam_unix(cron:session): session closed for user root
+Jul 30 03:17:01 sentinel CRON[2340]: (root) CMD (cd / && run-parts --report /etc/cron.hourly)
+Jul 30 04:02:11 sentinel systemd[1]: logrotate.service: Deactivated successfully.
+Jul 30 04:02:11 sentinel systemd[1]: Finished Rotate log files.
+Jul 30 04:02:12 sentinel rsyslogd: [origin software="rsyslogd" swVersion="8.2312.0"] rsyslogd was HUPed
+Jul 30 05:00:03 sentinel systemd-resolved[801]: Clock change detected. Flushing caches.
+Jul 30 05:00:04 sentinel chronyd[790]: Selected source 162.159.200.123 (2.debian.pool.ntp.org)
+Jul 30 05:00:05 sentinel chronyd[790]: System clock TAI offset set to 37 seconds
+Jul 30 06:12:33 sentinel sshd[3001]: Accepted publickey for arron from 192.168.1.20 port 51234 ssh2: RSA SHA256:2Zk9vQ
+Jul 30 06:12:33 sentinel sshd[3001]: pam_unix(sshd:session): session opened for user arron(uid=1000) by (uid=0)
+Jul 30 06:12:33 sentinel systemd-logind[812]: New session 42 of user arron.
+Jul 30 06:12:33 sentinel systemd[1]: Started Session 42 of User arron.
+Jul 30 06:14:02 sentinel sudo[3040]: arron : TTY=pts/0 ; PWD=/home/arron ; USER=root ; COMMAND=/usr/bin/systemctl status nginx
+Jul 30 06:14:02 sentinel sudo[3040]: pam_unix(sudo:session): session opened for user root(uid=0) by arron(uid=1000)
+Jul 30 06:14:03 sentinel sudo[3040]: pam_unix(sudo:session): session closed for user root
+Jul 30 06:15:10 sentinel sudo[3055]: arron : TTY=pts/0 ; PWD=/home/arron ; USER=root ; COMMAND=/usr/bin/journalctl -u nginx --since -1h
+Jul 30 06:20:44 sentinel sshd[3001]: pam_unix(sshd:session): session closed for user arron
+Jul 30 06:20:44 sentinel systemd-logind[812]: Session 42 logged out. Waiting for processes to exit.
+Jul 30 06:20:44 sentinel systemd[1]: session-42.scope: Deactivated successfully.
+Jul 30 07:30:01 sentinel dockerd[900]: time="2026-07-30T07:30:01Z" level=info msg="Container 8f2a started"
+Jul 30 07:30:02 sentinel containerd[880]: time="2026-07-30T07:30:02Z" level=info msg="starting signal loop"
+Jul 30 07:30:05 sentinel dockerd[900]: time="2026-07-30T07:30:05Z" level=info msg="Attempting next endpoint for pull"
+Jul 30 07:45:00 sentinel nginx[1200]: 192.168.1.20 - - [30/Jul/2026:07:45:00 +0000] "GET /api/health HTTP/1.1" 200 51
+Jul 30 07:45:30 sentinel nginx[1200]: 192.168.1.20 - - [30/Jul/2026:07:45:30 +0000] "GET /api/stats HTTP/1.1" 200 1841
+Jul 30 08:00:00 sentinel snapd[950]: storehelpers.go:915: cannot refresh: snap has no updates available: "core22"
+Jul 30 08:00:01 sentinel snapd[950]: autorefresh.go:541: auto-refresh: all snaps are up-to-date
+Jul 30 08:01:00 sentinel kernel: audit: type=1400 audit(1690000000.123:45): apparmor="ALLOWED" operation="open" profile="snap.firefox" name="/etc/fonts/fonts.conf"
+Jul 30 08:02:00 sentinel kernel: EXT4-fs (sda1): mounted filesystem with ordered data mode. Opts: (null)
+Jul 30 08:02:01 sentinel kernel: usb 1-3: new high-speed USB device number 5 using xhci_hcd
+Jul 30 08:02:02 sentinel kernel: Bluetooth: hci0: Firmware revision 0.1 build 42
+Jul 30 08:30:00 sentinel NetworkManager[840]: <info>  [1690000000.1] device (eth0): state change: activated
+Jul 30 08:30:01 sentinel NetworkManager[840]: <info>  [1690000000.2] dhcp4 (eth0): state changed extended
+Jul 30 08:30:02 sentinel avahi-daemon[830]: Registering new address record for 192.168.1.10 on eth0.IPv4.
+Jul 30 09:00:00 sentinel postfix/qmgr[1400]: 3A2B1C: from=<root@sentinel>, size=812, nrcpt=1 (queue active)
+Jul 30 09:00:01 sentinel postfix/smtp[1401]: 3A2B1C: to=<arron@example.com>, relay=mail.example.com, status=sent (250 OK)
+Jul 30 09:15:00 sentinel systemd[1]: Starting Daily Cleanup of Temporary Directories...
+Jul 30 09:15:01 sentinel systemd[1]: systemd-tmpfiles-clean.service: Deactivated successfully.
+Jul 30 09:15:01 sentinel systemd[1]: Finished Daily Cleanup of Temporary Directories.
+Jul 30 10:00:00 sentinel packagekitd[1500]: get-updates transaction /1_dacceded from uid 1000 finished with success after 1204ms
+Jul 30 10:30:00 sentinel gdm-password][1600]: pam_unix(gdm-password:session): session opened for user arron(uid=1000) by (uid=0)
+Jul 30 10:30:20 sentinel gdm-password][1600]: pam_unix(gdm-password:session): session closed for user arron
+Jul 30 11:00:00 sentinel thermald[700]: Polling mode is enabled: 4
+Jul 30 11:05:00 sentinel systemd[1]: Started Run anacron jobs.
+Jul 30 11:05:01 sentinel anacron[1700]: Job `cron.daily' started
+Jul 30 11:05:40 sentinel anacron[1700]: Job `cron.daily' terminated
+Jul 30 11:05:41 sentinel anacron[1700]: Normal exit (1 job run)
+Jul 30 12:00:00 sentinel systemd[1]: Starting Refresh fwupd metadata and update motd...
+Jul 30 12:00:04 sentinel fwupdmgr[1800]: Successfully downloaded new metadata: 0 local devices supported
+Jul 30 12:00:05 sentinel systemd[1]: fwupd-refresh.service: Deactivated successfully.
+Jul 30 13:00:00 sentinel sshd[3200]: Accepted publickey for arron from 192.168.1.20 port 51888 ssh2: ED25519 SHA256:aB9
+Jul 30 13:00:00 sentinel sshd[3200]: pam_unix(sshd:session): session opened for user arron(uid=1000) by (uid=0)
+Jul 30 13:00:30 sentinel sudo[3210]: arron : TTY=pts/1 ; PWD=/srv ; USER=root ; COMMAND=/usr/bin/docker compose ps
+Jul 30 13:02:00 sentinel sshd[3200]: pam_unix(sshd:session): session closed for user arron
+Jul 30 14:00:00 sentinel systemd[1]: Starting Message of the Day...
+Jul 30 14:00:01 sentinel 50-motd-news[1900]: * Strictly confined Kubernetes makes edge and IoT secure.
+Jul 30 14:00:02 sentinel systemd[1]: motd-news.service: Deactivated successfully.
+Jul 30 15:00:00 sentinel systemd[1]: Starting Cleanup of Temporary Directories...
+Jul 30 15:00:01 sentinel systemd[1]: Finished Cleanup of Temporary Directories.
+Jul 30 16:00:00 sentinel kernel: TCP: request_sock_TCP: Possible SYN flooding on port 443. Sending cookies.
+Jul 30 16:30:00 sentinel systemd-resolved[801]: Using degraded feature set UDP instead of UDP+EDNS0 for DNS server 192.168.1.1.
+Jul 30 17:00:00 sentinel cron[600]: (CRON) INFO (pidfile fd = 3)
+Jul 30 17:00:01 sentinel cron[600]: (CRON) INFO (Running @reboot jobs)
+Jul 30 18:00:00 sentinel systemd[1]: Started Session 43 of User arron.
+Jul 30 18:00:01 sentinel systemd-logind[812]: New session 43 of user arron.
+Jul 30 18:30:00 sentinel dbus-daemon[820]: [system] Successfully activated service 'org.freedesktop.timedate1'
+Jul 30 19:00:00 sentinel systemd[1]: Starting Ubuntu Advantage Timer for running repeated jobs...
+Jul 30 19:00:03 sentinel ua_timer[2000]: no jobs to run
+Jul 30 19:00:04 sentinel systemd[1]: ua-timer.service: Deactivated successfully.
+Jul 30 20:00:00 sentinel kernel: Linux version 6.8.0-45-generic (buildd@lcy02) #45-Ubuntu SMP PREEMPT_DYNAMIC
+Jul 30 21:00:00 sentinel systemd[1]: Started Daily apt download activities.
+Jul 30 22:00:00 sentinel sshd[3300]: Accepted publickey for arron from 192.168.1.20 port 52000 ssh2: ED25519 SHA256:aB9
+Jul 30 22:00:01 sentinel sshd[3300]: pam_unix(sshd:session): session opened for user arron(uid=1000) by (uid=0)
+Jul 30 22:10:00 sentinel sudo[3310]: arron : TTY=pts/2 ; PWD=/var/log ; USER=root ; COMMAND=/usr/bin/tail -f /var/log/syslog
+Jul 30 22:30:00 sentinel sshd[3300]: pam_unix(sshd:session): session closed for user arron
+Jul 30 23:00:00 sentinel systemd[1]: Finished Rotate log files.
+Jul 30 23:30:00 sentinel systemd[1]: Starting Discard unused blocks on filesystems...
+Jul 30 23:30:11 sentinel fstrim[2100]: /: 12.3 GiB (13207306240 bytes) trimmed on /dev/sda1
+Jul 30 23:30:12 sentinel systemd[1]: fstrim.service: Deactivated successfully.
+Jul 31 06:00:00 sentinel sshd-session[3400]: Accepted publickey for arron from 192.168.1.20 port 52100 ssh2: ED25519 SHA256:aB9
+Jul 31 06:00:01 sentinel sshd-session[3400]: pam_unix(sshd:session): session opened for user arron(uid=1000) by (uid=0)
+Jul 31 06:05:00 sentinel sshd-session[3400]: pam_unix(sshd:session): session closed for user arron
+Jul 31 07:00:00 sentinel sshd[3500]: debug1: trying public key file /home/arron/.ssh/authorized_keys
+Jul 31 07:00:01 sentinel sshd[3500]: debug1: matching key found: file /home/arron/.ssh/authorized_keys, line 2 ED25519 SHA256:aB9
+Jul 31 07:10:00 sentinel sshd[3510]: reverse mapping checking getaddrinfo for broadband.example.net [198.51.100.60] failed - POSSIBLE BREAK-IN ATTEMPT!
+Jul 31 07:20:00 sentinel kernel: audit: type=1400 audit(1690000200.456:78): apparmor="DENIED" operation="open" profile="snap.firefox.firefox" name="/etc/nsswitch.conf" pid=4100 comm="firefox"
+Jul 31 07:20:01 sentinel kernel: audit: type=1400 audit(1690000201.456:79): apparmor="DENIED" operation="capable" profile="/usr/sbin/cupsd" pid=1230 comm="cupsd" capability=12
+Jul 31 07:30:00 sentinel ansible-command[5000]: Invoked with _raw_params=curl -fsSL https://get.docker.com | sh _uses_shell=True
