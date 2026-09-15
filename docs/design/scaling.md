@@ -242,3 +242,14 @@ properties they demonstrated are now pinned by tests that run in CI:
 * `internal/correlate/correlate_test.go::TestPerSourceStateIsBounded`
 
 Each was confirmed to fail against the defect it describes before being kept.
+
+---
+
+## Since
+
+`internal/ship` was not covered by this audit and was examined separately; see
+[spool.md](spool.md). It found the same mistake a fifth time — the spool cap is
+expressed in bytes while every operation on it cost one pass over its *files*,
+and outage duration, which an attacker chooses, sets the file count. It also
+found the torn-write defect from §2 repeated in another package, which is the
+better argument for writing these notes down.

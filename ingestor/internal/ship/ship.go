@@ -33,12 +33,15 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -76,6 +79,24 @@ type Shipper struct {
 	cfg    Config
 	client *http.Client
 
+	// send serialises everything that talks to the hub or mutates the spool
+	// directory. Flush is reachable from three places at once — the pipeline's
+	// collector goroutine when a batch fills, the background ticker, and Close —
+	// and replaySpool lists the spool, posts each file, then deletes it. With
+	// nothing serialising that, two concurrent flushes both enumerated the same
+	// files and both sent them: the hub received the same events several times
+	// over, from the one component whose purpose is an accurate record. Measured
+	// at four-way duplication under a four-goroutine flush.
+	//
+	// Serialising also restores the ordering the package claims. Replay is
+	// documented as oldest-first precisely so a reconstructed timeline is
+	// truthful, and concurrent senders interleave batches regardless of the sort.
+	//
+	// Held across the network call, so a slow hub applies backpressure to the
+	// pipeline rather than letting work pile up in memory. Lock order is always
+	// send then mu; nothing acquires them the other way.
+	send sync.Mutex
+
 	mu      sync.Mutex
 	pending []*event.Event
 	stats   Stats
@@ -83,7 +104,40 @@ type Shipper struct {
 	closed  bool
 	done    chan struct{}
 	wg      sync.WaitGroup
+
+	// spoolIdx is the spool directory held in memory, oldest first, with
+	// spoolBytes its running total.
+	//
+	// The cap is expressed in bytes but every operation on the spool cost one
+	// pass over its *files*: trimSpool enumerated the directory and stat'd every
+	// entry on each spool(), replaySpool enumerated it on each Flush, and Stats
+	// enumerated it per call. Nothing bounds the file count. One file is written
+	// per flush, so it is outage duration that picks it — and this package's own
+	// doc note observes that an attacker who can reach the host can arrange for
+	// the network to break. At the default 2s ticker and a low event rate the
+	// files are a few hundred bytes, so the 256 MB cap is reached at roughly
+	// 850,000 of them, at which point each 2s flush stat'd all 850,000.
+	//
+	// The listing is therefore built once, in scanSpool, and maintained
+	// incrementally. Every mutation happens under the send mutex, so the order
+	// is stable while replaySpool walks it.
+	spoolIdx   []spoolEntry
+	spoolBytes int64
 }
+
+// spoolEntry is one file in the spool as tracked in memory. Base names sort
+// chronologically, so the slice order is the replay order.
+type spoolEntry struct {
+	name   string
+	size   int64
+	events int64
+}
+
+// readDir is indirected so a test can count how often the spool directory is
+// enumerated. That count is the work bound this design exists to hold — one
+// enumeration at startup, none per flush — and it is the thing worth asserting,
+// since a wall-clock assertion tight enough to catch the regression would flake.
+var readDir = os.ReadDir
 
 // New builds a Shipper, loading the client certificate and the CA that the hub
 // must present. A misconfigured certificate is a startup error rather than a
@@ -160,6 +214,7 @@ func New(cfg Config) (*Shipper, error) {
 		if err := os.MkdirAll(cfg.SpoolDir, 0o700); err != nil {
 			return nil, fmt.Errorf("create spool %s: %w", cfg.SpoolDir, err)
 		}
+		s.scanSpool()
 	}
 
 	s.wg.Add(1)
@@ -182,6 +237,9 @@ func (s *Shipper) Write(ev *event.Event) error {
 
 // Flush sends everything buffered, spooling it if the hub cannot be reached.
 func (s *Shipper) Flush() error {
+	s.send.Lock()
+	defer s.send.Unlock()
+
 	s.mu.Lock()
 	batch := s.pending
 	s.pending = nil
@@ -250,6 +308,52 @@ func (s *Shipper) post(body []byte) error {
 
 // -- spool -------------------------------------------------------------------
 
+// scanSpool builds the in-memory listing once, at construction, recovering
+// whatever a previous run left behind. This is the only full enumeration of the
+// spool directory; everything after it works from the listing.
+//
+// A file dropped into the spool by hand after startup is therefore not picked
+// up. That was never a supported way to feed the shipper — two writers sharing
+// one spool directory would already have double-sent every batch in it.
+func (s *Shipper) scanSpool() {
+	entries, err := readDir(s.cfg.SpoolDir)
+	if err != nil {
+		return
+	}
+	idx := make([]spoolEntry, 0, len(entries))
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		// A write that died between CreateTemp and Rename leaves one of these.
+		// It holds no deliverable batch, so sweep it rather than let a crash loop
+		// fill the disk with debris the size cap never sees.
+		if strings.HasPrefix(e.Name(), ".spool-") && strings.HasSuffix(e.Name(), ".tmp") {
+			_ = os.Remove(filepath.Join(s.cfg.SpoolDir, e.Name()))
+			continue
+		}
+		if !strings.HasSuffix(e.Name(), ".ndjson") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		idx = append(idx, spoolEntry{
+			name:   e.Name(),
+			size:   info.Size(),
+			events: spoolEventCount(e.Name()),
+		})
+		total += info.Size()
+	}
+	sort.Slice(idx, func(i, j int) bool { return idx[i].name < idx[j].name })
+
+	s.mu.Lock()
+	s.spoolIdx, s.spoolBytes = idx, total
+	s.mu.Unlock()
+}
+
 func (s *Shipper) spool(body []byte, count int) {
 	if s.cfg.SpoolDir == "" {
 		s.mu.Lock()
@@ -257,56 +361,141 @@ func (s *Shipper) spool(body []byte, count int) {
 		s.mu.Unlock()
 		return
 	}
-	name := filepath.Join(s.cfg.SpoolDir, fmt.Sprintf("%d-%09d.ndjson", time.Now().UnixNano(), count))
-	if err := os.WriteFile(name, body, 0o600); err != nil {
+	name := fmt.Sprintf("%d-%09d.ndjson", time.Now().UnixNano(), count)
+	if err := writeSpoolFile(filepath.Join(s.cfg.SpoolDir, name), body); err != nil {
 		s.mu.Lock()
 		s.stats.Dropped += int64(count)
 		s.mu.Unlock()
 		return
 	}
+	entry := spoolEntry{name: name, size: int64(len(body)), events: int64(count)}
+
 	s.mu.Lock()
 	s.stats.Spooled += int64(count)
+	// Names embed the wall clock, so an NTP step backwards can mint a name that
+	// sorts before its predecessor. Insert in order rather than assume; the
+	// common case appends and copies nothing.
+	at := sort.Search(len(s.spoolIdx), func(i int) bool { return s.spoolIdx[i].name >= name })
+	s.spoolIdx = append(s.spoolIdx, spoolEntry{})
+	copy(s.spoolIdx[at+1:], s.spoolIdx[at:])
+	s.spoolIdx[at] = entry
+	s.spoolBytes += entry.size
 	s.mu.Unlock()
+
 	s.trimSpool()
+}
+
+// spoolTempPattern names the in-progress write. The suffix keeps it out of the
+// ".ndjson" listing, so a torn write is invisible to replay rather than being
+// posted as a short batch.
+const spoolTempPattern = ".spool-*.tmp"
+
+// writeSpoolFile persists a batch durably and atomically.
+//
+// os.WriteFile neither fsyncs nor renames, and both matter. Without the fsync a
+// spooled batch sits in the page cache and is lost to a power cut; without the
+// rename a crash mid-write leaves a *partial* file under its final name, which
+// scanSpool lists and replaySpool posts as a truncated NDJSON body with a torn
+// last line. Both defeat the reason the spool exists: it is the copy of record
+// for exactly the window when the hub cannot be reached, and "the moment the
+// network breaks is exactly the moment worth recording".
+//
+// This is the pattern ioc.writeFileAtomic already argues for, and every durable
+// write in the engine — the vector store, the parent store, the IOC bundle —
+// follows. The spool was the one that did neither.
+//
+// It goes one step further than writeFileAtomic and syncs the directory, because
+// a rename that has not reached the platter is a batch that vanishes. The IOC
+// bundle can afford to skip that: it is derived from an upstream feed and a crash
+// simply means rebuilding it. A spooled batch is derived from nothing — it is the
+// delivery queue itself, and nothing the shipper can reach can regenerate it.
+func writeSpoolFile(name string, body []byte) error {
+	dir := filepath.Dir(name)
+	tmp, err := os.CreateTemp(dir, spoolTempPattern)
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename succeeds
+
+	if _, err := tmp.Write(body); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, name); err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
+
+// syncDir flushes a directory entry so a rename survives a power cut.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 // trimSpool enforces the size cap, oldest-first. An unbounded spool turns a hub
 // outage into a full disk, which takes down the host it was protecting.
+//
+// The cost is now proportional to what is evicted rather than to what is
+// retained, which is the point: eviction is rare and the retained set is the
+// quantity an attacker gets to choose.
 func (s *Shipper) trimSpool() {
-	entries, err := os.ReadDir(s.cfg.SpoolDir)
-	if err != nil {
-		return
-	}
-	type spooled struct {
-		path string
-		size int64
-	}
-	var files []spooled
-	var total int64
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".ndjson") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		files = append(files, spooled{filepath.Join(s.cfg.SpoolDir, e.Name()), info.Size()})
-		total += info.Size()
-	}
-	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
-
 	limit := int64(s.cfg.SpoolMaxMB) << 20
-	for total > limit && len(files) > 0 {
-		oldest := files[0]
-		files = files[1:]
-		if os.Remove(oldest.path) == nil {
-			total -= oldest.size
-			s.mu.Lock()
-			s.stats.Dropped++
-			s.mu.Unlock()
-		}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for s.spoolBytes > limit && len(s.spoolIdx) > 0 {
+		oldest := s.spoolIdx[0]
+		s.spoolIdx = s.spoolIdx[1:]
+		s.spoolBytes -= oldest.size
+
+		// Events, not files. This counter used to be incremented by one per
+		// evicted file while the no-spool path incremented it by the event count,
+		// so the single number reported through -stats mixed two units and
+		// under-stated real loss by up to BatchSize — 500x at the default. For a
+		// package whose own comment calls silent truncation of security telemetry
+		// "its own incident", the figure has to be countable.
+		//
+		// Counted whether or not the unlink succeeds. A file we have stopped
+		// tracking will never be replayed, so it is lost to the hub either way,
+		// and the accounting has to say so.
+		s.stats.Dropped += oldest.events
+		_ = os.Remove(filepath.Join(s.cfg.SpoolDir, oldest.name))
 	}
+}
+
+// spoolEventCount recovers how many events a spool file holds from its name.
+//
+// spool() writes "<unixnano>-<count>.ndjson", so the count is already on disk and
+// simply was not being read. Falling back to 1 keeps a file written by some other
+// version from being counted as zero loss, which would be the one wrong answer
+// here: under-reporting is what this is fixing.
+func spoolEventCount(name string) int64 {
+	base := strings.TrimSuffix(name, ".ndjson")
+	dash := strings.LastIndexByte(base, '-')
+	if dash < 0 {
+		return 1
+	}
+	n, err := strconv.ParseInt(base[dash+1:], 10, 64)
+	if err != nil || n <= 0 {
+		return 1
+	}
+	return n
 }
 
 // replaySpool re-sends spooled batches oldest-first, stopping at the first
@@ -315,35 +504,73 @@ func (s *Shipper) replaySpool() {
 	if s.cfg.SpoolDir == "" {
 		return
 	}
-	entries, err := os.ReadDir(s.cfg.SpoolDir)
-	if err != nil {
-		return
-	}
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".ndjson") {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
+	s.mu.Lock()
+	queue := append([]spoolEntry(nil), s.spoolIdx...)
+	s.mu.Unlock()
 
-	for _, name := range names {
-		path := filepath.Join(s.cfg.SpoolDir, name)
+	// Only a leading run is retired, so the listing stays in replay order and a
+	// batch is never skipped past. The caller holds send, so nothing else removes
+	// from the front while this walks it.
+	var done int
+	var freed, replayed, dropped int64
+	for _, e := range queue {
+		path := filepath.Join(s.cfg.SpoolDir, e.name)
 		body, err := os.ReadFile(path)
-		if err != nil {
+
+		if errors.Is(err, fs.ErrNotExist) {
+			// Gone from under us. Nothing to send and nothing to retry, so retire
+			// it and count the loss rather than carry an entry that can never
+			// leave the queue.
+			done++
+			freed += e.size
+			dropped += e.events
 			continue
 		}
-		if err := s.post(body); err != nil {
+		// A batch written by a pre-atomic build can already be torn: the process
+		// died mid-write and the final line is half a record. Atomic writes stop
+		// new ones appearing, but they do not clean up a spool that survived the
+		// upgrade, and posting a body with a torn last line hands the hub something
+		// it cannot parse. Every complete record ends in '\n' — encode uses
+		// json.Encoder — so anything after the last one is a fragment.
+		var torn int64
+		if err == nil {
+			if cut := bytes.LastIndexByte(body, '\n'); cut < 0 {
+				body, torn = nil, 1
+			} else if cut+1 != len(body) {
+				body, torn = body[:cut+1], 1
+			}
+		}
+		if err == nil && len(body) > 0 {
+			err = s.post(body)
+		}
+		if err != nil {
+			// A post failure is the ordinary hub-is-down case; any read error that
+			// is not "missing" may well be transient. Both leave the file in place
+			// and stop. Skipping ahead would break the oldest-first ordering this
+			// function promises, and a hub that is still down should not be
+			// hammered with the rest of the backlog.
 			s.mu.Lock()
 			s.lastErr = err
 			s.mu.Unlock()
-			return
+			break
 		}
 		_ = os.Remove(path)
-		s.mu.Lock()
-		s.stats.Replayed += int64(bytes.Count(body, []byte("\n")))
-		s.mu.Unlock()
+		done++
+		freed += e.size
+		replayed += int64(bytes.Count(body, []byte("\n")))
+		// The fragment is one event at most — it was the last line — and it is
+		// unrecoverable, so it is counted rather than silently discarded.
+		dropped += torn
 	}
+	if done == 0 {
+		return
+	}
+	s.mu.Lock()
+	s.spoolIdx = s.spoolIdx[done:]
+	s.spoolBytes -= freed
+	s.stats.Replayed += replayed
+	s.stats.Dropped += dropped
+	s.mu.Unlock()
 }
 
 // -- lifecycle ---------------------------------------------------------------
@@ -380,17 +607,9 @@ func (s *Shipper) Close() error {
 // Stats returns a snapshot, including how many batches are still spooled.
 func (s *Shipper) Stats() Stats {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	out := s.stats
-	s.mu.Unlock()
-	if s.cfg.SpoolDir != "" {
-		if entries, err := os.ReadDir(s.cfg.SpoolDir); err == nil {
-			for _, e := range entries {
-				if !e.IsDir() && strings.HasSuffix(e.Name(), ".ndjson") {
-					out.SpoolFile++
-				}
-			}
-		}
-	}
+	out.SpoolFile = len(s.spoolIdx)
 	return out
 }
 
