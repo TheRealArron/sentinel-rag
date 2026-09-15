@@ -34,6 +34,17 @@ set -euo pipefail
 AUDIT_LOG="${SENTINEL_AUDIT_LOG:-/var/lib/docker/volumes/sentinel-rag_sentinel-data/_data/audit.log}"
 STATE_FILE="${SENTINEL_RESPONDER_STATE:-/var/lib/sentinel/responder.state}"
 
+# The ingestor's own output. This script re-derives the score from here rather
+# than believing the one recorded in the engine's audit log.
+#
+# The audit log is written by the engine, so a score read from it is evidence
+# produced by the thing under review — re-checking it against itself proves
+# nothing. events.jsonl is written by the Go ingestor, which has no network
+# listener, no LLM client, and no way to be reached by a prompt. Reading the
+# score from there is what makes the host-side check independent rather than a
+# second reading of the same number.
+EVENTS_FILE="${SENTINEL_EVENTS:-/var/lib/docker/volumes/sentinel-rag_sentinel-data/_data/events.jsonl}"
+
 # The responder keeps its OWN audit trail, separate from the engine's audit.log
 # and from the journal. Two reasons: the engine's log is written by a container
 # the engine controls, so it is evidence produced by the thing under review; and
@@ -107,6 +118,16 @@ already_blocked() {
   ufw status | grep -qF "$1"
 }
 
+# The highest deterministic score the ingestor recorded for an address, or empty
+# if it recorded none. Correlated incidents are included: they are the ingestor's
+# own conclusion from its own rules, not the engine's.
+ingestor_score() {
+  [[ -r "$EVENTS_FILE" ]] || return 0
+  jq -r --arg ip "$1" \
+    'select(.source_ip == $ip) | .score' "$EVENTS_FILE" 2>/dev/null \
+    | sort -n | tail -1
+}
+
 applied=0
 processed=0
 
@@ -124,13 +145,27 @@ while IFS=$'\t' read -r ip score reason at; do
     continue
   fi
 
-  # The engine already checked this. We check it again because this script must
-  # be correct even if the engine is entirely compromised.
-  if [[ ! "$score" =~ ^[0-9]+$ ]] || (( score < MIN_SCORE )); then
-    log "REFUSED $ip — score '${score}' below host-side threshold $MIN_SCORE"
-    audit refused "$ip" "score below host-side threshold $MIN_SCORE" "$score"
+  # Re-derive the score from the ingestor's output rather than trusting the
+  # engine's audit entry. This script must be correct even if the engine is
+  # entirely compromised, and a compromised engine can write any number it likes
+  # into its own audit log.
+  ingested_score="$(ingestor_score "$ip")"
+  if [[ ! "$ingested_score" =~ ^[0-9]+$ ]]; then
+    log "REFUSED $ip — no event in $EVENTS_FILE carries a score for this address"
+    audit refused "$ip" "no ingested evidence" "${score}"
     continue
   fi
+  if (( ingested_score != score )); then
+    # Not fatal on its own — the engine's buffer is capped and its view can lag
+    # the file — but the number this script acts on is always the one it derived.
+    log "NOTE $ip — engine recorded score $score, ingestor output says $ingested_score"
+  fi
+  if (( ingested_score < MIN_SCORE )); then
+    log "REFUSED $ip — ingestor score $ingested_score below host-side threshold $MIN_SCORE"
+    audit refused "$ip" "score below host-side threshold $MIN_SCORE" "$ingested_score"
+    continue
+  fi
+  score="$ingested_score"
 
   if ! [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
     log "REFUSED $ip — not a valid address"

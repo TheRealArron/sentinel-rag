@@ -753,7 +753,7 @@ async function blockAddress(btn) {
   try {
     const result = await api("/api/response/block", {
       method: "POST",
-      body: JSON.stringify({ ip: ip, score: Number(btn.dataset.score) || 0, reason: "operator action from dashboard" })
+      body: JSON.stringify({ ip: ip, reason: "operator action from dashboard" })
     });
     const cls = result.executed ? "" : (result.allowed ? "warn" : "err");
     $("blockResult").innerHTML =

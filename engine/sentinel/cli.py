@@ -277,6 +277,109 @@ def cmd_ioc(args, engine: SentinelEngine, printer: Printer) -> int:
     return 0
 
 
+def cmd_eval_retrieval(args, engine: SentinelEngine, printer: Printer) -> int:
+    """Recall@k for the bilingual retriever, on whichever embedder is loaded.
+
+    Prints both floor settings. The floor-off column is ranking quality — what
+    the embedder can do. The floor-on column is what an operator receives, which
+    is better by construction and says nothing about the model.
+    """
+    from .retrieval_eval import evaluate, load_cases
+
+    cases = load_cases(Path(args.cases))
+    engine.index_all()
+    report = evaluate(engine, cases, k=args.k)
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+    printer.header("Retrieval evaluation")
+    printer.kv("embedder", f"{report['embedder']} (semantic={report['semantic']})")
+    printer.kv("vector backend", report["vector_backend"])
+    printer.kv("documents", report["documents"])
+    printer.kv("queries", report["queries"])
+
+    ks = report["floor_off"]["ks"]
+    header = "  {:<26} {:>7} " + " ".join("{:>8}" for _ in ks) + " {:>8}"
+    row = "  {:<26} {:>7} " + " ".join("{:>8.3f}" for _ in ks) + " {:>8.3f}"
+
+    for key, caption in (("floor_off", "per-language floor OFF — ranking quality"),
+                         ("floor_on", "per-language floor ON — what the operator receives")):
+        printer.line("")
+        printer.line(f"  {caption}")
+        printer.line(header.format("", "queries", *[f"hit@{k}" for k in ks], "MRR"))
+        block = report[key]
+        for entry in [block["overall"], block["cross_lingual"],
+                      *block["by_query_lang"], *block["by_origin"]]:
+            printer.line(row.format(
+                entry["label"], entry["queries"],
+                *[entry[f"hit@{k}"] for k in ks], entry["mrr"]))
+
+    misses = report["misses"]
+    printer.line("")
+    printer.line(f"  {len(misses)} miss(es) at k={args.k} with the floor off")
+    for miss in misses[: args.show_misses]:
+        printer.line(f"    {miss['id']} [{miss['lang']}] {miss['query'][:76]}")
+        printer.line(f"        wanted {miss['expected']}")
+        printer.line(f"        got    {miss['got']}")
+    return 0
+
+
+def cmd_feeds(args, engine: SentinelEngine, printer: Printer) -> int:
+    """Fetch a real advisory corpus.
+
+    `--source` is required rather than defaulting to "all", because the two
+    sources have different redistribution terms and the operator should be
+    choosing between them knowingly. See sentinel/feeds.py.
+    """
+    from .feeds import (
+        JPCERT_REDISTRIBUTION_NOTICE,
+        FeedError,
+        fetch_jvn,
+        fetch_nvd,
+        write_advisories,
+    )
+
+    out = Path(args.out) if args.out else Path(
+        "data/advisories/nvd" if args.source == "nvd" else "data/advisories/jvn-local"
+    )
+    try:
+        if args.source == "nvd":
+            advisories = fetch_nvd(days=args.days, limit=args.limit, keyword=args.keyword)
+        else:
+            advisories = fetch_jvn(limit=args.limit)
+    except FeedError as exc:
+        printer.line(f"feed error: {exc}")
+        return 1
+
+    if args.dry_run:
+        printer.header(f"{args.source}: {len(advisories)} advisory document(s) (dry run)")
+        for advisory in advisories[:10]:
+            printer.kv(advisory.id, advisory.title[:90])
+        return 0
+
+    written = write_advisories(advisories, out)
+    if args.json:
+        print(json.dumps({
+            "source": args.source, "written": len(written), "out": str(out),
+            "ids": [a.id for a in advisories],
+        }, ensure_ascii=False, indent=2))
+    else:
+        printer.header(f"{args.source} → {out}")
+        printer.kv("documents", len(written))
+        for advisory in advisories[:10]:
+            printer.kv(advisory.id, advisory.title[:90])
+        if len(advisories) > 10:
+            printer.line(f"  … and {len(advisories) - 10} more")
+
+    if args.source == "jvn":
+        printer.line("")
+        for line in JPCERT_REDISTRIBUTION_NOTICE.splitlines():
+            printer.line(f"  {line}")
+    return 0
+
+
 def cmd_sigma(args, engine: SentinelEngine, printer: Printer) -> int:
     """Compile Sigma YAML into the JSON bundle the Go ingestor loads.
 
@@ -510,7 +613,8 @@ def cmd_warm(args, engine: SentinelEngine, printer: Printer) -> int:
 
 
 def cmd_block(args, engine: SentinelEngine, printer: Printer) -> int:
-    action = engine.responder.block(args.ip, score=args.score, reason=args.reason, dry_run=args.dry_run or None)
+    action = engine.block(args.ip, reason=args.reason, dry_run=args.dry_run or None,
+                          event_id=args.event_id)
     if args.json:
         print(json.dumps(action.to_dict(), ensure_ascii=False, indent=2))
         return 0 if action.allowed else 1
@@ -637,6 +741,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-score", type=int, default=60, help="ignore events below this score")
     p.set_defaults(func=cmd_analyze)
 
+    p = sub.add_parser("eval-retrieval", help="recall@k for the bilingual retriever")
+    p.add_argument("--cases", default="data/eval/retrieval.jsonl",
+                   help="query -> expected-document pairs")
+    p.add_argument("--k", type=int, default=5, help="retrieve this many per query")
+    p.add_argument("--show-misses", type=int, default=8, help="how many misses to print")
+    p.set_defaults(func=cmd_eval_retrieval)
+
+    p = sub.add_parser("feeds", help="fetch a real advisory corpus (NVD / JVN)")
+    p.add_argument("--source", required=True, choices=["nvd", "jvn"],
+                   help="nvd is public domain and committable; jvn is (c) JPCERT/CC and IPA "
+                        "and must not be redistributed without prior coordination")
+    p.add_argument("--days", type=int, default=30, help="NVD publication window")
+    p.add_argument("--limit", type=int, default=40, help="maximum documents to fetch")
+    p.add_argument("--keyword", default="", help="narrow the NVD pull to a product area")
+    p.add_argument("--out", default="", help="output directory (defaults per source)")
+    p.add_argument("--dry-run", action="store_true", help="list what would be written")
+    p.set_defaults(func=cmd_feeds)
+
     p = sub.add_parser("sigma", help="compile Sigma rules for the ingestor (Phase 11)")
     p.add_argument("--rules", default="rules/sigma", help="directory of Sigma YAML rules")
     p.add_argument("--out", default="rules/external/sigma.json",
@@ -693,7 +815,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("block", help="block a source address via UFW")
     p.add_argument("ip")
-    p.add_argument("--score", type=int, required=True, help="deterministic ingestor score for the trigger")
+    p.add_argument("--event-id", default="",
+                   help="raw_sha256 of the event justifying the block; "
+                        "defaults to the highest-scoring event for this address")
     p.add_argument("--reason", default="operator request via CLI")
     p.add_argument("--dry-run", action="store_true", help="rehearse even in enforce mode")
     p.set_defaults(func=cmd_block)

@@ -26,7 +26,7 @@ from .config import Settings, get_settings
 from .embeddings import Embedder, get_embedder
 from .indexer import Indexer, IndexStats
 from .llm import LLM, get_llm
-from .response import Responder
+from .response import Responder, ResponseAction
 from .retriever import ParentDocumentRetriever
 from .schemas import Alert, LogEvent, Retrieved, severity_rank
 from .store import ParentStore, VectorStore, get_parent_store, get_vector_store
@@ -131,6 +131,28 @@ class EventBuffer:
             if len(results) >= limit:
                 break
         return results
+
+    def evidence_for(self, ip: str, event_id: str = "") -> LogEvent | None:
+        """The highest-scoring ingested event that justifies blocking ``ip``.
+
+        This is the provenance step for active response. The score behind a
+        firewall action has to be one the Go ingestor's deterministic rules
+        actually produced for this address — not a number a caller supplied.
+        Returning None means there is no such event, and the block is refused.
+
+        ``event_id`` pins the decision to one specific ``raw_sha256``. The event
+        must still belong to ``ip``, so naming an unrelated high-scoring event
+        does not transfer its score onto another address.
+        """
+        best: LogEvent | None = None
+        for event in self.all():
+            if event.source_ip != ip:
+                continue
+            if event_id and event.raw_sha256 != event_id:
+                continue
+            if best is None or event.score > best.score:
+                best = event
+        return best
 
     def summary(self) -> dict[str, Any]:
         events = self.all()
@@ -358,6 +380,34 @@ class SentinelEngine:
 
         self.events.refresh()
         return build_graph(self.events.query(limit=limit, min_score=min_score))
+
+    def block(self, ip: str, reason: str = "", dry_run: bool | None = None,
+              event_id: str = "") -> ResponseAction:
+        """Block ``ip``, with the score resolved from ingested evidence.
+
+        The score is deliberately *not* a parameter. It used to arrive in the
+        HTTP request body, which meant the system's central safety property —
+        "the threshold is checked against the deterministic ingestor score, never
+        the model's opinion" — was a convention rather than a control. Any caller
+        that could reach the endpoint could assert any score for any address.
+
+        Resolving it here instead means a block requires an event the Go ingestor
+        actually produced for that address. There is no argument a caller can
+        pass to skip that.
+        """
+        self.events.refresh()
+        evidence = self.events.evidence_for(ip, event_id)
+        return self.responder.block(
+            ip,
+            score=None if evidence is None else evidence.score,
+            reason=reason or (
+                f"deterministic rule '{evidence.rule or 'none'}'" if evidence else "unevidenced"
+            ),
+            dry_run=dry_run,
+            # On a refusal this is the event the caller *asked* for; on a block it
+            # is the event the score came from.
+            evidence_id=event_id if evidence is None else evidence.raw_sha256,
+        )
 
     def index_all(self, rebuild: bool = False) -> IndexStats:
         if rebuild:

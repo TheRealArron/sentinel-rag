@@ -44,10 +44,10 @@ class TestGlobalFlagPositions:
         assert args.query == "brute force"
 
     def test_json_works_on_subcommands_with_required_flags(self):
-        args = build_parser().parse_args(["block", "203.0.113.45", "--score", "97", "--json"])
+        args = build_parser().parse_args(["block", "203.0.113.45", "--event-id", "abc123", "--json"])
         assert args.json is True
         assert args.ip == "203.0.113.45"
-        assert args.score == 97
+        assert args.event_id == "abc123"
 
 
 class TestLangFlag:
@@ -80,16 +80,23 @@ class TestSubcommandArguments:
         with pytest.raises(SystemExit):
             build_parser().parse_args(["nope"])
 
-    def test_block_requires_a_score(self):
+    def test_block_does_not_accept_a_score(self):
+        # The score is resolved from the ingested event, so there is no flag for
+        # it. An operator who wants to assert one has to change the event store.
         with pytest.raises(SystemExit):
-            build_parser().parse_args(["block", "203.0.113.45"])
+            build_parser().parse_args(["block", "203.0.113.45", "--score", "99"])
+
+    def test_block_needs_only_an_address(self):
+        args = build_parser().parse_args(["block", "203.0.113.45"])
+        assert args.ip == "203.0.113.45"
+        assert args.event_id == ""
 
     def test_every_subcommand_binds_a_handler(self):
         parser = build_parser()
         for command in [*SUBCOMMANDS, "search", "block", "unblock"]:
             argv = {
                 "search": ["search", "q"],
-                "block": ["block", "203.0.113.45", "--score", "99"],
+                "block": ["block", "203.0.113.45"],
                 "unblock": ["unblock", "203.0.113.45"],
             }.get(command, [command])
             args = parser.parse_args(argv)

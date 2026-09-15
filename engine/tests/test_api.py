@@ -173,28 +173,94 @@ class TestResponseEndpoints:
         _s, payload = get(router, "/api/response/status")
         assert payload["mode"] == "dry-run"
 
-    def test_block_requires_a_score(self, router):
-        status, payload = post(router, "/api/response/block", {"ip": "203.0.113.45"})
+    def test_a_caller_supplied_score_is_refused_outright(self, router):
+        # The endpoint used to *require* this field and act on it, which made the
+        # score-90 threshold a convention rather than a control. Accepting and
+        # ignoring it would be almost as bad: a caller would believe it mattered.
+        status, payload = post(
+            router, "/api/response/block", {"ip": "203.0.113.45", "score": 99}
+        )
         assert status == 400
-        assert "'score' is required" in payload["error"]
+        assert "'score' is not accepted" in payload["error"]
 
     def test_block_rejects_a_non_address(self, router):
-        assert post(router, "/api/response/block", {"ip": "evil; rm -rf /", "score": 99})[0] == 400
+        assert post(router, "/api/response/block", {"ip": "evil; rm -rf /"})[0] == 400
 
     def test_allowlisted_block_is_403(self, router):
-        status, payload = post(router, "/api/response/block", {"ip": "192.168.1.1", "score": 99})
+        status, payload = post(router, "/api/response/block", {"ip": "192.168.1.1"})
         assert status == 403
         assert payload["allowed"] is False
+        # Specifically the allowlist, not the evidence check that now precedes
+        # the threshold — this address has no ingested event either, and the
+        # refusal must still name the more important reason.
+        assert "allowlist" in payload["reason"].lower()
 
     def test_dry_run_block_succeeds(self, router):
-        status, payload = post(router, "/api/response/block", {"ip": "203.0.113.45", "score": 99})
+        status, payload = post(router, "/api/response/block", {"ip": "203.0.113.45"})
         assert status == 200
         assert payload["executed"] is False
+        # 97, from the correlated compromise incident in the fixture.
+        assert payload["score"] == 97
 
     def test_history_records_the_attempt(self, router):
-        post(router, "/api/response/block", {"ip": "203.0.113.45", "score": 99})
+        post(router, "/api/response/block", {"ip": "203.0.113.45"})
         _s, payload = get(router, "/api/response/history")
         assert payload["actions"][0]["target"] == "203.0.113.45"
+
+
+class TestBlockProvenance:
+    """The score behind a firewall action must come from an ingested event."""
+
+    def test_an_address_with_no_ingested_event_is_refused(self, router):
+        status, payload = post(router, "/api/response/block", {"ip": "198.51.100.200"})
+        assert status == 403
+        assert payload["allowed"] is False
+        assert payload["reason"] == "no deterministic evidence for this address"
+        assert payload["score"] == -1
+
+    def test_the_score_comes_from_the_event_not_the_caller(self, router):
+        # 198.51.100.7 is real but scores 26 in the fixture. Under the old
+        # contract a caller could simply say 99 and the block went through.
+        status, payload = post(router, "/api/response/block", {"ip": "198.51.100.7"})
+        assert status == 403
+        assert payload["reason"] == "score below threshold"
+        assert payload["score"] == 26
+
+    def test_event_id_pins_the_decision_to_one_event(self, router, sample_event_dicts):
+        best = max(
+            (r for r in sample_event_dicts if r.get("source_ip") == "203.0.113.45"),
+            key=lambda r: r["score"],
+        )
+        status, payload = post(
+            router, "/api/response/block",
+            {"ip": "203.0.113.45", "event_id": best["raw_sha256"]},
+        )
+        assert status == 200
+        assert payload["score"] == best["score"]
+        assert payload["evidence_id"] == best["raw_sha256"]
+
+    def test_a_high_scoring_event_cannot_be_borrowed_by_another_address(
+        self, router, sample_event_dicts
+    ):
+        # The score-100 honeytoken event belongs to 198.51.100.23. Naming it
+        # while asking to block a different address must not transfer its score.
+        honey = max(sample_event_dicts, key=lambda r: r["score"])
+        assert honey["source_ip"] == "198.51.100.23" and honey["score"] == 100
+
+        status, payload = post(
+            router, "/api/response/block",
+            {"ip": "198.51.100.7", "event_id": honey["raw_sha256"]},
+        )
+        assert status == 403
+        assert payload["reason"] == "no deterministic evidence for this address"
+        assert payload["score"] == -1
+
+    def test_the_audit_trail_records_which_event_justified_the_block(self, router):
+        post(router, "/api/response/block", {"ip": "203.0.113.45"})
+        _s, payload = get(router, "/api/response/history")
+        entry = payload["actions"][0]
+        assert entry["evidence_id"], "audit entry has no provenance link"
+        assert len(entry["evidence_id"]) == 64, "evidence_id should be a raw_sha256"
 
 
 class TestAuth:
@@ -208,26 +274,26 @@ class TestAuth:
         assert get(secured, "/api/events")[0] == 200
 
     def test_protected_endpoint_without_a_token_is_401(self, secured):
-        status, payload = post(secured, "/api/response/block", {"ip": "203.0.113.45", "score": 99})
+        status, payload = post(secured, "/api/response/block", {"ip": "203.0.113.45"})
         assert status == 401
         assert "SENTINEL_API_TOKEN" in payload["error"]
 
     def test_wrong_token_is_401(self, secured):
         status, _ = post(
-            secured, "/api/response/block", {"ip": "203.0.113.45", "score": 99},
+            secured, "/api/response/block", {"ip": "203.0.113.45"},
             headers={"authorization": "Bearer wrong"},
         )
         assert status == 401
 
     def test_correct_token_is_accepted(self, secured):
         status, _ = post(
-            secured, "/api/response/block", {"ip": "203.0.113.45", "score": 99},
+            secured, "/api/response/block", {"ip": "203.0.113.45"},
             headers={"authorization": "Bearer s3cret-token"},
         )
         assert status == 200
 
     def test_no_token_configured_means_no_auth(self, router):
-        assert post(router, "/api/response/block", {"ip": "203.0.113.45", "score": 99})[0] == 200
+        assert post(router, "/api/response/block", {"ip": "203.0.113.45"})[0] == 200
 
 
 class TestEventBuffer:

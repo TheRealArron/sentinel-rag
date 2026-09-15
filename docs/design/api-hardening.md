@@ -56,3 +56,51 @@ The two fixes that do work:
 
 `SENTINEL_API_TOKEN` is compared with `hmac.compare_digest`. A plain `!=` on a
 secret leaks its length and prefix through timing.
+
+
+## The score behind a block is looked up, not asserted
+
+The pre-flight pass above found the CSRF hole. It did not find this one, which
+sat one layer further in and is the same shape: a safety property enforced by
+what the caller *says* rather than by what the system can *check*.
+
+`POST /api/response/block` required a `score` field and acted on it:
+
+```python
+score = _as_int(request.body.get("score"), -1)   # from the request body
+```
+
+Every layer downstream then re-checked that number against the threshold and
+agreed with itself. The host-side responder — the component whose entire purpose
+is to be correct even if the engine is compromised — read `.score` out of the
+engine's own audit log, so its "independent" re-check was a second reading of the
+caller's number.
+
+The README claimed the threshold was *"checked against the deterministic ingestor
+score, never the model's opinion"*. That was true of the intent and false of the
+mechanism. Nothing verified the score came from the ingestor at all.
+
+**Now:** the endpoint takes an address and, optionally, an `event_id`. The engine
+resolves the highest-scoring event the ingestor recorded for that address and
+uses *its* score. `score` in the request body is a 400, not a silently ignored
+field — a caller that thinks it is supplying evidence should be told it is not.
+
+Three properties follow, each with a test:
+
+- An address the ingestor has never seen cannot be blocked, at any score.
+- An `event_id` must belong to the address being blocked, so the score-100
+  honeytoken event for one host cannot be borrowed to block another.
+- The audit trail records `evidence_id`, so every block has a provenance link
+  back to the log line that justified it.
+
+**The host-side responder re-derives the score from `events.jsonl`**, not from
+the engine's audit entry. That file is written by the Go ingestor, which has no
+network listener and no LLM client; the audit log is written by the component
+under review. Re-reading a number the engine wrote and calling it independent
+verification was the flaw in the original design, and it is the reason the script
+now reads the ingestor's output directly.
+
+The engine's recorded score and the re-derived one can legitimately differ — the
+engine's buffer is capped and its view can lag the file — so a mismatch is logged
+rather than treated as an attack, and the number the script acts on is always the
+one it derived itself.

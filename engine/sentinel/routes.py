@@ -410,17 +410,24 @@ def response_block(router: Router, request: Request) -> Response:
     ip = str(request.body.get("ip") or "").strip()
     if not ip or not _IP_RE.match(ip):
         raise BadRequest("'ip' must be a valid IPv4 or IPv6 address")
-    score = _as_int(request.body.get("score"), -1)
-    if score < 0:
-        # The score must come from the ingestor's deterministic rules, so the
-        # caller has to state it; defaulting it would let a block through with
-        # no evidence behind it.
-        raise BadRequest("'score' is required: pass the deterministic ingestor score for the triggering event")
+    # There is deliberately no 'score' parameter. It used to be required and was
+    # taken at face value, which made the threshold a convention rather than a
+    # control: any caller reaching this endpoint could assert score 99 for any
+    # address. The score is now resolved from the ingested events, so a block
+    # requires evidence the Go ingestor actually produced. An optional
+    # 'event_id' pins the decision to one specific event.
+    if "score" in request.body:
+        raise BadRequest(
+            "'score' is not accepted: the deterministic score is resolved from the "
+            "ingested event for this address. Pass 'event_id' to pin a specific event."
+        )
+    event_id = str(request.body.get("event_id") or "").strip()
     reason = str(request.body.get("reason") or "").strip() or "operator request via API"
     dry_run = request.body.get("dry_run")
-    action = router.engine.responder.block(
-        ip, score=score, reason=reason,
+    action = router.engine.block(
+        ip, reason=reason,
         dry_run=None if dry_run is None else bool(dry_run),
+        event_id=event_id,
     )
     return Response(200 if action.allowed else 403, action.to_dict())
 

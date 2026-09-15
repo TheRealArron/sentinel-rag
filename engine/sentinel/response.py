@@ -57,6 +57,11 @@ class ResponseAction:
     # host-side responder can re-check the threshold itself instead of trusting
     # that the engine already did.
     score: int = -1
+    # The raw_sha256 of the event the score came from. This is the provenance
+    # link: it lets the host-side responder find the same event in events.jsonl
+    # and re-derive the score from the ingestor's output rather than believing
+    # the number recorded here.
+    evidence_id: str = ""
     command: list[str] = field(default_factory=list)
     at: str = field(default_factory=utcnow_iso)
 
@@ -70,6 +75,7 @@ class ResponseAction:
             "reason": self.reason,
             "detail": self.detail,
             "score": self.score,
+            "evidence_id": self.evidence_id,
             "command": list(self.command),
             "at": self.at,
         }
@@ -122,11 +128,14 @@ class Responder:
 
     # -- actions -----------------------------------------------------------
 
-    def block(self, ip: str, score: int, reason: str, dry_run: bool | None = None) -> ResponseAction:
+    def block(self, ip: str, score: int | None, reason: str, dry_run: bool | None = None,
+              evidence_id: str = "") -> ResponseAction:
         """Add a deny rule for ``ip``, subject to every safety check.
 
-        ``score`` must be the deterministic ingestor score for the triggering
-        event, not a model-derived number.
+        ``score`` is the deterministic ingestor score for ``evidence_id``,
+        resolved from the event store by :meth:`SentinelEngine.block`; ``None``
+        means no ingested event backs this address and the block is refused.
+        Callers do not get to assert the number — see that method for why.
         """
         # dry_run=True forces a rehearsal even in enforce mode; None defers to
         # configuration. dry_run=False does not grant enforcement on its own —
@@ -137,7 +146,9 @@ class Responder:
             return self._audit(
                 ResponseAction(
                     action="block", target=ip, allowed=False, executed=False,
-                    mode=mode, reason=why, detail=detail, score=score,
+                    mode=mode, reason=why, detail=detail,
+                    score=-1 if score is None else score,
+                    evidence_id=evidence_id,
                 )
             )
 
@@ -155,6 +166,14 @@ class Responder:
             )
         if address.is_multicast or address.is_unspecified:
             return refuse("target is not a unicast host address")
+        if score is None:
+            return refuse(
+                "no deterministic evidence for this address",
+                f"event {evidence_id[:16]!r} was not found, or does not belong to {ip}"
+                if evidence_id
+                else f"no ingested event for {ip} carries a deterministic score; "
+                     f"the ingestor must have observed this address before it can be blocked",
+            )
         if score < self.settings.response_min_score:
             return refuse(
                 "score below threshold",
@@ -176,7 +195,7 @@ class Responder:
                 return self._audit(
                     ResponseAction(
                         action="block", target=ip, allowed=True, executed=False, mode=mode,
-                        reason=reason, score=score,
+                        reason=reason, score=score, evidence_id=evidence_id,
                         detail="dry-run: the command below was not executed",
                         command=command,
                     )
@@ -206,7 +225,7 @@ class Responder:
                 return self._audit(
                     ResponseAction(
                         action="block", target=ip, allowed=True, executed=False, mode=mode,
-                        reason=reason, score=score,
+                        reason=reason, score=score, evidence_id=evidence_id,
                         detail=f"ufw exited {completed.returncode}: {(completed.stderr or completed.stdout).strip()[:400]}",
                         command=command,
                     )
@@ -216,7 +235,7 @@ class Responder:
             return self._audit(
                 ResponseAction(
                     action="block", target=ip, allowed=True, executed=True, mode=mode,
-                    reason=reason, score=score,
+                    reason=reason, score=score, evidence_id=evidence_id,
                     detail=(completed.stdout or "").strip()[:400],
                     command=command,
                 )
