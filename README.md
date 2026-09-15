@@ -208,7 +208,11 @@ the two languages.
 >
 > The likeliest reason cross-lingual lags is a same-language preference: on every
 > query with a relevant document in each language where both were retrieved, the
-> one in the query's language scored higher — 22 of 22 with e5-large.
+> one in the query's language scored higher — 22 of 22 with e5-large. The two
+> directions are not symmetric either: English queries find the Japanese answer
+> in the top five in 6 of 20 cases, Japanese queries find the English answer in
+> 12 of 12. Part of that is likely the corpus rather than the model — an English
+> query competes with 42 English documents, a Japanese one with five Japanese ones.
 >
 > **A known defect was present in every number above.** The token-count estimator
 > that sizes chunks underestimates English, so 9 of 93 child chunks exceed e5's
@@ -940,12 +944,18 @@ make bench       # ingest throughput
 ```
 
 **Retrieval is measured, not asserted.** `make retrieval-report` runs 47
-query→expected-document pairs over the 47-document corpus and reports hit@1/3/5
-and MRR, split by query language, by cross-lingual answerability, and by whether
-the query was derived from an *event* (32 of them, written from the rule set and
-sample log before the corpus was consulted) or from *software* (15, the weaker
-half, labelled so). It reports with the per-language floor on and off, because
-with the floor on a cross-lingual "hit" is the floor, not the model.
+queries, each with one to three expected documents, over the 47-document corpus
+and reports hit@1/3/5 and MRR, split by query language, by cross-lingual
+answerability, and by whether the query was derived from an *event* (32 of them,
+written from the rule set and sample log before the corpus was consulted) or from
+*software* (15, the weaker half, labelled so). It reports with the per-language
+floor on and off, because with the floor on a cross-lingual "hit" is the floor,
+not the model.
+
+It measures whichever embedder is installed — the dependency-free fallback by
+default. To measure the real model, install `engine/requirements.txt` and set
+`SENTINEL_EMBEDDING_BACKEND=e5`, which loads `multilingual-e5-large`; from a
+clean index that took about 31 minutes on CPU, most of it embedding the corpus.
 
 **Detection is measured, not asserted.** `make detection-report` runs the corpus
 in `ingestor/internal/enrich/testdata/detection/`: 66 cases pinning, for every one
