@@ -35,6 +35,14 @@ def cases():
     return load_cases(REPO_ROOT / "data" / "eval" / "retrieval.jsonl")
 
 
+def test_the_default_cases_path_does_not_depend_on_the_working_directory(tmp_path, monkeypatch):
+    # `make retrieval-report` runs from engine/, so a cwd-relative default
+    # resolved to engine/data/eval/ and the documented command failed. CI passes
+    # an explicit --cases and never saw it.
+    monkeypatch.chdir(tmp_path)
+    assert len(load_cases()) >= 30
+
+
 class TestTheEvalSetItself:
     def test_it_is_the_promised_size_and_shape(self, cases):
         assert 30 <= len(cases) <= 60, f"{len(cases)} pairs"

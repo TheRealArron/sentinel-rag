@@ -58,7 +58,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-DEFAULT_EVAL_PATH = Path("data/eval/retrieval.jsonl")
+from .config import repo_root
+
+# Anchored to the repo root, like every data path in config.py. It used to be
+# cwd-relative, so `make retrieval-report` — which runs from engine/ — looked
+# for engine/data/eval/ and failed; CI passed an explicit --cases and never saw it.
+DEFAULT_EVAL_PATH = repo_root() / "data" / "eval" / "retrieval.jsonl"
 DEFAULT_KS = (1, 3, 5)
 
 

@@ -286,7 +286,7 @@ def cmd_eval_retrieval(args, engine: SentinelEngine, printer: Printer) -> int:
     """
     from .retrieval_eval import evaluate, load_cases
 
-    cases = load_cases(Path(args.cases))
+    cases = load_cases(Path(args.cases)) if args.cases else load_cases()
     engine.index_all()
     report = evaluate(engine, cases, k=args.k)
 
@@ -742,8 +742,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_analyze)
 
     p = sub.add_parser("eval-retrieval", help="recall@k for the bilingual retriever")
-    p.add_argument("--cases", default="data/eval/retrieval.jsonl",
-                   help="query -> expected-document pairs")
+    p.add_argument("--cases", default=None,
+                   help="query -> expected-document pairs (default: data/eval/retrieval.jsonl in the repo)")
     p.add_argument("--k", type=int, default=5, help="retrieve this many per query")
     p.add_argument("--show-misses", type=int, default=8, help="how many misses to print")
     p.set_defaults(func=cmd_eval_retrieval)
