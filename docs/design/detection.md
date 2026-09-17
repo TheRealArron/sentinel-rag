@@ -473,8 +473,69 @@ lower score by trying enough usernames. And the compromise path gets its own
 cooldown, separate from the brute-force one, so a busy shared address cannot
 re-raise the incident every few seconds.
 
+### One key cannot see a distributed spray
+
+Every correlation above keys on the source address, and that key has a blind
+spot that is structural rather than a matter of tuning. `Observe` looked up
+`c.state[ev.SourceIP]`, so N addresses making one attempt each against one
+account left N states holding a single failure apiece. No per-source threshold
+is approached from any of them, and the campaign is silent at any volume — the
+same shape of blindness the username defect had, arrived at from the other
+direction.
+
+So correlation now runs on a second key. Keyed on account, the axis that moves
+is the number of distinct *sources* failing against it:
+
+| Case | Rule | Score |
+|---|---|---:|
+| ≥5 distinct sources against one account in 60s, any of them public | `correlated_distributed_spray` | 84 |
+| the same, all sources internal | `correlated_distributed_auth_failure` | 70 |
+
+The split is the judgement `loginAfterFailures` already makes, applied to the
+other key. Five internal addresses failing against one account is more often a
+fleet of application servers retrying a credential that was rotated an hour ago,
+and a syslog line cannot distinguish that from the attack. It is still reported —
+a spray launched from inside the perimeter is the one that matters most — but it
+lands below the score that acts without a human, and its message names the
+benign explanation.
+
+Neither pass can raise the other's finding: one source making many attempts
+never leaves a distinct-source count of 1, and many sources making one attempt
+each never approach `FailureThreshold`. Each has its own clock and its own
+cooldown.
+
+The account key is chosen by whoever is attacking, which is the unbounded-state
+class `scaling.md` closed elsewhere, so it gets the same treatment:
+`MaxTrackedAccounts` (4096) bounds the map with LRU eviction, and
+`maxSourcesPerAccount` (64) bounds each entry. Both sit far above
+`SprayThreshold`, so saturating either cannot suppress a real spray — it only
+makes the reported source count read as a floor (`>=64`).
+
+Measured on a six-line spray (six public sources, one attempt each against
+`svc-deploy`, inside 30s), run through the built binary:
+
+```
+pre-change binary:  6 events, 0 incidents
+post-change binary: 6 events, 1 incident
+  score= 84 critical correlated_distributed_spray  distinct_sources=5 public_sources=5
+```
+
+Only 5 of the 6 sources are named: the sixth attempt falls inside the cooldown.
+False positives did not move — `data/baseline.log` (604 lines) and the benign
+corpus (108 lines) each produced 0 incidents both before and after, and the
+benign corpus's count of lines scoring ≥40 stayed at 1.
+
 ## What this does not fix
 
+- **A spray slower than the window is still invisible.** The detection is ≥5
+  distinct sources inside 60s; one attempt per source every 30 seconds never
+  accumulates, and `TestSpraySourcesOutsideWindowDoNotAccumulate` pins that as
+  intended behaviour rather than an oversight. A patient attacker is bounded by
+  the window, exactly as they are on the source key.
+- **The account key is the literal string.** `admin` and `Admin` are two
+  accounts to this correlator. Linux usernames are case-sensitive, so that
+  matches the host's own view, but an attacker alternating case would split
+  their campaign across keys.
 - **`session_opened` / `session_closed` remain unfiltered by process** and match
   on any daemon. They score 16 and 10, below anything that owns a line, so they
   cannot take a verdict — but that is a safety argument resting on score

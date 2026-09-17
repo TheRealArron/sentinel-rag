@@ -307,7 +307,10 @@ Three hard limits are applied to every response, and each has a test:
 
 A single `Failed password` is noise; the internet knocks on port 22 all day. The
 correlator is stateful, time-ordered, and memory-bounded (LRU-capped, so an
-attacker rotating source addresses cannot grow the heap):
+attacker rotating source addresses cannot grow the heap). It runs on two keys,
+because one key can only see one shape of attack — many failures from one
+*source* is a brute force, many *sources* against one account is a spray, and
+the second is invisible to the first by construction:
 
 | Signal | Score |
 |---|---|
@@ -315,6 +318,8 @@ attacker rotating source addresses cannot grow the heap):
 | Five failures from one source in 60s, across ≥3 usernames | **92** — `correlated_brute_force` |
 | A success for **an account that source was guessing at** | **97** — `correlated_successful_login_after_bruteforce` |
 | A success for an account it never touched | **74** — `correlated_login_from_attacking_source` |
+| Five **distinct sources** against one account in 60s | **84** — `correlated_distributed_spray` |
+| The same, with every source internal | **70** — `correlated_distributed_auth_failure` |
 
 That last row is a false positive the audit found and the fix removed. Behind
 CGNAT or a corporate NAT, an attacker's failures and a colleague's login share

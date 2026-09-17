@@ -449,3 +449,251 @@ func hasTag(ev *event.Event, tag string) bool {
 	}
 	return false
 }
+
+// ---------------------------------------------------------------------------
+// Distributed spraying: the account-keyed pass.
+//
+// Everything above this point keys on the source address, and that key cannot
+// see the attack these tests describe. N addresses making one attempt each
+// against one account leave N sourceStates holding a single failure apiece, so
+// no per-source threshold is ever approached and the campaign is silent.
+
+// publicIPFor generates distinct routable addresses, so scope() reads "public"
+// and the spray lands on the higher-severity branch. ipFor's 10.0.0.0/8 is
+// private and deliberately exercises the other one.
+func publicIPFor(i int) string {
+	return "198.51." + itoa((i/256)%256) + "." + itoa(i%256)
+}
+
+func TestDistributedSprayAcrossSources(t *testing.T) {
+	c := New(Config{FailureThreshold: 5, Window: time.Minute, Cooldown: time.Hour, SprayThreshold: 5})
+
+	var got []*event.Event
+	for i := 0; i < 5; i++ {
+		// One attempt each, from five different addresses, against one account.
+		got = append(got, c.Observe(failure(publicIPFor(i), "svc-deploy"), base.Add(time.Duration(i)*time.Second))...)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d incidents, want exactly 1 (the spray, and no brute force)", len(got))
+	}
+	inc := got[0]
+	if inc.Rule != "correlated_distributed_spray" {
+		t.Errorf("Rule = %q, want correlated_distributed_spray", inc.Rule)
+	}
+	if inc.Severity != event.SeverityCritical {
+		t.Errorf("Severity = %q (score %d), want critical", inc.Severity, inc.Score)
+	}
+	if inc.Fields["distinct_sources"] != "5" {
+		t.Errorf("distinct_sources = %q, want 5", inc.Fields["distinct_sources"])
+	}
+	if inc.Fields["public_sources"] != "5" {
+		t.Errorf("public_sources = %q, want 5", inc.Fields["public_sources"])
+	}
+	if inc.Fields["targeted_account"] != "svc-deploy" {
+		t.Errorf("targeted_account = %q", inc.Fields["targeted_account"])
+	}
+	if inc.Process != "sentinel-correlator" {
+		t.Errorf("Process = %q", inc.Process)
+	}
+}
+
+func TestDistributedSprayNeedsTheThreshold(t *testing.T) {
+	c := New(Config{FailureThreshold: 5, Window: time.Minute, Cooldown: time.Hour, SprayThreshold: 5})
+	for i := 0; i < 4; i++ {
+		if inc := c.Observe(failure(publicIPFor(i), "svc-deploy"), base.Add(time.Duration(i)*time.Second)); len(inc) != 0 {
+			t.Fatalf("incident fired at %d distinct sources, threshold is 5", i+1)
+		}
+	}
+}
+
+// The whole point of the second key is that it is per account. Five sources
+// spread across five accounts is ordinary internet background noise, not a
+// spray against anybody.
+func TestDistributedSprayIsPerAccount(t *testing.T) {
+	c := New(Config{FailureThreshold: 5, Window: time.Minute, Cooldown: time.Hour, SprayThreshold: 5})
+	for i := 0; i < 5; i++ {
+		inc := c.Observe(failure(publicIPFor(i), fmt.Sprintf("user%d", i)), base.Add(time.Duration(i)*time.Second))
+		if len(inc) != 0 {
+			t.Fatalf("incident fired for one source against one account (attempt %d)", i+1)
+		}
+	}
+}
+
+// The two keys must not double-report. One source hammering one account is a
+// brute force and nothing else: its distinct-source count never leaves 1.
+func TestManyFailuresFromOneSourceAreNotASpray(t *testing.T) {
+	c := New(Config{FailureThreshold: 5, Window: time.Minute, Cooldown: time.Hour, SprayThreshold: 5})
+	var got []*event.Event
+	for i := 0; i < 10; i++ {
+		got = append(got, c.Observe(failure("203.0.113.45", "root"), base.Add(time.Duration(i)*time.Second))...)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d incidents, want 1", len(got))
+	}
+	if got[0].Rule != "correlated_brute_force" {
+		t.Errorf("Rule = %q, want correlated_brute_force", got[0].Rule)
+	}
+	if ast := c.accounts["root"]; ast != nil && len(ast.sources) != 1 {
+		t.Errorf("distinct sources = %d, want 1", len(ast.sources))
+	}
+}
+
+func TestSpraySourcesOutsideWindowDoNotAccumulate(t *testing.T) {
+	c := New(Config{FailureThreshold: 5, Window: 60 * time.Second, Cooldown: time.Hour, SprayThreshold: 5})
+	// A fresh source every 30s: never 5 distinct inside any 60s window.
+	for i := 0; i < 20; i++ {
+		if inc := c.Observe(failure(publicIPFor(i), "root"), base.Add(time.Duration(i)*30*time.Second)); len(inc) != 0 {
+			t.Fatalf("slow drip across sources triggered a spray at attempt %d", i+1)
+		}
+	}
+}
+
+func TestSprayHasItsOwnCooldown(t *testing.T) {
+	c := New(Config{FailureThreshold: 100, Window: time.Minute, Cooldown: 5 * time.Minute, SprayThreshold: 5})
+	total := 0
+	// 60 attempts from rotating sources over 60s: many thresholds crossed, one
+	// alert allowed.
+	for i := 0; i < 60; i++ {
+		total += len(c.Observe(failure(publicIPFor(i), "root"), base.Add(time.Duration(i)*time.Second)))
+	}
+	if total != 1 {
+		t.Errorf("got %d incidents, want 1 (cooldown should suppress the rest)", total)
+	}
+}
+
+// An account name is chosen by whoever is attacking, exactly like the usernames
+// in TestPerSourceStateIsBounded. Keying new state on it reintroduces the
+// unbounded-state class unless it is bounded here too.
+func TestAccountStateIsBounded(t *testing.T) {
+	t.Run("invented account names cannot grow the heap without limit", func(t *testing.T) {
+		const max = 100
+		c := New(Config{FailureThreshold: 5, Window: time.Hour, Cooldown: time.Hour, MaxTrackedAccounts: max})
+		for i := 0; i < 10000; i++ {
+			c.Observe(failure("203.0.113.9", fmt.Sprintf("user%d", i)), base.Add(time.Duration(i)*time.Millisecond))
+			if len(c.accounts) > max {
+				t.Fatalf("tracked %d accounts, exceeds cap %d", len(c.accounts), max)
+			}
+		}
+	})
+
+	t.Run("sources attacking one account cannot grow the heap without limit", func(t *testing.T) {
+		c := New(Config{FailureThreshold: 10000, Window: time.Hour, Cooldown: time.Hour, SprayThreshold: 5})
+		for i := 0; i < 10000; i++ {
+			c.Observe(failure(publicIPFor(i), "root"), base.Add(time.Duration(i)*time.Millisecond))
+		}
+		ast := c.accounts["root"]
+		if got := len(ast.sources); got > maxSourcesPerAccount {
+			t.Errorf("tracked %d sources against one account, cap is %d", got, maxSourcesPerAccount)
+		}
+		if !ast.sourcesOverflow {
+			t.Error("overflow not recorded, so the alert would understate the spread")
+		}
+		if got := c.sourceCount(ast); !strings.HasPrefix(got, ">=") {
+			t.Errorf("distinct_sources = %q; a saturated count must read as a floor", got)
+		}
+		if list := c.sourceList(ast); !strings.Contains(list, "tracking capped") {
+			t.Errorf("source list %q does not disclose that tracking was capped", list)
+		}
+		// The running total is a counter, not a collection, so it stays exact.
+		if ast.totalFails != 10000 {
+			t.Errorf("totalFails = %d, want 10000", ast.totalFails)
+		}
+	})
+
+	t.Run("a saturated account recovers once its window drains", func(t *testing.T) {
+		c := New(Config{FailureThreshold: 10000, Window: time.Minute, Cooldown: time.Hour, SprayThreshold: 5})
+		for i := 0; i < 500; i++ {
+			c.Observe(failure(publicIPFor(i), "root"), base.Add(time.Duration(i)*time.Millisecond))
+		}
+		ast := c.accounts["root"]
+		if !ast.sourcesOverflow {
+			t.Fatal("expected overflow after 500 distinct sources inside the window")
+		}
+		c.Observe(failure("198.51.200.1", "root"), base.Add(time.Hour))
+		if ast.sourcesOverflow {
+			t.Error("still overflowed after the window drained")
+		}
+		if got := c.sourceCount(ast); got != "1" {
+			t.Errorf("distinct_sources = %q, want an exact 1 once the window drained", got)
+		}
+	})
+}
+
+// Five internal addresses failing against one account is most often a fleet
+// retrying a rotated credential. It is reported, but it must not carry the score
+// that arms an automated response.
+func TestInternalSprayIsReportedBelowTheActingScore(t *testing.T) {
+	c := New(Config{FailureThreshold: 100, Window: time.Minute, Cooldown: time.Hour, SprayThreshold: 5})
+	var got []*event.Event
+	for i := 0; i < 5; i++ {
+		// ipFor yields 10.0.0.0/8 — private.
+		got = append(got, c.Observe(failure(ipFor(i), "svc-deploy"), base.Add(time.Duration(i)*time.Second))...)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d incidents, want 1", len(got))
+	}
+	inc := got[0]
+	if inc.Rule != "correlated_distributed_auth_failure" {
+		t.Errorf("Rule = %q, want correlated_distributed_auth_failure", inc.Rule)
+	}
+	if inc.Severity != event.SeverityHigh {
+		t.Errorf("Severity = %q (score %d), want high — internal sources must stay below critical", inc.Severity, inc.Score)
+	}
+	if inc.Fields["public_sources"] != "0" {
+		t.Errorf("public_sources = %q, want 0", inc.Fields["public_sources"])
+	}
+	if !strings.Contains(inc.Message, "rotated credential") {
+		t.Errorf("message does not disclose the benign explanation: %q", inc.Message)
+	}
+}
+
+// A failure with no account cannot be attributed to one, and must not create
+// state under an empty key.
+func TestFailuresWithoutAnAccountAreNotTracked(t *testing.T) {
+	c := New(Config{FailureThreshold: 100, Window: time.Minute, Cooldown: time.Hour, SprayThreshold: 5})
+	for i := 0; i < 10; i++ {
+		c.Observe(failure(publicIPFor(i), ""), base.Add(time.Duration(i)*time.Second))
+	}
+	if len(c.accounts) != 0 {
+		t.Errorf("tracked %d accounts from failures carrying no user", len(c.accounts))
+	}
+}
+
+// Same guarantee TestCapsDoNotAffectAnyVerdict makes for the source key.
+func TestSprayCapsDoNotAffectAnyVerdict(t *testing.T) {
+	if maxSourcesPerAccount < DefaultConfig().SprayThreshold {
+		t.Errorf("maxSourcesPerAccount %d is below SprayThreshold %d: the cap could suppress a real spray",
+			maxSourcesPerAccount, DefaultConfig().SprayThreshold)
+	}
+	if maxSourcesPerAccount < 10 {
+		t.Errorf("maxSourcesPerAccount %d is below the 10 sources the alert lists", maxSourcesPerAccount)
+	}
+}
+
+// A source already in the set must be refreshed, not rejected, once the set is
+// full. Without that, the one attacker who never stops ages out of their own
+// campaign: their entry keeps the timestamp of their first attempt while 63
+// newer peers hold the set at its cap, and the window eventually prunes them.
+func TestAKnownSourceIsRefreshedOnceTheSetIsFull(t *testing.T) {
+	c := New(Config{FailureThreshold: 100000, Window: time.Minute, Cooldown: time.Hour, SprayThreshold: 100000})
+	for i := 0; i < maxSourcesPerAccount; i++ {
+		c.Observe(failure(publicIPFor(i), "root"), base)
+	}
+	ast := c.accounts["root"]
+	if len(ast.sources) != maxSourcesPerAccount {
+		t.Fatalf("set holds %d sources, want the cap %d", len(ast.sources), maxSourcesPerAccount)
+	}
+
+	persistent := publicIPFor(0)
+	// Still attacking, 30s in, while the set stays full.
+	c.Observe(failure(persistent, "root"), base.Add(30*time.Second))
+	// 70s in: everything still dated `base` has left the 60s window.
+	c.Observe(failure("198.51.250.250", "root"), base.Add(70*time.Second))
+
+	if _, alive := ast.sources[persistent]; !alive {
+		t.Error("the source that never stopped was pruned while its peers held the set at the cap")
+	}
+	if _, stale := ast.sources[publicIPFor(1)]; stale {
+		t.Error("a source that stopped at base should have left the window")
+	}
+}

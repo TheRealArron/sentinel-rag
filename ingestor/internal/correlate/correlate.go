@@ -6,11 +6,19 @@
 // is a probable compromise. That distinction cannot be made by a stateless
 // per-line rule, so it lives here.
 //
+// Correlation runs on two keys, because one key can only see one shape of
+// attack. Keyed on source address, many failures from one place is a
+// brute-force attempt. Keyed on account, many *places* failing against one
+// account is a distributed spray — and that one is invisible to the first key
+// by construction, since N addresses making one attempt each never approach a
+// per-source threshold. Neither pass can raise the other's finding.
+//
 // The correlator is deliberately single-goroutine and time-ordered: the
 // pipeline runs it after the reorder buffer, so state transitions follow log
 // order rather than worker-scheduling order. Memory is bounded by MaxTrackedIPs
-// with LRU eviction, because an attacker choosing a fresh source address per
-// packet must not be able to grow our heap without limit.
+// and MaxTrackedAccounts with LRU eviction, because both keys are chosen by
+// whoever is attacking — a fresh source address per packet, or a fresh username
+// per attempt — and neither must be able to grow our heap without limit.
 package correlate
 
 import (
@@ -25,28 +33,39 @@ import (
 
 // Config tunes incident detection.
 //
-//	FailureThreshold  authentication failures from one source within Window that
-//	                  constitute a brute-force incident
-//	Window            sliding window for the threshold
-//	Cooldown          minimum gap between repeat incidents for one source, so a
-//	                  sustained attack yields one alert per period, not per packet
-//	MaxTrackedIPs     upper bound on tracked sources; the oldest are evicted
+//	FailureThreshold    authentication failures from one source within Window that
+//	                    constitute a brute-force incident
+//	Window              sliding window for both thresholds
+//	Cooldown            minimum gap between repeat incidents for one key, so a
+//	                    sustained attack yields one alert per period, not per packet
+//	MaxTrackedIPs       upper bound on tracked sources; the oldest are evicted
+//	SprayThreshold      distinct source addresses failing against one account
+//	                    within Window that constitute a distributed spray
+//	MaxTrackedAccounts  upper bound on tracked accounts; the oldest are evicted
 type Config struct {
-	FailureThreshold int
-	Window           time.Duration
-	Cooldown         time.Duration
-	MaxTrackedIPs    int
+	FailureThreshold   int
+	Window             time.Duration
+	Cooldown           time.Duration
+	MaxTrackedIPs      int
+	SprayThreshold     int
+	MaxTrackedAccounts int
 }
 
 // DefaultConfig reflects what we actually see on a home server exposed to the
 // internet: opportunistic scanners try 3-4 credentials and move on, so 5 in a
 // minute is a real campaign rather than background radiation.
+// SprayThreshold is 5 distinct addresses rather than a failure count. One
+// account legitimately fails from more than one place — a phone on cellular, a
+// laptop on the office NAT, a VPN exit — but five distinct addresses inside one
+// minute against a single account is not a person mistyping a password.
 func DefaultConfig() Config {
 	return Config{
-		FailureThreshold: 5,
-		Window:           60 * time.Second,
-		Cooldown:         5 * time.Minute,
-		MaxTrackedIPs:    8192,
+		FailureThreshold:   5,
+		Window:             60 * time.Second,
+		Cooldown:           5 * time.Minute,
+		MaxTrackedIPs:      8192,
+		SprayThreshold:     5,
+		MaxTrackedAccounts: 4096,
 	}
 }
 
@@ -65,10 +84,27 @@ func DefaultConfig() Config {
 // brute-force threshold defaults to 5 failures. So saturating either changes no
 // verdict — it only makes the reported detail approximate, and only in the case
 // where the exact figure has long stopped being interesting.
+// maxSourcesPerAccount bounds the per-account side the same way, and for the
+// same reason: the account key is attacker-chosen, and so is the set of
+// addresses attacking it. 64 is well above SprayThreshold, so saturating it
+// cannot change whether a spray is declared — only how exactly the source count
+// is reported, and only long after the count stopped being interesting.
 const (
 	maxUsersPerSource    = 64
 	maxFailuresPerSource = 128
+	maxSourcesPerAccount = 64
 )
+
+// clock is the window-evaluation state shared by both correlation keys. It is a
+// struct rather than two loose fields because windowClock's rules — do not trust
+// the future, never run backwards — are subtle enough that a second hand-copied
+// version would drift from this one.
+type clock struct {
+	// windowAt is the time the sliding window is evaluated at for this key.
+	// It only ever moves forward — see windowClock.
+	windowAt time.Time
+	skewed   int
+}
 
 type sourceState struct {
 	// failures holds the timestamps of recent authentication failures inside the
@@ -86,10 +122,26 @@ type sourceState struct {
 	// cooldown and the compromise cooldown cannot suppress each other. They
 	// describe different findings and an operator wants both.
 	lastCompromise time.Time
-	// windowAt is the time the sliding window is evaluated at for this source.
-	// It only ever moves forward — see windowClock.
-	windowAt   time.Time
-	skewed     int
+	clock
+	totalFails int
+}
+
+// accountState is the second correlation key.
+//
+// The source-keyed state above cannot see a distributed spray by construction:
+// N addresses making one attempt each against one account produce N sourceStates
+// holding one failure apiece, and FailureThreshold is never approached from any
+// of them. The axis that moves is the number of distinct *sources* hitting a
+// single account, so that is what this counts.
+//
+// sources maps each address to its most recent in-window failure, which is what
+// lets the set be pruned by time rather than reset wholesale.
+type accountState struct {
+	sources         map[string]time.Time
+	sourcesOverflow bool
+	lastSeen        time.Time
+	lastAlert       time.Time
+	clock
 	totalFails int
 }
 
@@ -109,9 +161,10 @@ const futureTolerance = 2 * time.Minute
 
 // Correlator holds per-source sliding-window state. Not safe for concurrent use.
 type Correlator struct {
-	cfg    Config
-	state  map[string]*sourceState
-	seqGen int64
+	cfg      Config
+	state    map[string]*sourceState
+	accounts map[string]*accountState
+	seqGen   int64
 }
 
 // New returns a Correlator, filling zero-valued config fields with defaults.
@@ -129,7 +182,17 @@ func New(cfg Config) *Correlator {
 	if cfg.MaxTrackedIPs <= 0 {
 		cfg.MaxTrackedIPs = def.MaxTrackedIPs
 	}
-	return &Correlator{cfg: cfg, state: make(map[string]*sourceState)}
+	if cfg.SprayThreshold <= 0 {
+		cfg.SprayThreshold = def.SprayThreshold
+	}
+	if cfg.MaxTrackedAccounts <= 0 {
+		cfg.MaxTrackedAccounts = def.MaxTrackedAccounts
+	}
+	return &Correlator{
+		cfg:      cfg,
+		state:    make(map[string]*sourceState),
+		accounts: make(map[string]*accountState),
+	}
 }
 
 // Observe feeds one event through the correlator and returns any incidents it
@@ -142,7 +205,7 @@ func (c *Correlator) Observe(ev *event.Event, ts time.Time) []*event.Event {
 	st := c.stateFor(ev.SourceIP, ts)
 	st.lastSeen = ts
 	// Everything below windows against `at`, never against the raw timestamp.
-	at := c.windowClock(st, ts)
+	at := c.windowClock(&st.clock, ts)
 
 	var out []*event.Event
 	isAuthFailure := ev.Outcome == "failure" &&
@@ -175,6 +238,16 @@ func (c *Correlator) Observe(ev *event.Event, ts time.Time) []*event.Event {
 		if len(st.failures) >= c.cfg.FailureThreshold && c.offCooldown(st, at) {
 			st.lastAlert = at
 			out = append(out, c.bruteForceIncident(ev, st, at))
+		}
+		// The account-keyed pass runs on its own clock and its own cooldown, so a
+		// brute-force alert and a spray alert neither suppress nor imply each
+		// other. One source making many attempts raises the first and cannot
+		// raise the second; many sources making one attempt each raise the
+		// second and cannot raise the first.
+		if ev.User != "" {
+			if inc := c.observeAccount(ev, ts); inc != nil {
+				out = append(out, inc)
+			}
 		}
 
 	case ev.Outcome == "success" && ev.Category == enrich.CatAuth:
@@ -225,6 +298,174 @@ func (c *Correlator) evictOldest() {
 	}
 }
 
+// accountFor returns the state for an account, evicting if the map is full.
+//
+// The key here is an account name, which is chosen by whoever is attacking: a
+// spray that invents a fresh username per attempt would otherwise grow this map
+// without limit. That is the same unbounded-state class MaxTrackedIPs exists to
+// close, so it gets the same bound.
+func (c *Correlator) accountFor(user string, ts time.Time) *accountState {
+	if ast, ok := c.accounts[user]; ok {
+		return ast
+	}
+	if len(c.accounts) >= c.cfg.MaxTrackedAccounts {
+		c.evictOldestAccounts()
+	}
+	ast := &accountState{sources: make(map[string]time.Time, 4), lastSeen: ts}
+	c.accounts[user] = ast
+	return ast
+}
+
+// evictOldestAccounts mirrors evictOldest. Written out a second time rather than
+// made generic over both maps: the ingestor is plain Go with no type parameters
+// anywhere, and the shared version would have to reach lastSeen through either
+// an interface or a callback for the sake of fifteen lines.
+func (c *Correlator) evictOldestAccounts() {
+	type entry struct {
+		user string
+		at   time.Time
+	}
+	entries := make([]entry, 0, len(c.accounts))
+	for user, ast := range c.accounts {
+		entries = append(entries, entry{user, ast.lastSeen})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].at.Before(entries[j].at) })
+	drop := len(entries) / 10
+	if drop == 0 {
+		drop = 1
+	}
+	for _, e := range entries[:drop] {
+		delete(c.accounts, e.user)
+	}
+}
+
+// observeAccount records one failure against an account and returns an incident
+// if this attempt took the distinct-source count over the threshold.
+func (c *Correlator) observeAccount(ev *event.Event, ts time.Time) *event.Event {
+	ast := c.accountFor(ev.User, ts)
+	ast.lastSeen = ts
+	at := c.windowClock(&ast.clock, ts)
+	ast.totalFails++
+	c.pruneSources(ast, at)
+
+	// A source already in the set is refreshed rather than rejected, so a
+	// persistent attacker does not age out of their own campaign once the set
+	// has filled with their peers.
+	if _, known := ast.sources[ev.SourceIP]; known || len(ast.sources) < maxSourcesPerAccount {
+		ast.sources[ev.SourceIP] = at
+	} else {
+		ast.sourcesOverflow = true
+	}
+
+	if len(ast.sources) >= c.cfg.SprayThreshold && c.offAccountCooldown(ast, at) {
+		ast.lastAlert = at
+		return c.distributedSprayIncident(ev, ast, at)
+	}
+	return nil
+}
+
+// pruneSources drops addresses whose most recent failure has left the window.
+func (c *Correlator) pruneSources(ast *accountState, now time.Time) {
+	cutoff := now.Add(-c.cfg.Window)
+	for ip, seen := range ast.sources {
+		if !seen.After(cutoff) {
+			delete(ast.sources, ip)
+		}
+	}
+	if len(ast.sources) < maxSourcesPerAccount {
+		ast.sourcesOverflow = false
+	}
+}
+
+func (c *Correlator) offAccountCooldown(ast *accountState, now time.Time) bool {
+	return ast.lastAlert.IsZero() || now.Sub(ast.lastAlert) >= c.cfg.Cooldown
+}
+
+func (c *Correlator) sourceList(ast *accountState) string {
+	ips := make([]string, 0, len(ast.sources))
+	for ip := range ast.sources {
+		ips = append(ips, ip)
+	}
+	sort.Strings(ips)
+	if len(ips) > 10 {
+		remainder := fmt.Sprintf("+%d more", len(ast.sources)-10)
+		if ast.sourcesOverflow {
+			remainder = fmt.Sprintf("+%d more (tracking capped)", len(ast.sources)-10)
+		}
+		ips = append(ips[:10], remainder)
+	}
+	return join(ips, ", ")
+}
+
+// sourceCount renders the distinct-source count, marked as a floor once the cap
+// has been reached, for the same reason failureCount does.
+func (c *Correlator) sourceCount(ast *accountState) string {
+	if ast.sourcesOverflow {
+		return fmt.Sprintf(">=%d", len(ast.sources))
+	}
+	return fmt.Sprint(len(ast.sources))
+}
+
+func (c *Correlator) publicSources(ast *accountState) int {
+	n := 0
+	for ip := range ast.sources {
+		if enrich.Scope(ip) == "public" {
+			n++
+		}
+	}
+	return n
+}
+
+// distributedSprayIncident reports many sources against one account, at one of
+// two severities.
+//
+// The split is the judgement loginAfterFailures already makes, applied to the
+// other key. Five public addresses failing against one account inside a minute
+// is a spray. Five *internal* addresses doing it is, more often, a fleet of
+// application servers retrying a credential that was rotated an hour ago — and
+// from a syslog line those are indistinguishable. The internal case is still
+// reported, because a spray launched from inside the perimeter is the one that
+// matters most, but it lands below the score that acts without a human.
+func (c *Correlator) distributedSprayIncident(trigger *event.Event, ast *accountState, ts time.Time) *event.Event {
+	pub := c.publicSources(ast)
+
+	var inc *event.Event
+	if pub > 0 {
+		inc = c.newIncident(trigger, ts, fmt.Sprintf(
+			"INCIDENT distributed password spray: %s distinct sources failed against %q within %s (sources: %s)",
+			c.sourceCount(ast), trigger.User, c.cfg.Window, c.sourceList(ast)))
+		inc.Rule = "correlated_distributed_spray"
+		inc.Score = 84
+		inc.AddTags("password-spraying", "パスワードスプレー")
+	} else {
+		inc = c.newIncident(trigger, ts, fmt.Sprintf(
+			"INCIDENT distributed authentication failures: %s distinct internal sources failed against %q "+
+				"within %s (%s) — a fleet retrying a rotated credential looks identical",
+			c.sourceCount(ast), trigger.User, c.cfg.Window, c.sourceList(ast)))
+		inc.Rule = "correlated_distributed_auth_failure"
+		inc.Score = 70
+		inc.AddTags("internal-sources", "内部送信元", "needs-triage", "要トリアージ")
+	}
+
+	inc.Category = enrich.CatAuth
+	inc.Outcome = "attempt"
+	inc.Severity = event.SeverityFor(inc.Score)
+	inc.MITRE = []string{"T1110.003"}
+	inc.AddTags("distributed", "分散", "incident", "インシデント",
+		"correlated", "相関検知", "brute-force", "ブルートフォース", enrich.CatAuth)
+	if ast.skewed > 0 {
+		inc.SetField("clock_skew_events", strconv.Itoa(ast.skewed))
+		inc.AddTags("clock-skew", "時刻ずれ")
+	}
+	inc.SetField("distinct_sources", c.sourceCount(ast))
+	inc.SetField("public_sources", strconv.Itoa(pub))
+	inc.SetField("window", c.cfg.Window.String())
+	inc.SetField("spray_sources", c.sourceList(ast))
+	inc.SetField("targeted_account", trigger.User)
+	inc.SetField("total_failures_seen", fmt.Sprint(ast.totalFails))
+	return inc
+}
+
 func (c *Correlator) prune(st *sourceState, now time.Time) {
 	cutoff := now.Add(-c.cfg.Window)
 	keep := st.failures[:0]
@@ -270,7 +511,7 @@ func (c *Correlator) offCompromiseCooldown(st *sourceState, now time.Time) bool 
 // Skew is counted rather than silently corrected, and surfaced on any incident
 // the source goes on to raise. "Your clocks disagree" is something an operator
 // needs told, not something a detector should quietly paper over.
-func (c *Correlator) windowClock(st *sourceState, ts time.Time) time.Time {
+func (c *Correlator) windowClock(st *clock, ts time.Time) time.Time {
 	if ts.After(event.Now().Add(futureTolerance)) {
 		// Not trusted, and therefore not used to advance anything. Clamping it
 		// to the tolerance limit instead was the first attempt and it does not
