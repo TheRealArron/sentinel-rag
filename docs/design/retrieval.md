@@ -163,8 +163,51 @@ ranking quality; floor-on is what the operator receives.
 > **These tables were re-measured after the chunking fix above.** Every number
 > here comes from a run on the current code; the pre-fix figures are kept
 > alongside so the effect of the fix is visible rather than quietly replaced.
-> Each run used a fresh index directory, because chunk ids are content-addressed
-> and a reused store would have kept the old chunks alongside the new ones.
+> Each run used a fresh index directory — see the next section for why that is
+> not merely tidiness.
+
+### The index the numbers are measured against
+
+Indexing is incremental and child ids are content-addressed. Both are deliberate:
+re-indexing an unchanged corpus must embed nothing, because embedding is by far
+the most expensive step. The consequence nobody had accounted for is that
+changing the chunker, the token estimator, or a document produces *new* ids and
+**leaves every superseded vector in the store**. Only `index --rebuild` calls
+`reset()`, and nothing on the read path checked.
+
+So the stale chunks stayed retrievable and competed for the top k against the
+chunks that replaced them. Measured here, immediately after the estimator change
+above:
+
+```
+store after `make retrieval-report`:  1203 vectors
+a clean build of the same corpus:      908 vectors
+overall hit@5, stale index:  0.702
+overall hit@5, clean index:  0.851
+```
+
+A headline figure wrong by 0.149, with no warning. This is the same shape as the
+`--cases` default that broke `make retrieval-report` for weeks: the failure only
+exists on the path a real user takes. CI starts from an empty directory every
+time, and so does every fixture in the test suite, so neither could see it.
+
+`eval-retrieval` now compares the store's vector count against the number of
+chunks the current corpus and chunking actually produce, and **refuses to print a
+report** when the store holds more, naming the gap and the command that fixes it.
+A quietly wrong benchmark is worse than no benchmark. Measured: a clean index
+reports normally; re-running with `SENTINEL_CHILD_TOKENS=200` against an index
+built at 400 refuses with *"index is stale: 2742 vectors in the store, but the
+current corpus and chunking produce 1869"*.
+
+Two things this does not do. It does not prune — the store is left alone and
+`make reindex` is the remedy, which on e5-large means re-embedding the corpus.
+And it cannot tell a superseded chunk from a legitimately extra one, because it
+compares counts rather than id sets; anything that adds vectors outside
+`index_all` would read as staleness. Ordinary further ingestion does not trip it:
+indexing 400 events and then re-running against the full log reported normally,
+because later events form new windows rather than rewriting existing ones. A
+truncation landing mid-window would rewrite that window's document, and I did not
+test that case.
 
 ### Results — dependency-free backend (`hashing-512`, `LocalVectorStore`)
 

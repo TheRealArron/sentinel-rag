@@ -398,3 +398,131 @@ keeping with the rest of this codebase. That is the next iteration.
 
 Also still open from iteration 1: `pam_authentication_failure` never captures
 `rhost`; the candidate pattern is written down there and remains untested.
+
+---
+
+## Iteration 3 — the evaluation was measuring a stale index
+
+**Date:** 2026-09-19
+
+### What I audited, and what I found
+
+`engine/sentinel/indexer.py`, `store.py`, `engine.py`, `cli.py`,
+`retrieval_eval.py`, and the fixtures in `engine/tests/conftest.py`.
+
+This defect was found by iteration 2's own verification, not by looking for it.
+Running the *undecorated* `make retrieval-report` — the command the README
+documents, with no flags — reported overall hit@5 **0.702** where every
+fresh-directory run in that iteration had measured **0.851**.
+
+The cause is two deliberate properties meeting:
+
+* `index_documents` skips ids already in the store (`existing_ids`) and never
+  removes one. That is correct for the write path: re-indexing an unchanged
+  corpus must embed nothing, since embedding dominates the cost.
+* Child ids are content-addressed over parent id, ordinal and text.
+
+Together, changing the chunker or the estimator produces entirely new ids and
+leaves every superseded vector in place. Only `index --rebuild` calls `reset()`.
+Nothing on the read path checked, so the superseded chunks stayed retrievable and
+competed for the top k. Measured on this machine:
+
+```
+store after `make retrieval-report`:  1203 vectors
+a clean build of the same corpus:      908 vectors
+overall hit@5, stale index:  0.702
+overall hit@5, clean index:  0.851
+```
+
+**This is the third instance of the same pattern in this repo**, and the reason
+it keeps surviving is structural: CI starts from an empty index directory, and
+every fixture in `conftest.py` points at `tmp_path`. Neither can reach a state
+that only exists on a machine that has run the tool before. The `--cases` bug had
+exactly this shape.
+
+### What I chose, and why
+
+**Detect and refuse, rather than prune.** `eval-retrieval` now compares
+`vectors.count()` against `IndexStats.children_total` — the number of chunks the
+current corpus and chunking actually produce, which the indexer already computes
+— and returns non-zero with the gap named and `make reindex` suggested.
+
+Over the alternatives: `index_all(rebuild=True)` in the eval path is correct but
+forces a 25-minute re-embed on every e5-large run, and would have made iteration
+2 considerably more expensive for no measurement benefit. Pruning the store to
+the current id set is the real fix, but it changes the write path for every
+caller including the dashboard, and `index_all` is not the only thing that writes
+vectors — deleting "anything not in this set" risks removing chunks added by
+another path. A guard that converts a silent wrong number into a loud actionable
+one is strictly better than today and does not risk data.
+
+No new store surface was needed: `count()` and `children_total` both already
+existed.
+
+### What I changed
+
+- `retrieval_eval.stale_chunk_count(store_count, corpus_chunk_count)` — the
+  detector, with the measurement above in its docstring.
+- `cmd_eval_retrieval` — refuses before evaluating, printing the two counts and
+  `make reindex`. No override flag; the remedy is one command.
+- `engine/tests/test_retrieval_eval.py` — four tests in
+  `TestStaleIndexIsRefusedRatherThanMeasured`.
+- `docs/design/retrieval.md` — a new "The index the numbers are measured against"
+  section, and the tables now say why each run used a fresh directory.
+
+### Mutation table
+
+| Leg removed | Test that failed |
+|---|---|
+| the guard in `cmd_eval_retrieval` (report anyway) | `test_the_command_refuses_instead_of_printing_wrong_numbers` |
+| `stale_chunk_count` always returns 0 | `test_chunks_the_corpus_no_longer_produces_are_detected`, `test_the_command_refuses_instead_of_printing_wrong_numbers` |
+
+The refusal test asserts `"hit@5" not in out`, so a mutation that prints the
+report *and* the warning still fails — the point is that no numbers escape.
+
+### Measurements
+
+End to end, through `make`, not through the test suite:
+
+| Scenario | Result |
+|---|---|
+| clean index, `make retrieval-report PYTHON=python3` | reports normally — 0.638 / 0.766 / **0.851** / 0.713 |
+| index built at `child_tokens=400`, re-run at `SENTINEL_CHILD_TOKENS=200` | **refuses**: "index is stale: 2742 vectors in the store, but the current corpus and chunking produce 1869", `make` exits 1 |
+| index built on 400 events, re-run against the full event log | reports normally — later events form new windows rather than rewriting existing ones |
+
+`make test-py` in `.venv/ci` with **no requirements.txt installed**: 600 passed,
+1 skipped. `make lint`: ruff clean. `make vet` clean, all 9 Go packages pass under
+`-race`, `go.mod` untouched.
+
+I also rebuilt the user's `data/index` with `make reindex` at the end of
+iteration 2, because my own undecorated run had mixed old and new chunks into it.
+It now holds 908 vectors, matching a clean build. `data/index/` is gitignored.
+
+### What I did NOT verify
+
+- **Whether the guard is too strict in real use.** It compares counts, not id
+  sets, so anything that adds vectors outside `index_all` reads as staleness. I
+  tested the ordinary-ingestion case and it does not trip; I did **not** test a
+  truncation landing mid-window, which would rewrite that window's document and
+  should trip it. Someone actively ingesting who hits this gets told to re-embed
+  their whole corpus, which on e5-large is 25 minutes.
+- **The dashboard and `sentinel analyze` still read a stale index silently.**
+  Only the evaluation path refuses. The content there is older cuts of the same
+  documents rather than wrong documents, so I judged it less severe, but it is
+  unfixed and unmeasured.
+- **ChromaVectorStore.** Everything here ran on `LocalVectorStore`, which is what
+  the eval and the tests use. `count()` exists on both, so the check should
+  behave the same, but I did not run it against Chroma.
+- Docker remains unreachable in this session (`permission denied` on the socket,
+  no passwordless sudo), independently of the user's DNS timeout.
+
+### Found and not fixed
+
+- **Pruning is still the real fix.** A store that cannot be brought into line
+  with its corpus except by re-embedding everything is a design gap, not just a
+  reporting one. It needs `VectorStore.prune(keep_ids)` on both backends and a
+  decision about which callers are allowed to prune.
+- `pam_authentication_failure` still never captures `rhost` (iteration 1 has the
+  verified defect and an untested candidate pattern).
+- The per-direction and same-language-preference analyses in `retrieval.md` are
+  still marked as pre-fix and un-rerun.

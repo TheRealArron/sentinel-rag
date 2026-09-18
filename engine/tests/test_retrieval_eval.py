@@ -202,3 +202,76 @@ class TestBaselineOnTheFallbackBackend:
         origins = {e["label"]: e for e in report["floor_off"]["by_origin"]}
         assert "origin = event" in origins and "origin = software" in origins
         assert origins["origin = event"]["queries"] >= 25
+
+
+class TestStaleIndexIsRefusedRatherThanMeasured:
+    """The evaluation must not report against a store the corpus has outgrown.
+
+    Indexing is incremental and child ids are content-addressed, so changing the
+    chunker or the token estimator leaves every superseded vector in place and
+    adds the new ones beside them. Nothing removed them and nothing on the read
+    path noticed. The one time it happened here, `make retrieval-report` read
+    overall hit@5 0.702 against a clean index's 0.851 — off by 0.149, silently.
+
+    CI never saw it because CI always starts from an empty index directory, and
+    so does every fixture in this suite. That is the same reason the `--cases`
+    default could break for weeks: the failure only exists on the path a real
+    user takes.
+    """
+
+    def test_a_clean_index_reports_no_stale_chunks(self, indexed_engine):
+        from sentinel.retrieval_eval import stale_chunk_count
+
+        stats = indexed_engine.index_all()
+        assert stale_chunk_count(indexed_engine.indexer.vectors.count(), stats.children_total) == 0
+
+    def test_reindexing_the_same_corpus_stays_clean(self, indexed_engine):
+        """Idempotence is the property that makes the check safe to enforce."""
+        from sentinel.retrieval_eval import stale_chunk_count
+
+        before = indexed_engine.indexer.vectors.count()
+        stats = indexed_engine.index_all()
+        assert indexed_engine.indexer.vectors.count() == before
+        assert stats.children_embedded == 0
+        assert stale_chunk_count(before, stats.children_total) == 0
+
+    def test_chunks_the_corpus_no_longer_produces_are_detected(self, indexed_engine, monkeypatch):
+        """Change the chunking underneath a built index, the way the estimator fix did."""
+        from sentinel import chunking
+        from sentinel.retrieval_eval import stale_chunk_count
+
+        stats_before = indexed_engine.index_all()
+        assert stale_chunk_count(indexed_engine.indexer.vectors.count(), stats_before.children_total) == 0
+
+        # Halve the token budget: every child is re-cut, so every id changes and
+        # the old vectors are left behind rather than replaced.
+        real_estimate = chunking.estimate_tokens
+        monkeypatch.setattr(chunking, "estimate_tokens", lambda text: real_estimate(text) * 2)
+
+        stats_after = indexed_engine.index_all()
+        store = indexed_engine.indexer.vectors.count()
+        stale = stale_chunk_count(store, stats_after.children_total)
+        assert store > stats_after.children_total, (
+            f"store {store} did not grow past the {stats_after.children_total} chunks "
+            "the new chunking produces — the fixture did not actually re-cut anything"
+        )
+        assert stale > 0
+
+    def test_the_command_refuses_instead_of_printing_wrong_numbers(self, indexed_engine, monkeypatch, capsys):
+        import argparse
+
+        from sentinel import chunking
+        from sentinel.cli import Printer, cmd_eval_retrieval
+
+        indexed_engine.index_all()
+        real_estimate = chunking.estimate_tokens
+        monkeypatch.setattr(chunking, "estimate_tokens", lambda text: real_estimate(text) * 2)
+
+        args = argparse.Namespace(cases=None, k=5, show_misses=8, json=False)
+        code = cmd_eval_retrieval(args, indexed_engine, Printer())
+        out = capsys.readouterr().out
+
+        assert code == 1, "a stale index must not produce a report"
+        assert "index is stale" in out
+        assert "make reindex" in out
+        assert "hit@5" not in out, "no numbers may be printed from a stale index"

@@ -283,11 +283,27 @@ def cmd_eval_retrieval(args, engine: SentinelEngine, printer: Printer) -> int:
     Prints both floor settings. The floor-off column is ranking quality — what
     the embedder can do. The floor-on column is what an operator receives, which
     is better by construction and says nothing about the model.
+
+    Refuses to report against an index that holds chunks the current corpus no
+    longer produces. Indexing is incremental and content-addressed, so a store
+    built before a chunking change keeps the superseded vectors and they compete
+    in the ranking — see `stale_chunk_count`. Printing a quietly wrong benchmark
+    is worse than printing nothing, and this is a measurement command.
     """
-    from .retrieval_eval import evaluate, load_cases
+    from .retrieval_eval import evaluate, load_cases, stale_chunk_count
 
     cases = load_cases(Path(args.cases)) if args.cases else load_cases()
-    engine.index_all()
+    stats = engine.index_all()
+    stale = stale_chunk_count(engine.indexer.vectors.count(), stats.children_total)
+    if stale:
+        printer.line(
+            f"index is stale: {engine.indexer.vectors.count()} vectors in the store, "
+            f"but the current corpus and chunking produce {stats.children_total}. "
+            f"{stale} superseded chunk(s) would compete in the ranking and the "
+            f"numbers below would be wrong."
+        )
+        printer.line("rebuild it first:  make reindex")
+        return 1
     report = evaluate(engine, cases, k=args.k)
 
     if args.json:

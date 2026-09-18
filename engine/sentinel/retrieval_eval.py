@@ -246,4 +246,32 @@ def evaluate(engine, cases: Sequence[EvalCase] | None = None, k: int = 5,
     return report
 
 
-__all__ = ["EvalCase", "CaseResult", "Metrics", "evaluate", "load_cases", "run", "summarise"]
+def stale_chunk_count(store_count: int, corpus_chunk_count: int) -> int:
+    """Vectors in the store that the current corpus and chunking no longer produce.
+
+    Child ids are content-addressed, so changing the chunker, the token
+    estimator, or a document produces *new* ids — and ``index_documents`` skips
+    ids it already holds and never removes one. That is right for the write
+    path, where re-indexing an unchanged corpus must embed nothing. It is wrong
+    for a measurement: the superseded chunks stay in the store, stay
+    retrievable, and compete for the top k against the chunks that replaced
+    them.
+
+    Only ``index --rebuild`` calls ``reset()``, and nothing on the read path
+    checks. So the failure is silent, and it lands on the command a user
+    actually types rather than on CI, which always starts from an empty
+    directory — the same shape as the ``--cases`` default that broke
+    ``make retrieval-report`` for weeks.
+
+    Measured once, on this repo: after the token estimator changed, a store that
+    should have held 908 vectors held 1203, and ``make retrieval-report`` read
+    overall hit@5 **0.702** where a clean index gave **0.851**. A headline figure
+    wrong by 0.149, with no warning anywhere.
+
+    Returns the excess, which is zero for a clean index.
+    """
+    return max(0, store_count - corpus_chunk_count)
+
+
+__all__ = ["EvalCase", "CaseResult", "Metrics", "evaluate", "load_cases", "run",
+           "stale_chunk_count", "summarise"]
