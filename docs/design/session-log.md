@@ -221,3 +221,180 @@ unchanged (40 sigma vectors, 10/9/6/30 ioc vectors; `git status` clean afterward
   than fixed.
 - `data/events.jsonl` still has no rotation, index, or retention; Shadow Search
   still recomputes its baseline over full history. Untouched.
+
+---
+
+## Iteration 2 — the 512-token truncation, and a variant that was measured and rejected
+
+**Date:** 2026-09-18 / 19
+
+### What I audited, and what I found
+
+`engine/sentinel/chunking.py`, `lang.py`, `embeddings.py`, `indexer.py`,
+`retrieval_eval.py`, `cli.py`, and `docs/design/retrieval.md`.
+
+The recorded defect reproduces exactly. Running e5-large's own tokenizer over the
+child chunks the current code produces: **9 of 93 chunks over the 512-token
+limit, longest 824, 1397 tokens discarded**. That matches what `retrieval.md`
+records, so the recorded figure was sound.
+
+The cause is not the one I would have guessed from the backlog entry, and the
+decomposition matters:
+
+* The estimator is the whole story. The worst chunk estimated 433 tokens and held
+  788 — a ratio of **1.82**. The prepended title contributes 36.
+* **8 of the 9 were already over the limit before the title was added.**
+* `estimate_tokens` counted everything non-CJK at four characters per token.
+  SentencePiece merges letters into word pieces but emits digits and punctuation
+  singly, so `CVE-2026-46279` and `mm/alloc_tag:` cost far more than their length
+  suggests. Japanese was already safe (it over-estimates, median ratio 0.79).
+* Separately, `max est_body = 461` against a 400 budget, because `apply_overlap`
+  adds its tail *after* `split_text` has enforced the budget. A 15% contributor
+  next to the estimator's 80%.
+
+### What I chose, and why
+
+Four candidate estimators, each re-chunking the whole corpus and measured with
+the real tokenizer:
+
+| estimator | chunks | over 512 | max tokens | real/est max |
+|---|---:|---:|---:|---:|
+| current (non-CJK at 4 chars/token) | 93 | 9 | 824 | 1.80 |
+| digits+punctuation at 1 token each | 126 | **0** | 497 | 1.06 |
+| non-CJK at 3 chars/token | 107 | 7 | 626 | 1.31 |
+| digits+punctuation at 2 chars/token | 102 | 6 | 603 | 1.38 |
+
+Only the third character class closes it, which is why the fix is that and not a
+uniform tightening.
+
+I also built the obvious companion change — reserving the title and overlap
+inside `child_tokens`, so the budget bounds the *embedded* string structurally
+rather than empirically — and then **measured it and threw it away**. It works on
+its own terms (174 chunks, longest 380) and it costs retrieval on every metric:
+
+| e5-large | pre-fix | estimator + reservation | estimator only |
+|---|---:|---:|---:|
+| overall hit@5 | 0.915 | 0.894 | **0.936** |
+| overall MRR | 0.858 | 0.852 | **0.871** |
+| cross-lingual hit@5 | 0.562 | 0.531 | **0.594** |
+| misses at k=5 | 4 | 5 | **3** |
+
+Smaller chunks retrieve worse. Shipping the reservation would have fixed the
+defect and made the product worse, and nothing short of running the evaluation
+would have shown that — the unit tests were green for both.
+
+### What I changed
+
+`engine/sentinel/lang.py` — `estimate_tokens` counts three classes instead of
+two. That is the entire production change; `chunking.py` is untouched.
+
+New: `scripts/gen-tokenizer-vectors.py`, `engine/tests/testdata/tokenizer_vectors.json`
+(49 longest chunks with real token counts), `engine/tests/test_tokenizer_vectors.py`,
+and a `make tokenizer-check` target. Docs: `retrieval.md` and `README.md`.
+
+**Why the vectors exist.** The suite passed before and after the defect existed,
+because every test that measured a chunk against its budget measured it with the
+same estimator that was wrong — they agreed with each other and with nothing
+real. The Go/Python Sigma and IOC bridges already solve this shape of problem by
+committing one side's answers; these do the same for the tokenizer, and the test
+that reads them needs no dependencies.
+
+### Mutation table
+
+| Leg removed | Test that failed |
+|---|---|
+| estimator reverted to the two-class model | `test_identifier_dense_text_costs_more_than_prose_of_the_same_length`, `test_the_estimator_still_produces_the_committed_estimates` |
+| a 600-token chunk planted in the vectors | `test_no_chunk_reaches_the_model_input_limit`, `test_the_estimator_does_not_underestimate_beyond_its_headroom`, `test_the_headroom_under_the_limit_is_recorded_and_still_positive` |
+
+Stronger than a mutation: with `lang.py` and `chunking.py` reverted to HEAD and
+the vectors regenerated from that code, the new gate fails with *"9 chunk(s) at
+or past the 512-token limit, longest 824"* and *"27 vector(s) underestimate by
+more than 1.10x, worst ratio 1.787"*. The gate detects the real defect on the
+real corpus, not a synthetic stand-in.
+
+### Measurements
+
+Retrieval, `make retrieval-report`, 47 queries, floor off, each run in a **fresh
+index directory** (chunk ids are content-addressed, so a reused store keeps the
+old chunks alongside the new — see below):
+
+| | hashing before | hashing after | small before | small after | large before | large after |
+|---|---:|---:|---:|---:|---:|---:|
+| overall hit@1 | 0.660 | 0.638 | 0.787 | 0.830 | 0.830 | 0.830 |
+| overall hit@3 | 0.787 | 0.766 | 0.894 | 0.915 | 0.872 | 0.894 |
+| overall hit@5 | 0.830 | **0.851** | 0.936 | 0.936 | 0.915 | **0.936** |
+| overall MRR | 0.720 | 0.713 | 0.839 | **0.870** | 0.858 | **0.871** |
+| cross-lingual hit@5 | 0.188 | **0.312** | 0.438 | 0.438 | 0.562 | **0.594** |
+| cross-lingual MRR | 0.112 | **0.183** | 0.212 | 0.213 | 0.249 | **0.258** |
+| misses at k=5 | 8 | 7 | 3 | 3 | 4 | **3** |
+
+The pre-fix e5-large run reproduced the committed table **exactly** — all six
+slices, both floor settings, and the same four misses — which is what gives me
+confidence the environment and the recorded numbers are both sound.
+
+Chunking: 93 → 126 chunks, 9 → **0** over the limit, longest 824 → **497**, 1397
+→ **0** tokens discarded, worst real/estimate 1.80 → 1.05.
+
+`make test-py` in `.venv/ci` with **no requirements.txt installed**: 596 passed,
+1 skipped. `make lint`: ruff clean. `make vet`, `make test-go`: unchanged, all 9
+packages pass under `-race`. `go.mod` untouched and still dependency-free.
+
+### What I did NOT verify
+
+- **Whether any of the retrieval movement is real.** The biggest change to a
+  headline figure is one query out of 32. Nothing is tested for significance and
+  a 47-query set judged by one person cannot support much. I would not defend
+  "the fix improved retrieval" — I would defend "the fix stopped discarding 1397
+  tokens and did not make retrieval worse".
+- **The per-direction asymmetry and the same-language-preference analysis** in
+  `retrieval.md` were not re-run on the new boundaries. Both are now explicitly
+  marked as describing the pre-fix configuration. The first needs the `--json`
+  report rather than the printed table.
+- **The headroom is empirical, not structural, and it is 15 tokens.** The
+  embedded estimate reaches 502 against a 400 budget; at the worst observed ratio
+  that permits ~529 real tokens, which would not fit. It does not happen only
+  because the longest chunks are ones the estimator overestimates. A larger
+  corpus can consume that margin and only `make tokenizer-check` would notice.
+- **Docker** — still unreachable here: `docker ps` gives `permission denied` on
+  the socket and there is no passwordless sudo, on top of the user's DNS timeout.
+- The chars-per-token calibration table was recomputed with my own grouping (3
+  hand-written summaries, 39 NVD records); the earlier table grouped five
+  summaries. Both columns shift slightly with the grouping and I did not
+  reconstruct the original method.
+
+### Found and not fixed — a defect in the default path
+
+`make retrieval-report` on a machine with an existing index **reports wrong
+numbers, silently**, and this is the same shape as the `--cases` bug already
+recorded in this repo: the command a user actually types is not the one that was
+exercised.
+
+`cmd_eval_retrieval` calls `engine.index_all()`, which adds incrementally and
+never removes. Chunk ids are content-addressed, so changing chunking produces
+*new* ids and leaves every old chunk in the store. Measured, on this machine,
+immediately after the change:
+
+```
+default index after `make retrieval-report`:  1203 vectors
+a clean build of the same corpus:              908 vectors
+overall hit@5, stale index:  0.702
+overall hit@5, clean index:  0.851
+```
+
+295 stale chunks, and a headline figure wrong by 0.149 — in the pessimistic
+direction here, but nothing makes that the general case. Every number in this
+iteration was measured in a fresh index directory for exactly this reason; the
+numbers in `retrieval.md` are reproducible from a clean index and not otherwise.
+
+I rebuilt the user's `data/index` with `make reindex` afterwards, since my own
+run had mixed old and new chunks into it. `data/index/` is gitignored, so a fresh
+clone is unaffected — this bites anyone who has run the tool before.
+
+The fix is not obvious enough to bolt on here. `index_all(rebuild=True)` in the
+eval path is correct but forces a 25-minute re-embed of the whole corpus on every
+e5-large run. Detecting that the store holds chunk ids outside the current chunk
+set, and refusing to report rather than reporting quietly, is cheaper and more in
+keeping with the rest of this codebase. That is the next iteration.
+
+Also still open from iteration 1: `pam_authentication_failure` never captures
+`rhost`; the candidate pattern is written down there and remains untested.

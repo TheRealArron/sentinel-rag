@@ -171,6 +171,15 @@ ioc-check: ## Compile threat feeds without writing, and refresh the Go/Python ag
 honeytokens-verify: build ## Check canaries do not collide with real accounts (run on the host)
 	./$(BIN) -honeytokens-verify /etc/passwd
 
+.PHONY: tokenizer-check
+tokenizer-check: ## Refresh the estimator/tokenizer agreement vectors (needs sentence-transformers)
+	@# lang.estimate_tokens models a SentencePiece tokenizer it cannot import,
+	@# because the chunker must run dependency-free and chunk ids must not depend
+	@# on what is installed. These vectors are how that model is held to the real
+	@# thing; the test that reads them needs no dependencies. Run after changing
+	@# chunking, the estimator, or the corpus.
+	$(PYTHON) scripts/gen-tokenizer-vectors.py
+
 .PHONY: index
 index: ## Build the hierarchical index
 	$(PYTHON) -m sentinel index

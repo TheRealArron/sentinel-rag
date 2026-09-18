@@ -51,6 +51,16 @@ class TestEstimateTokens:
         english = "a" * 100
         assert estimate_tokens(japanese) > 3 * estimate_tokens(english)
 
+    def test_identifier_dense_text_costs_more_than_prose_of_the_same_length(self):
+        # SentencePiece merges letters into word pieces but emits digits and
+        # punctuation as separate tokens, so an NVD record tokenises far worse
+        # than prose of the same length. Estimating that third class at four
+        # characters per token is what built chunks past e5's 512-token limit.
+        identifiers = "CVE-2026-46279 mm/alloc_tag:0x7f,drm/amdgpu(7.8/10)"
+        prose = "the quick brown fox jumps over a lazy dog and keeps on running"
+        assert len(identifiers) < len(prose)
+        assert estimate_tokens(identifiers) > estimate_tokens(prose)
+
     def test_empty(self):
         assert estimate_tokens("") == 0
 
@@ -157,6 +167,9 @@ class TestBuildHierarchy:
         text = "。".join("攻撃者はSSHの総当たり攻撃により認証情報を取得しました" for _ in range(80)) + "。"
         parents, children = build_hierarchy(self._doc(text, "ja"), 600, 120, 20)
         assert len(children) > 1
-        # +len(title) tokens for the prepended title.
+        # +len(title) tokens for the prepended title. `child_tokens` bounds the
+        # body; the title and the overlap tail are added on top of it, and the
+        # margin that keeps the sum under the model's input limit is measured
+        # rather than structural — see tests/test_tokenizer_vectors.py.
         assert all(estimate_tokens(c.text) <= 160 for c in children)
         assert all(c.lang == "ja" for c in children)

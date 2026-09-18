@@ -198,13 +198,13 @@ the two languages.
 >
 > `make retrieval-report` now measures this against 47 hand-built queries, each
 > with one to three expected documents. With the floor off, **cross-lingual
-> hit@5 is 0.188 on the fallback, 0.438 with `multilingual-e5-small`, and 0.562
+> hit@5 is 0.312 on the fallback, 0.438 with `multilingual-e5-small`, and 0.594
 > with `multilingual-e5-large`**, the project default. So the model does carry
 > genuine cross-lingual signal, and more of it at the larger size. It is also
-> still only about half at k=5, and the per-language floor lifts it to 0.938,
-> which means the *floor* is still the thing making the guarantee. Overall hit@5
-> is 0.830 / 0.936 / 0.915 — large ranks better at the top (MRR 0.858 against
-> 0.839) but misses one more query at k=5.
+> still only about six in ten at k=5, and the per-language floor lifts it to
+> 0.938, which means the *floor* is still the thing making the guarantee. Overall
+> hit@5 is 0.851 / 0.936 / 0.936, and large and small now tie there and on hit@1,
+> with large well ahead cross-lingually and small ahead on overall hit@3.
 >
 > The likeliest reason cross-lingual lags is a same-language preference: on every
 > query with a relevant document in each language where both were retrieved, the
@@ -214,13 +214,23 @@ the two languages.
 > 12 of 12. Part of that is likely the corpus rather than the model — an English
 > query competes with 42 English documents, a Japanese one with five Japanese ones.
 >
-> **A known defect was present in every number above.** The token-count estimator
-> that sizes chunks underestimates English, so 9 of 93 child chunks exceed e5's
-> 512-token input limit and are silently truncated when embedded. It affects both
-> e5 runs equally and is unfixed, because fixing it moves chunk boundaries and
-> would invalidate this table rather than just correct it.
-> [`docs/design/retrieval.md`](docs/design/retrieval.md) has the tables, the
-> method, the remaining misses and the caveats;
+> **A defect that distorted every earlier number here is now fixed, and these
+> numbers are a fresh run.** The token-count estimator that sizes chunks counted
+> digits and punctuation at four characters per token, which SentencePiece does
+> not do, so 9 of 93 child chunks were built past e5's 512-token input limit and
+> silently truncated — 1397 tokens never reached the model. It now counts them at
+> one token each: no chunk exceeds the limit, and the longest is 497 of 512. That
+> margin is thin and empirical rather than structural, so the real tokenizer's
+> counts are committed and a dependency-free test fails if it disappears
+> (`make tokenizer-check`).
+>
+> The effect on retrieval is small and not all in one direction: e5-large overall
+> hit@5 0.915 → 0.936 and cross-lingual 0.562 → 0.594, one fewer miss; the
+> fallback gains cross-lingually and loses a little at hit@1. Most of these
+> movements are one or two queries out of 47 and none of it is tested for
+> significance. [`docs/design/retrieval.md`](docs/design/retrieval.md) has the
+> tables, the method, the remaining misses, the variant that was measured and
+> rejected, and the caveats;
 > [`docs/design/corpus.md`](docs/design/corpus.md) has the corpus provenance.
 
 ### 3. Hierarchical indexing to suppress hallucination
@@ -237,14 +247,17 @@ unchanged corpus embeds nothing.
 <a name="why-a-hand-written-splitter"></a>
 **Why a hand-written splitter.** LangChain's character-count splitter, tuned for
 English, produces Japanese chunks roughly **twice over budget**. Measured with
-multilingual-e5's own tokenizer on this corpus, English prose runs 3.4 characters
-per token and Japanese script 1.6, so a character budget sized for English holds
-about 2.2× its tokens once the text is Japanese. (This used to say four times,
+multilingual-e5's own tokenizer on this corpus, English prose runs 3.3 characters
+per token and Japanese script 1.8, so a character budget sized for English holds
+about 1.9× its tokens once the text is Japanese. (This used to say four times,
 from the rule of thumb of one token per Japanese character; the tokenizer merges
-more than that.) And splitting Japanese on `". "` finds nothing, so it falls
-through to a hard character cut mid-word. `sentinel/chunking.py` uses a
-script-aware token estimate and a separator list that includes `。`, `、`, `！`,
-`？`. LangChain still earns its place in orchestration; this particular 150 lines
+more than that. It then said 2.2×, from a grouping that counted five English
+summaries where this one counts three — the column moves with how the corpus is
+split, not with the estimator.) And splitting Japanese on `". "` finds nothing,
+so it falls through to a hard character cut mid-word. `sentinel/chunking.py` uses
+a script-aware token estimate — CJK at one token per character, letters and
+whitespace at four characters per token, digits and punctuation at one token each
+— and a separator list that includes `。`, `、`, `！`, `？`. LangChain still earns its place in orchestration; this particular 150 lines
 was load-bearing enough to own.
 
 ### 4. Log lines are attacker-controlled input, and are treated that way

@@ -31,37 +31,86 @@ A character-count splitter tuned for English produces Japanese chunks about twic
 over budget. And splitting Japanese on `". "` finds nothing, so it falls through
 to a hard cut mid-word.
 
-`lang.estimate_tokens` counts CJK code points as one token each and everything
-else at four characters per token; the separator list includes `。`, `、`, `！`,
-`？`.
+`lang.estimate_tokens` counts CJK code points as one token each, letters and
+whitespace at four characters per token, and digits, punctuation and symbols at
+one token each; the separator list includes `。`, `、`, `！`, `？`.
 
 ### Measured against the real tokenizer
 
 This section used to say *four times*, from a rule of thumb: one token per
 Japanese character, four characters per English token. Neither half survives the
 tokenizer multilingual-e5 actually uses (XLM-R's SentencePiece vocabulary).
-Measured on this corpus:
+Measured on this corpus, with the estimator as it now stands:
 
-| Text | chars / token | `estimate_tokens` ÷ real |
+| Text | n | chars / token | `estimate_tokens` ÷ real |
+|---|---:|---:|---:|
+| English, hand-written summaries | 3 | 3.33 | 1.15 |
+| English, NVD records | 39 | 3.02 | 1.22 |
+| Japanese documents, whole | 5 | 2.02 | 1.42 |
+| Japanese script only | 5 | 1.78 | 1.78 |
+
+A character budget sized for English still holds roughly twice its tokens on
+Japanese script, which is what justifies a script-aware splitter — about half
+the figure this document originally claimed.
+
+The ratio column previously read 0.87 / 0.74 / 1.58 / 1.19, against an estimator
+that counted everything non-CJK at four characters per token. The chars-per-token
+column moved a little too (from 3.43 / 2.97 / 1.58 / 2.07); that column is a
+property of the tokenizer and not of the estimator, and it shifts here because
+this grouping counts 39 NVD records against 3 hand-written summaries, where the
+earlier split counted five summaries.
+
+### The third character class, and the truncation it caused
+
+Counting everything non-CJK at four characters per token was wrong in the
+direction that loses data. SentencePiece merges letters into multi-character
+word pieces, so prose really does run about four characters to the token. It does
+not merge digits and punctuation: `CVE-2026-46279` and `mm/alloc_tag:` become a
+long run of one-character pieces, and an NVD record is dense with exactly those.
+
+Measured with the real tokenizer, before the fix: the worst child chunk estimated
+433 tokens and held **788**, a ratio of 1.82. Nine of 93 chunks were over e5's
+512-token input limit, the largest at 824, and sentence-transformers truncates
+silently — 1397 tokens were discarded before they were ever embedded. Eight of
+the nine were already past the limit before the prepended title was counted, so
+the title was never the cause.
+
+`estimate_tokens` now counts three classes, and the defect is closed:
+
+| | before | after |
 |---|---:|---:|
-| English, hand-written summaries | 3.43 | 0.87 |
-| English, NVD records | 2.97 | 0.74 |
-| Japanese script only | 1.58 | 1.58 |
-| Japanese documents, whole | 2.07 | 1.19 |
+| child chunks | 93 | 126 |
+| chunks over the 512-token limit | 9 | **0** |
+| longest chunk, real tokens | 824 | 497 |
+| tokens discarded by truncation | 1397 | **0** |
+| real ÷ estimate, worst chunk | 1.80 | 1.05 |
 
-So a character budget sized for English holds about **2.2×** its tokens on
-Japanese script, and 1.7× on whole Japanese documents, which carry ASCII
-identifiers. That still justifies a script-aware splitter. It is half the figure
-previously claimed.
+**The remaining margin is thin, and it is empirical rather than structural.**
+`child_tokens` bounds the chunk *body*; the prepended title and the overlap tail
+are added on top of it, so the embedded string's estimate reaches 502 against a
+400-token budget. At the worst observed ratio that arithmetic permits about 529
+real tokens, which would not fit. It does not happen only because the chunks that
+run longest are ones this estimator overestimates. The longest is 497 of 512 —
+fifteen tokens of headroom, and a longer document could consume it.
 
-The estimator errs in both directions. Overestimating Japanese is the safe one:
-Japanese chunks come out smaller than budget. Underestimating English is not.
-**9 of the 93 child chunks exceed e5's 512-token input limit** once the
-`passage: ` prefix and the prepended title are counted — all English, the
-largest at 824 tokens — and sentence-transformers truncates silently, so the
-tail of those chunks is never embedded. The retrieval numbers below were measured
-with that defect present. Fixing it changes chunk boundaries, and therefore every
-number below, so it is recorded here rather than folded into this measurement.
+Nothing detects that on its own, so it is pinned instead.
+`engine/tests/testdata/tokenizer_vectors.json` holds the 49 longest chunks with
+their token counts from the real tokenizer, and
+`engine/tests/test_tokenizer_vectors.py` — which needs no dependencies to run —
+fails if a chunk reaches the limit, if the estimator drifts from the committed
+numbers, or if the headroom disappears. `make tokenizer-check` regenerates it,
+and must be re-run when the corpus, the chunking settings, or the estimator
+change. It is the arrangement the Go/Python Sigma and IOC bridges already use,
+for the same reason: an approximation of something you are not allowed to import
+has to be held against it somewhere, or it drifts in silence. That is precisely
+how this defect survived — every test that measured a chunk against its budget
+measured it with the same estimator that was wrong, so they all agreed.
+
+A second change was built, measured, and **rejected**: reserving the title and
+overlap inside `child_tokens`, so the budget would bound the embedded string
+structurally instead of empirically. It works — 174 chunks, longest 380 — but
+smaller chunks retrieve worse, and it cost e5-large overall hit@5 0.936 → 0.894,
+cross-lingual 0.594 → 0.531, and misses 3 → 5. The headroom was not worth that.
 
 ## Hierarchical parent-document retrieval
 
@@ -111,19 +160,30 @@ makes cross-lingual recall meaningless: the Japanese document is in the results
 because the floor put it there. The report therefore runs both ways. Floor-off is
 ranking quality; floor-on is what the operator receives.
 
+> **These tables were re-measured after the chunking fix above.** Every number
+> here comes from a run on the current code; the pre-fix figures are kept
+> alongside so the effect of the fix is visible rather than quietly replaced.
+> Each run used a fresh index directory, because chunk ids are content-addressed
+> and a reused store would have kept the old chunks alongside the new ones.
+
 ### Results — dependency-free backend (`hashing-512`, `LocalVectorStore`)
 
 | Slice | queries | hit@1 | hit@3 | hit@5 | MRR |
 |---|---:|---:|---:|---:|---:|
-| overall | 47 | 0.660 | 0.787 | **0.830** | 0.720 |
-| **cross-lingual** | 32 | 0.062 | 0.156 | **0.188** | 0.112 |
-| query lang = en | 33 | 0.697 | 0.788 | 0.818 | 0.740 |
-| query lang = ja | 14 | 0.571 | 0.786 | 0.857 | 0.673 |
-| origin = event | 32 | 0.625 | 0.750 | 0.812 | 0.688 |
-| origin = software | 15 | 0.733 | 0.867 | 0.867 | 0.789 |
+| overall | 47 | 0.638 | 0.766 | **0.851** | 0.713 |
+| **cross-lingual** | 32 | 0.125 | 0.219 | **0.312** | 0.183 |
+| query lang = en | 33 | 0.636 | 0.727 | 0.849 | 0.702 |
+| query lang = ja | 14 | 0.643 | 0.857 | 0.857 | 0.738 |
+| origin = event | 32 | 0.562 | 0.750 | 0.844 | 0.664 |
+| origin = software | 15 | 0.800 | 0.800 | 0.867 | 0.817 |
 
-With the floor **on**, cross-lingual hit@5 goes from 0.188 to **0.656** — while
-hit@1 and hit@3 do not move at all (0.062 and 0.156 in both runs).
+Before the fix: overall 0.660 / 0.787 / 0.830 / 0.720 and cross-lingual 0.062 /
+0.156 / 0.188 / 0.112, with 8 misses against 7 now. The fix helps this backend
+at k=5 and cross-lingually — smaller chunks give a lexical retriever more
+specific vectors to match — and costs it a little at hit@1.
+
+With the floor **on**, cross-lingual hit@5 goes from 0.312 to **0.562** (it was
+0.188 → 0.656 before the fix).
 
 That pattern is the whole finding in one line. The floor reserves a slot near the
 bottom of the result set, so it can only change the figure at the k where the
@@ -148,66 +208,94 @@ option `requirements.txt` offers for constrained hosts. Both tables are floor of
 
 | Slice | queries | hit@1 | hit@3 | hit@5 | MRR |
 |---|---:|---:|---:|---:|---:|
-| overall | 47 | 0.787 | 0.894 | **0.936** | 0.839 |
-| **cross-lingual** | 32 | 0.125 | 0.250 | **0.438** | 0.212 |
-| query lang = en | 33 | 0.758 | 0.879 | 0.939 | 0.822 |
-| query lang = ja | 14 | 0.857 | 0.929 | 0.929 | 0.881 |
-| origin = event | 32 | 0.750 | 0.875 | 0.938 | 0.816 |
-| origin = software | 15 | 0.867 | 0.933 | 0.933 | 0.889 |
+| overall | 47 | 0.830 | 0.915 | **0.936** | 0.870 |
+| **cross-lingual** | 32 | 0.094 | 0.281 | **0.438** | 0.213 |
+| query lang = en | 33 | 0.818 | 0.909 | 0.939 | 0.860 |
+| query lang = ja | 14 | 0.857 | 0.929 | 0.929 | 0.893 |
+| origin = event | 32 | 0.812 | 0.906 | 0.938 | 0.855 |
+| origin = software | 15 | 0.867 | 0.933 | 0.933 | 0.900 |
+
+Before the fix: overall 0.787 / 0.894 / 0.936 / 0.839, cross-lingual 0.125 /
+0.250 / 0.438 / 0.212. Overall hit@1 gains most (0.787 → 0.830); cross-lingual
+hit@5 does not move and cross-lingual hit@1 falls. The same three queries miss
+before and after (q08, q14, q46).
 
 **multilingual-e5-large**
 
 | Slice | queries | hit@1 | hit@3 | hit@5 | MRR |
 |---|---:|---:|---:|---:|---:|
-| overall | 47 | 0.830 | 0.872 | **0.915** | 0.858 |
-| **cross-lingual** | 32 | 0.094 | 0.344 | **0.562** | 0.249 |
-| query lang = en | 33 | 0.788 | 0.818 | 0.879 | 0.818 |
-| query lang = ja | 14 | 0.929 | 1.000 | 1.000 | 0.952 |
-| origin = event | 32 | 0.781 | 0.812 | 0.875 | 0.812 |
-| origin = software | 15 | 0.933 | 1.000 | 1.000 | 0.956 |
+| overall | 47 | 0.830 | 0.894 | **0.936** | 0.871 |
+| **cross-lingual** | 32 | 0.094 | 0.312 | **0.594** | 0.258 |
+| query lang = en | 33 | 0.788 | 0.849 | 0.909 | 0.832 |
+| query lang = ja | 14 | 0.929 | 1.000 | 1.000 | 0.964 |
+| origin = event | 32 | 0.781 | 0.844 | 0.906 | 0.827 |
+| origin = software | 15 | 0.933 | 1.000 | 1.000 | 0.967 |
+
+Before the fix: overall 0.830 / 0.872 / 0.915 / 0.858, cross-lingual 0.094 /
+0.344 / 0.562 / 0.249. Overall hit@5 0.915 → 0.936 and cross-lingual hit@5
+0.562 → 0.594, with the miss list going from four queries to three — `q21`, the
+reverse shell launched from a sudo command line, is now found, and nothing that
+was found before is lost. Cross-lingual hit@3 is the one figure that drops
+(0.344 → 0.312), which is one query.
+
+With the floor **on**, e5-large now answers every query in the top five
+(overall hit@5 1.000, from 0.957); cross-lingual floor-on is unchanged at 0.938.
 
 ### The gap, which is the point
 
 | | hashing-512 | e5-small | e5-large |
 |---|---:|---:|---:|
-| overall hit@5 | 0.830 | 0.936 | 0.915 |
-| overall MRR | 0.720 | 0.839 | 0.858 |
-| **cross-lingual hit@5** | **0.188** | **0.438** | **0.562** |
-| cross-lingual MRR | 0.112 | 0.212 | 0.249 |
-| cross-lingual hit@5, floor **on** | 0.656 | 0.750 | 0.938 |
-| misses at k=5 | 8 | 3 | 4 |
+| overall hit@5 | 0.851 | 0.936 | 0.936 |
+| overall MRR | 0.713 | 0.870 | 0.871 |
+| **cross-lingual hit@5** | **0.312** | **0.438** | **0.594** |
+| cross-lingual MRR | 0.183 | 0.213 | 0.258 |
+| cross-lingual hit@5, floor **on** | 0.562 | 0.719 | 0.938 |
+| misses at k=5 | 7 | 3 | 3 |
 
-**e5 does beat the fallback, and by a lot on exactly the axis it was chosen
-for.** Cross-lingual hit@5 roughly triples from the fallback to e5-large. That is
-the claim in the README finally carrying evidence rather than an argument.
+**e5 does beat the fallback, on exactly the axis it was chosen for.**
+Cross-lingual hit@5 goes from 0.312 to 0.594, roughly double. Before the
+chunking fix the same comparison was 0.188 to 0.562, roughly triple — the gap
+narrowed because the fix helped the lexical fallback more than it helped the
+model, not because e5 got worse.
 
-**Large is not uniformly better than small.** It is better cross-lingually
-(0.562 against 0.438) and at the top of the overall ranking (hit@1 0.830 against
-0.787, MRR 0.858 against 0.839), but overall hit@5 is lower, it misses one more
-query, and cross-lingually at rank 1 it is *worse* (0.094 against 0.125). An
+**Large is no longer uniformly behind small on the overall figures.** The two now
+tie on overall hit@1 (0.830) and hit@5 (0.936) and are within a thousandth on MRR
+(0.871 against 0.870); small is ahead on overall hit@3 (0.915 against 0.894), and
+large is well ahead cross-lingually (0.594 against 0.438). They miss the same
+number of queries, three, though not the same ones. Before the fix large lost on
+overall hit@5 and missed one more query than small; that is no longer true. An
 earlier version of this note, written before large could be run, called small's
 0.438 "a lower bound" on the default configuration. For cross-lingual hit@5 it
 was; as a general statement it was not.
 
-**And cross-lingual is still only about half at k=5.** A query finds the answer
-that sits in the other language 56% of the time with large, and at rank 1 fewer
-than one time in ten. Switching the per-language floor on takes that to 0.938 —
-what the operator receives, but floor-on hit@5 measures a guarantee, not ranking.
-With e5-small the floor added more than the model did (+0.31 against +0.25 over
-the fallback); with e5-large the two are the same size (+0.375 and +0.374). The
-model contributes real cross-lingual signal, and the floor is still what makes
-the guarantee.
+**And cross-lingual is still only about six in ten at k=5.** A query finds the
+answer sitting in the other language 59% of the time with large, and at rank 1
+fewer than one time in ten — cross-lingual hit@1 did not move at all. Switching
+the per-language floor on takes hit@5 to 0.938, which is what the operator
+receives, but floor-on hit@5 measures a guarantee rather than ranking. Over the
+fallback, the model now contributes +0.282 and the floor a further +0.344; the
+model contributes real cross-lingual signal and the floor is still what makes the
+guarantee.
+
+With 32 cross-lingual queries, the difference between 0.562 and 0.594 is one
+query. Nothing in this section has been tested for significance, and most of the
+movement in this iteration is of that size.
+
+> **Not re-measured after the chunking fix.** The two subsections below — the
+> asymmetry between query directions, and the same-language-preference analysis —
+> were measured on the pre-fix chunking and have not been re-run. Chunk
+> boundaries moved underneath them, so treat their figures as describing the
+> earlier configuration. The per-direction split needs the `--json` report rather
+> than the table above, and re-deriving it was not part of this change.
 
 **The two directions are not symmetric.** Split by query language (e5-large,
-floor off), English queries find the Japanese answer in the top five in 6 of 20
-cases (0.300) and Japanese queries find the English answer in 12 of 12 (1.000);
-at rank 1 it is 0 of 20 and 3 of 12. Part of that is corpus composition rather
-than the model: an English query competes with 42 English documents for five
-slots, a Japanese query with five Japanese ones. The overall 0.929 hit@1 for
-Japanese queries is mostly same-language hits and says nothing about this.
-
-With 32 cross-lingual queries, the difference between 0.438 and 0.562 is four
-queries. Nothing in this section has been tested for significance.
+floor off, *pre-fix chunking*), English queries find the Japanese answer in the
+top five in 6 of 20 cases (0.300) and Japanese queries find the English answer in
+12 of 12 (1.000); at rank 1 it is 0 of 20 and 3 of 12. Part of that is corpus
+composition rather than the model: an English query competes with 42 English
+documents for five slots, a Japanese query with five Japanese ones. The overall
+0.929 hit@1 for Japanese queries is mostly same-language hits and says nothing
+about this.
 
 ### Why cross-lingual is weak: a same-language preference, not the score band
 
@@ -264,21 +352,33 @@ The misses are informative rather than random. e5-small misses three:
   one-paragraph NVD record whose distinguishing words are all English product
   identifiers.
 
-e5-large misses four, all English queries, and three of them — `q14` again,
-`q19` and `q20`, both about failed sudo attempts — have only a Japanese answer.
-The fourth, `q21`, a reverse shell launched from sudo, retrieves the sudo CVEs
-instead of the persistence note. Large fixes `q08` and `q46` and newly misses
-`q19`, `q20` and `q21`; two of those three have only a Japanese answer, which is
-the same-language preference showing up in the miss list.
+e5-large now misses three, all English queries, and all three — `q14`, `q19` and
+`q20`, the last two about failed sudo attempts — have only a Japanese answer.
+Large still fixes `q08` and `q46`, which small misses. Before the chunking fix it
+also missed `q21`, a reverse shell launched from a sudo command line, which
+retrieved the sudo CVEs instead of the persistence note; that one is now found,
+and it is the only change to either miss list. The remaining three are the
+same-language preference showing up in the miss list, and they are the cases a
+better Japanese corpus would address before a better model would.
 
 ### What this run does *not* establish
 
-**The chunking defect above was present in both runs.** Nine of 93 child chunks
-exceed the 512-token input limit both models share and are truncated when
-embedded. Fixing the estimator changes chunk boundaries and would move every
-number here.
+**The chunking defect is fixed, and the margin that replaced it is thin.** No
+chunk now exceeds the 512-token limit, but the longest is 497 of 512 and the
+guarantee is empirical — see "The third character class" above. A larger corpus
+can consume that headroom, and only `make tokenizer-check` would notice.
+
+**Whether any of this movement is real.** The largest change to a headline figure
+is e5-large's cross-lingual hit@5, 0.562 → 0.594, which is one query out of 32.
+Overall hit@5 moved by one query too. Nothing here is tested for significance,
+and a 47-query set judged by one person cannot support much.
+
+**The two analyses above were not re-run** on the new chunk boundaries: the
+per-direction asymmetry and the same-language-preference comparison both describe
+the pre-fix configuration.
 
 Also unmeasured: ChromaDB's approximate index (this used the exact
 `LocalVectorStore`, so no recall was lost to ANN), any k above 5, and whether
-better chunking would move the cross-lingual number more cheaply than a bigger
-model would.
+chunk *size* rather than chunk correctness is what moved these numbers — the fix
+changed the count from 93 to 126, and the rejected variant that took it to 174
+was worse, which hints that size matters here but does not isolate it.

@@ -73,26 +73,46 @@ def detect_language(text: str) -> str:
 def estimate_tokens(text: str) -> int:
     """Approximate the token count of ``text`` without a tokenizer.
 
-    CJK code points count as one token each; runs of non-CJK characters count as
-    one token per four characters. Measured against the multilingual-e5
-    tokenizer on this corpus it is not uniformly close: it overestimates Japanese
-    script by ~1.6x (the SentencePiece vocabulary merges multi-character pieces,
-    so the real density is ~0.63 tokens per character) and underestimates
-    English by 13% on prose and 26% on NVD records, which are dense with
-    identifiers. Overestimating is the safe direction for a budget;
-    underestimating is not. See "Script-aware chunking" in
-    docs/design/retrieval.md.
+    Three character classes, because multilingual-e5's SentencePiece vocabulary
+    treats them differently:
+
+    * CJK code points — one token each.
+    * Letters and whitespace — about four characters per token, because the
+      vocabulary merges those into multi-character word pieces.
+    * Everything else: digits, punctuation, symbols — one token each. These are
+      the pieces SentencePiece does *not* merge, and they are why an NVD record
+      dense with ``CVE-2026-46279`` and ``mm/alloc_tag:`` tokenises far worse
+      than prose of the same length.
+
+    That third class is the correction. Counting it at four characters per token
+    made this an underestimate exactly where it mattered: the worst child chunk
+    in this corpus estimated 433 tokens and really held 788, a ratio of 1.82.
+    The chunker's budget is only as good as this estimate, so nine of 93 child
+    chunks were built past e5's 512-token input limit and truncated silently at
+    embed time.
+
+    Measured on this corpus after the change: real tokens ÷ this estimate has a
+    maximum of 1.05, where it was 1.80, and the longest child chunk is 497 tokens
+    against the 512-token limit — fifteen tokens of headroom, which is thin and
+    empirical rather than guaranteed. `engine/tests/test_tokenizer_vectors.py`
+    pins it against counts from the real tokenizer.
+
+    Overestimating is the safe direction for a budget; underestimating is not.
+    See "Script-aware chunking" in docs/design/retrieval.md.
     """
     if not text:
         return 0
     cjk = 0
-    other = 0
+    merged = 0
+    discrete = 0
     for ch in text:
         if is_cjk(ch):
             cjk += 1
+        elif ch.isalpha() or ch.isspace():
+            merged += 1
         else:
-            other += 1
-    return cjk + (other + 3) // 4
+            discrete += 1
+    return cjk + (merged + 3) // 4 + discrete
 
 
 def token_budget_to_chars(tokens: int, text: str) -> int:
