@@ -65,6 +65,23 @@ class TestAllowlist:
         assert responder.is_allowlisted("10.0.0.1") is True
         assert responder.is_allowlisted("203.0.113.45") is False
 
+    def test_a_malformed_entry_is_reported_rather_than_silently_dropped(self, monkeypatch, settings):
+        # A typo in an allowlist entry does not narrow this guard rail, it removes
+        # it: whatever that line was meant to protect becomes blockable. Skipping
+        # it quietly is how an operator ends up believing their LAN is covered.
+        monkeypatch.setenv("SENTINEL_RESPONSE_ALLOWLIST", "192.168.0.0/16,192.168.0.0/33")
+        responder = Responder(Settings())
+        assert responder.allowlist_errors == ["192.168.0.0/33"]
+        assert responder.status()["allowlist_invalid"] == ["192.168.0.0/33"]
+        # And the warning reaches the audit trail, where an incident review reads.
+        action = responder.block("203.0.113.45", score=95, reason="t")
+        assert "could not be parsed" in action.detail
+
+    def test_a_clean_allowlist_reports_no_errors(self, responder):
+        assert responder.allowlist_errors == []
+        assert responder.status()["allowlist_invalid"] == []
+        assert "could not be parsed" not in responder.block("203.0.113.45", score=95, reason="t").detail
+
 
 class TestScoreThreshold:
     def test_below_threshold_is_refused(self, responder):
@@ -138,6 +155,30 @@ class TestAudit:
 
     def test_history_is_empty_before_any_action(self, responder):
         assert responder.history() == []
+
+    def test_history_holds_only_the_rows_it_returns(self, responder, settings):
+        """Memory proportional to the limit, not to the audit log.
+
+        The log is append-only and never rotated by this process, so on a
+        long-running host it is the biggest file the engine owns — and
+        GET /api/response/history is an unauthenticated read. Returning the last
+        few rows must not mean materialising every row ever written.
+        """
+        for i in range(50):
+            responder.block(f"203.0.113.{i + 1}", score=95, reason="bulk")
+
+        history = responder.history(limit=5)
+        assert len(history) == 5
+        # Newest first, and they are the newest five.
+        assert [row["target"] for row in history] == [
+            "203.0.113.50", "203.0.113.49", "203.0.113.48", "203.0.113.47", "203.0.113.46",
+        ]
+
+    def test_a_truncated_audit_line_does_not_break_history(self, responder, settings):
+        responder.block("203.0.113.45", score=95, reason="real")
+        with settings.audit_log.open("a", encoding="utf-8") as fh:
+            fh.write('{"action": "block", "target": "203.0.11')  # killed mid-write
+        assert [row["target"] for row in responder.history()] == ["203.0.113.45"]
 
 
 class TestStatus:

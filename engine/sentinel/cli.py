@@ -20,8 +20,9 @@ import json
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
-from .config import Settings, get_settings
+from .config import Settings, get_settings, repo_root
 from .engine import SentinelEngine
 from .schemas import Alert
 
@@ -658,7 +659,13 @@ def cmd_demo(args, engine: SentinelEngine, printer: Printer) -> int:
     demo does not require a Go toolchain to show the full pipeline.
     """
     settings = engine.settings
+    # The fixture is committed under the repository's data/, which is not
+    # necessarily settings.data_dir: someone who pointed SENTINEL_DATA_DIR at a
+    # mounted disk still has the sample in the checkout. Prefer the configured
+    # location — a deployment may ship its own — and fall back to the repo's.
     sample = settings.data_dir / "samples" / "events.sample.jsonl"
+    if not sample.exists():
+        sample = repo_root() / "data" / "samples" / "events.sample.jsonl"
 
     printer.header("1/4 — event source")
     if not settings.events_path.exists() or settings.events_path.stat().st_size == 0:
@@ -714,7 +721,7 @@ def _add_global_flags(target: argparse.ArgumentParser, suppress: bool) -> None:
     parser survives. With an ordinary ``store_true`` default the subparser would
     write False over an earlier ``--json``, silently discarding it.
     """
-    kwargs: dict[str, object] = {"default": argparse.SUPPRESS} if suppress else {}
+    kwargs: dict[str, Any] = {"default": argparse.SUPPRESS} if suppress else {}
     target.add_argument(
         "--json", action="store_true", help="emit machine-readable JSON", **kwargs
     )

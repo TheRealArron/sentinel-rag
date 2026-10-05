@@ -444,3 +444,47 @@ class TestHoneytokensInTheFixture:
         incident = next(e for e in engine.events.all() if e.rule == "correlated_brute_force")
         assert incident.fields["failure_count"] == "5"
         assert incident.fields["targeted_users"] == "admin, arron, oracle, root, test"
+
+
+class TestFastAPIAdapterParity:
+    """The two servers must serve the same set of paths.
+
+    This class exists because they did not. ``/api/shadow``, ``/api/shadow/run``,
+    ``/api/graph``, ``/api/graph.dot`` and ``/index.html`` were registered in
+    routes.py and 404'd under uvicorn — the deployment the README calls
+    production — because api.py declared its paths by hand. Two of them are
+    polled by the dashboard, so the Shadow Search and attack-graph panels were
+    dead there and nowhere else.
+
+    The first two tests need no FastAPI, which matters: CI installs none, and
+    that is precisely why the drift survived. They assert the properties that can
+    be checked from the tables alone. The third installs the real app when
+    FastAPI happens to be present.
+    """
+
+    def test_every_router_route_has_docs_prose(self):
+        from sentinel.api import missing_summaries
+
+        assert missing_summaries() == [], (
+            "these routes would appear in /docs with a generated placeholder; "
+            "add them to api.SUMMARIES"
+        )
+
+    def test_no_summary_describes_a_route_that_no_longer_exists(self):
+        from sentinel.api import SUMMARIES
+        from sentinel.routes import ROUTES
+
+        assert [key for key in SUMMARIES if key not in ROUTES] == []
+
+    def test_the_fastapi_app_serves_every_router_route(self):
+        pytest.importorskip("fastapi")
+        from sentinel.api import create_app
+        from sentinel.routes import ROUTES
+
+        app = create_app(SentinelEngine(Settings()))
+        declared = {
+            (method, route.path)
+            for route in app.routes
+            for method in getattr(route, "methods", ())
+        }
+        assert [key for key in sorted(ROUTES) if key not in declared] == []

@@ -116,6 +116,27 @@ class TestCSRF:
     def test_charset_parameter_is_tolerated(self):
         assert self._policy().check("POST", "application/json; charset=utf-8", "")[0] is True
 
+    def test_the_ipv6_loopback_dashboard_is_its_own_origin(self):
+        # A browser on http://[::1]:8000/ sends that exact Origin, brackets and
+        # all. The allowlist used to store the bracketed literal while _normalise
+        # stripped the brackets, so the two could never match and the dashboard's
+        # own block button was refused by a control aimed at other sites — the
+        # same defect shape as the bound-port one below, and just as invisible.
+        ok, reason = self._policy().check("POST", "application/json", "http://[::1]:8000")
+        assert ok is True, reason
+
+    def test_an_unparseable_origin_is_refused_and_does_not_raise(self):
+        # urlparse().port raises on a port outside 0-65535, and the Origin header
+        # is chosen by the caller. Before the guard this escaped check(), was
+        # caught by the router's blanket handler, and came back as a 500: a header
+        # an attacker controls must not be able to pick the status code.
+        for origin in ("http://[::1]:99999", "http://host:notaport", "://nonsense"):
+            ok, reason = self._policy().check("POST", "application/json", origin)
+            assert ok is False and "cross-origin" in reason
+
+    def test_an_ipv6_origin_on_another_port_is_still_refused(self):
+        assert self._policy().check("POST", "application/json", "http://[::1]:8001")[0] is False
+
 
 class TestGuardIntegration:
     def test_the_original_csrf_attack_is_now_refused(self, indexed_engine):

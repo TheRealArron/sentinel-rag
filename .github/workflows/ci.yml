@@ -287,6 +287,77 @@ jobs:
           python -m sentinel eval-retrieval \
             --cases ${{ github.workspace }}/data/eval/retrieval.jsonl --k 5
 
+  fastapi:
+    name: FastAPI adapter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install FastAPI only
+        # A separate job rather than a step in the matrix above, which installs no
+        # runtime dependencies on purpose. This is the one place FastAPI is
+        # present, and it exists because its absence hid a real defect: api.py
+        # declared its paths by hand and five of them — including the two the
+        # dashboard polls — 404'd under uvicorn while working fine under
+        # `python -m sentinel serve`. Nothing installed FastAPI, so nothing saw it.
+        run: python -m pip install --upgrade pip fastapi httpx
+
+      - name: Every router route is served by the app
+        env:
+          PYTHONPATH: ${{ github.workspace }}/engine
+          SENTINEL_EMBEDDING_BACKEND: hashing
+          SENTINEL_VECTOR_BACKEND: local
+          SENTINEL_LLM_PROVIDER: heuristic
+        run: |
+          python - <<'PY'
+          from fastapi.testclient import TestClient
+          from sentinel.api import create_app, missing_summaries
+          from sentinel.routes import ROUTES
+
+          app = create_app()
+          declared = {
+              (method, route.path)
+              for route in app.routes
+              for method in getattr(route, "methods", ())
+          }
+          missing = [key for key in sorted(ROUTES) if key not in declared]
+          assert not missing, f"not served by the FastAPI app: {missing}"
+          assert not missing_summaries(), f"no /docs summary for: {missing_summaries()}"
+
+          # Serving the path is not the same as answering on it. Every read must
+          # come back without a server error, and the two text endpoints must keep
+          # their own media types rather than being announced as HTML or JSON.
+          client = TestClient(app)
+          for (method, path), spec in sorted(ROUTES.items()):
+              if method != "GET" or path == "/api/search":  # search needs a query
+                  continue
+              response = client.get(path)
+              assert response.status_code == 200, f"GET {path} -> {response.status_code}"
+          assert "text/html" in client.get("/").headers["content-type"]
+          assert "graphviz" in client.get("/api/graph.dot").headers["content-type"]
+
+          # And the generated reference must be intact: duplicate operation ids
+          # silently break every generated client.
+          spec = client.get("/openapi.json").json()
+          ids = [op["operationId"] for p in spec["paths"].values() for op in p.values()]
+          assert len(ids) == len(set(ids)), "duplicate operation ids in the OpenAPI schema"
+          print(f"{len(ROUTES)} routes served, {len(ids)} documented")
+          PY
+
+      - name: The adapter still imports without FastAPI
+        # The parity check above is worthless if it only holds when FastAPI is
+        # installed: the module is imported by the test suite, which runs without
+        # it. Uninstalling proves the guard itself needs no dependency.
+        env:
+          PYTHONPATH: ${{ github.workspace }}/engine
+        run: |
+          python -m pip uninstall -y fastapi
+          python -c "from sentinel.api import missing_summaries; assert missing_summaries() == []"
+
   docker:
     name: Docker images
     runs-on: ubuntu-latest

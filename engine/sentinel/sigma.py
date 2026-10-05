@@ -552,9 +552,10 @@ def _metadata(rule: dict[str, Any]) -> tuple[str, list[str], list[str]]:
                 category = mapped[0]
             tags.extend(mapped[1:])
 
-    # Deduplicate, order-preserving.
-    seen: set[str] = set()
-    tags = [t for t in tags if not (t in seen or seen.add(t))]
+    # Deduplicate, order-preserving. dict.fromkeys on both, rather than a set
+    # whose .add is abused for its falsy return — same result, and it reads as
+    # what it is.
+    tags = list(dict.fromkeys(tags))
     mitre = list(dict.fromkeys(mitre))
     return category, mitre, tags
 

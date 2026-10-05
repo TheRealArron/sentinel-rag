@@ -340,6 +340,108 @@ class TestEndToEnd:
         assert payload["host_pinning"] is True
 
 
+class TestAbandonedBodies:
+    """A request whose body the hub stops reading must not poison the connection.
+
+    The hub speaks HTTP/1.1 with keep-alive, so unread body bytes are not merely
+    wasted: the next request on that connection gets parsed starting from the
+    middle of them. _json already guarded the 4xx case, where the refusal is sent
+    before the body is read. These are the cases that arrive the other way — a
+    body the handler *starts* reading and then abandons, which is answered with a
+    200 — and they are checked over a raw socket because http.client will not
+    send a malformed request for us.
+    """
+
+    @pytest.fixture
+    def running_hub(self, settings, pki, tmp_path):
+        cfg = hub_settings(settings, pki, events_path=tmp_path / "events.jsonl")
+        server = make_hub_server(cfg)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        yield server, server.server_address[1], tmp_path
+        server.shutdown()
+        server.server_close()
+
+    def _connect(self, port, pki):
+        import socket
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(cafile=str(pki["ca"]))
+        ctx.load_cert_chain(certfile=str(pki["p1_cert"]), keyfile=str(pki["p1_key"]))
+        raw = socket.create_connection(("127.0.0.1", port), timeout=15)
+        return ctx.wrap_socket(raw, server_hostname="127.0.0.1")
+
+    @staticmethod
+    def _read_response(sock) -> str:
+        chunks = []
+        while b"\r\n\r\n" not in b"".join(chunks):
+            block = sock.recv(4096)
+            if not block:
+                break
+            chunks.append(block)
+        return b"".join(chunks).decode("utf-8", errors="replace")
+
+    def test_an_unparseable_content_length_closes_the_connection(self, running_hub, pki):
+        _server, port, _tmp = running_hub
+        sock = self._connect(port, pki)
+        try:
+            body = b'{"message": "x"}\n'
+            sock.sendall(
+                b"POST /ingest HTTP/1.1\r\nHost: hub\r\n"
+                b"Content-Length: not-a-number\r\n\r\n" + body
+            )
+            response = self._read_response(sock)
+            # The request is answered, and the answer says the connection is over,
+            # so the probe reconnects rather than writing into a socket the server
+            # has stopped parsing.
+            assert "200 OK" in response.splitlines()[0] or "400" in response.splitlines()[0]
+            assert "connection: close" in response.lower()
+        finally:
+            sock.close()
+
+    def test_a_well_formed_batch_keeps_the_connection(self, running_hub, pki):
+        """The control: the fix must not turn every request into a fresh connection.
+
+        A probe with -follow ships over one long-lived connection; closing after
+        each batch would undo the streaming design.
+        """
+        _server, port, _tmp = running_hub
+        sock = self._connect(port, pki)
+        try:
+            body = b'{"message": "x"}\n'
+            sock.sendall(
+                b"POST /ingest HTTP/1.1\r\nHost: hub\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+            )
+            first = self._read_response(sock)
+            assert "200 OK" in first.splitlines()[0]
+            assert "connection: close" not in first.lower()
+
+            # And the connection really is reusable: a second batch on the same
+            # socket is parsed as a request, not as leftover body bytes.
+            sock.sendall(
+                b"POST /ingest HTTP/1.1\r\nHost: hub\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+            )
+            second = self._read_response(sock)
+            assert "200 OK" in second.splitlines()[0]
+        finally:
+            sock.close()
+
+    def test_a_malformed_chunk_header_closes_the_connection(self, running_hub, pki):
+        _server, port, _tmp = running_hub
+        sock = self._connect(port, pki)
+        try:
+            sock.sendall(
+                b"POST /ingest HTTP/1.1\r\nHost: hub\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\nZZZZ\r\n"
+            )
+            response = self._read_response(sock)
+            assert "connection: close" in response.lower()
+        finally:
+            sock.close()
+
+
 class TestPeerIdentity:
     def test_extracts_the_common_name(self):
         cert = {"subject": ((("countryName", "JP"),), (("commonName", "probe-07"),))}

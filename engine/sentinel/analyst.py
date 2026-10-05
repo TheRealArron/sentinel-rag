@@ -527,7 +527,10 @@ class Analyst:
         incidents = [e for e in events if e.is_incident]
         actor = peak.source_ip if peak and peak.source_ip else ""
 
-        if events:
+        # `if peak is not None` rather than `if events`: the two are equivalent by
+        # construction, and this is the one a reader (and a type checker) can see
+        # guarantees the attribute access below.
+        if peak is not None:
             title_en = (
                 f"{severity.upper()}: {peak.rule or 'unclassified activity'} on "
                 f"{peak.host or 'host'}" + (f" from {actor}" if actor else "")

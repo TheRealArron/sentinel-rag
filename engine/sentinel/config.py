@@ -64,17 +64,38 @@ def _env_list(name: str, default: str) -> list[str]:
     return [p.strip() for p in _env(name, default).split(",") if p.strip()]
 
 
+# A path field still holding this exact object was not chosen by anyone, so it
+# follows data_dir. Compared by identity rather than by value: the marker has to
+# be impossible to confuse with a path an operator could type, and by the time
+# __post_init__ has run no field holds it any more — which is what makes
+# dataclasses.replace(settings, index_dir=...) keep the path it was handed.
+_DERIVE = Path("\0derive-from-data-dir")
+
+# The default layout inside data_dir: field name to the name it takes there. Any
+# single entry can still be pointed elsewhere with its own variable.
+_DATA_SUBPATHS: tuple[tuple[str, str], ...] = (
+    ("events_path", "events.jsonl"),
+    ("advisory_dir", "advisories"),
+    ("chroma_dir", "chroma"),
+    ("index_dir", "index"),
+    ("audit_log", "audit.log"),
+)
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable runtime configuration."""
 
     # --- paths -------------------------------------------------------------
+    # Unset, these five follow data_dir (see _DATA_SUBPATHS for the layout), so
+    # one variable moves the whole working set. They default to <repo>/data/...
+    # because that is where data_dir defaults to.
     data_dir: Path = field(default_factory=lambda: _env_path("SENTINEL_DATA_DIR", _REPO_ROOT / "data"))
-    events_path: Path = field(default_factory=lambda: _env_path("SENTINEL_EVENTS_PATH", _REPO_ROOT / "data" / "events.jsonl"))
-    advisory_dir: Path = field(default_factory=lambda: _env_path("SENTINEL_ADVISORY_DIR", _REPO_ROOT / "data" / "advisories"))
-    chroma_dir: Path = field(default_factory=lambda: _env_path("SENTINEL_CHROMA_DIR", _REPO_ROOT / "data" / "chroma"))
-    index_dir: Path = field(default_factory=lambda: _env_path("SENTINEL_INDEX_DIR", _REPO_ROOT / "data" / "index"))
-    audit_log: Path = field(default_factory=lambda: _env_path("SENTINEL_AUDIT_LOG", _REPO_ROOT / "data" / "audit.log"))
+    events_path: Path = field(default_factory=lambda: _env_path("SENTINEL_EVENTS_PATH", _DERIVE))
+    advisory_dir: Path = field(default_factory=lambda: _env_path("SENTINEL_ADVISORY_DIR", _DERIVE))
+    chroma_dir: Path = field(default_factory=lambda: _env_path("SENTINEL_CHROMA_DIR", _DERIVE))
+    index_dir: Path = field(default_factory=lambda: _env_path("SENTINEL_INDEX_DIR", _DERIVE))
+    audit_log: Path = field(default_factory=lambda: _env_path("SENTINEL_AUDIT_LOG", _DERIVE))
 
     # --- embeddings --------------------------------------------------------
     # multilingual-e5-large is the model the cross-lingual claim rests on: it is
@@ -229,6 +250,25 @@ class Settings:
         default_factory=lambda: _env_list("SENTINEL_API_ALLOWED_ORIGINS", ""))
 
     max_events_in_memory: int = field(default_factory=lambda: _env_int("SENTINEL_MAX_EVENTS", 20000))
+
+    def __post_init__(self) -> None:
+        """Resolve the paths nobody named, relative to ``data_dir``.
+
+        Those five fields used to default to ``<repo>/data/...`` independently,
+        which made SENTINEL_DATA_DIR a variable that moved almost nothing: setting
+        it to a mounted disk relocated the directory created on startup while
+        events, the index, the vector store and the audit log stayed on the system
+        disk. Nothing failed — the engine kept writing where it always had, which
+        is the worst shape for a path bug, because the misconfiguration is
+        invisible until someone goes looking for the data.
+
+        Naming a path still wins, whether by environment variable, by constructor
+        argument, or through dataclasses.replace: only the marker is replaced, and
+        a resolved Settings no longer holds it.
+        """
+        for name, tail in _DATA_SUBPATHS:
+            if getattr(self, name) is _DERIVE:
+                object.__setattr__(self, name, self.data_dir / tail)
 
     def validate(self) -> None:
         """Fail fast on impossible combinations rather than at query time."""

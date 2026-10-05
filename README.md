@@ -541,19 +541,31 @@ Imported rules can escalate a verdict but never quietly lower one.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/` | Dashboard |
+| `GET` | `/` | Dashboard (also `/index.html`) |
 | `GET` | `/api/health` | Liveness — deliberately does not load the model |
 | `GET` | `/api/stats` | Event, index, corpus and response statistics |
+| `GET` | `/api/config` | Effective configuration, secrets masked |
 | `GET` | `/api/events` | Filtered feed (`severity`, `category`, `source_ip`, `min_score`, `q`, `incidents_only`) |
+| `GET` | `/api/events/summary` | Aggregated counts by severity, category and source |
 | `GET`/`POST` | `/api/search` | Bilingual retrieval |
 | `POST` | `/api/analyze` | Generate a bilingual cited alert |
 | `POST` | `/api/index` | Build or rebuild the index |
+| `GET` | `/api/graph` · `/api/graph.dot` | Attack-path graph as JSON, or as Graphviz DOT |
+| `GET` | `/api/shadow` | Last Shadow Search report, read from disk — never runs a pass |
+| `POST` | `/api/shadow/run` | Run a Shadow Search pass now |
 | `GET` | `/api/response/status` · `/history` | Guard rails and audit trail |
 | `POST` | `/api/response/block` · `/unblock` | Firewall action. `block` takes `ip` and an optional `event_id`; it does **not** accept a `score` |
 
 Set `SENTINEL_API_TOKEN` and the `POST` endpoints require
 `Authorization: Bearer <token>` (compared in constant time). Reads stay open so
 the dashboard works without one.
+
+The table above is the routing table in `engine/sentinel/routes.py`, and both
+servers are generated from it: the FastAPI adapter registers whatever is
+registered there, so `uvicorn` and the dependency-free `python -m sentinel serve`
+cannot serve different sets of paths. They used to — `/api/shadow` and
+`/api/graph` were declared by hand in one and not the other, which meant two
+dashboard panels worked in the demo and 404'd in production.
 
 ---
 

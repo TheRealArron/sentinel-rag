@@ -117,20 +117,58 @@ class CSRFPolicy:
 
     @staticmethod
     def _normalise(origin: str) -> str:
-        parsed = urlparse(origin)
-        if not parsed.scheme or not parsed.hostname:
+        """Canonical ``scheme://host:port``, or "" if this is not one.
+
+        ``urlparse().port`` RAISES on a port that is not an integer in 0-65535,
+        and the Origin header is chosen by the caller — so without the guard a
+        request from ``http://[::1]:99999`` left this method by exception, was
+        caught by the router's blanket handler, and came back as a 500. A header
+        an attacker controls must not be able to pick the status code; an
+        unparseable origin is simply an origin that is not on the list.
+
+        ``hostname`` is deliberately what gets formatted rather than the raw
+        authority: urlparse lower-cases it and strips the brackets from an IPv6
+        literal, so ``http://[::1]:8000`` and ``HTTP://[::1]:8000`` reduce to one
+        string. default_origins has to build its entries through this same method
+        or they cannot match what a browser sends — see there.
+        """
+        try:
+            parsed = urlparse(origin)
+            if not parsed.scheme or not parsed.hostname:
+                return ""
+            port = parsed.port
+        except ValueError:
             return ""
-        port = parsed.port
         if port is None:
             port = 443 if parsed.scheme == "https" else 80
         return f"{parsed.scheme}://{parsed.hostname}:{port}"
 
     def default_origins(self, host: str, port: int) -> set[str]:
-        """Origins the dashboard is legitimately served from."""
-        names = {host, "localhost", "127.0.0.1", "[::1]"}
+        """Origins the dashboard is legitimately served from.
+
+        Every name goes through _normalise's own spelling rather than being
+        formatted by hand. The bracketed IPv6 literal is why: an entry written as
+        ``http://[::1]:8000`` could never match anything, because a real Origin
+        header of exactly that string normalises to ``http://::1:8000`` with the
+        brackets stripped. So a dashboard reached over IPv6 loopback had its own
+        POSTs refused by the control meant to stop *other* sites — the same class
+        of bug as the bound-port one in server.py, and invisible for the same
+        reason: the allowlist and the request were spelled differently.
+        """
+        names = {host, "localhost", "127.0.0.1", "::1"}
         if host in {"0.0.0.0", "::"}:  # noqa: S104 - comparison, not a bind
-            names |= {"localhost", "127.0.0.1"}
-        return {f"http://{n}:{port}" for n in names if n} | {f"https://{n}:{port}" for n in names if n}
+            names |= {"localhost", "127.0.0.1", "::1"}
+        candidates: set[str] = set()
+        for name in names:
+            if not name:
+                continue
+            # Bracket an IPv6 literal so urlparse reads the port, not the address.
+            authority = f"[{name}]" if ":" in name and not name.startswith("[") else name
+            for scheme in ("http", "https"):
+                normalised = self._normalise(f"{scheme}://{authority}:{port}")
+                if normalised:
+                    candidates.add(normalised)
+        return candidates
 
     def check(self, method: str, content_type: str, origin: str) -> tuple[bool, str]:
         """Returns (allowed, reason)."""

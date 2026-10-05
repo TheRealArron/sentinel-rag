@@ -1,26 +1,45 @@
 """FastAPI adapter.
 
-Paths are declared explicitly rather than behind one catch-all so ``/docs`` is a
-real, browsable API reference. Each handler does nothing but translate the
-framework's request into ``routes.Request`` and hand it to the shared router, so
-there is no logic here to drift from the stdlib server.
+Each path is registered individually rather than behind one catch-all so ``/docs``
+is a real, browsable API reference, and every handler does nothing but translate
+the framework's request into ``routes.Request`` and hand it to the shared router.
+
+# Why the path list is generated from ROUTES
+
+The *handlers* could not drift from the stdlib server, because both servers call
+the same router. The *path list* could, and did: ``/api/shadow``,
+``/api/shadow/run``, ``/api/graph``, ``/api/graph.dot`` and ``/index.html`` were
+registered in routes.py, served correctly by the stdlib fallback, and returned 404
+under uvicorn — which is what ``serve`` picks whenever FastAPI is installed, and
+therefore what the Docker image and every documented production run actually use.
+The dashboard polls two of them, so the Shadow Search and attack-graph panels were
+dead in exactly the configuration meant for real use. Nothing caught it: adding an
+endpoint was one edit there and one edit here, and no test installs FastAPI.
+
+So the table is now the single source of truth. Registration walks ``ROUTES``,
+which means a new endpoint is the ``@route`` decorator and nothing else, and a
+path that exists in one server necessarily exists in the other. SUMMARIES only
+adds prose for ``/docs``; a route missing from it still gets registered, and
+tests/test_api.py asserts none is missing.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 try:
     from fastapi import FastAPI
     from fastapi import Request as FastAPIRequest
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+    from fastapi.responses import Response as FastAPIResponse
 
     FASTAPI_AVAILABLE = True
 except ImportError:  # pragma: no cover - depends on the environment
     FASTAPI_AVAILABLE = False
 
 from .engine import SentinelEngine
-from .routes import Request, Response, Router
+from .routes import ROUTES, Request, Response, Route, Router
 
 DESCRIPTION = """\
 Sentinel RAG — bilingual (EN/JA) AI-powered SecOps engine.
@@ -45,7 +64,14 @@ def _to_request(fastapi_request: FastAPIRequest, body: dict[str, Any] | None = N
 
 def _to_fastapi_response(response: Response):
     if response.body_text is not None:
-        return HTMLResponse(content=response.body_text, status_code=response.status)
+        # media_type from the router, not HTMLResponse's text/html: /api/graph.dot
+        # answers with text/vnd.graphviz, and a browser told that DOT is HTML will
+        # try to render it.
+        return FastAPIResponse(
+            content=response.body_text,
+            status_code=response.status,
+            media_type=response.content_type,
+        )
     return JSONResponse(content=response.payload, status_code=response.status)
 
 
@@ -66,6 +92,89 @@ async def _json_body(fastapi_request: FastAPIRequest) -> dict[str, Any]:
     except ValueError:
         return {"__invalid_json__": True}
     return parsed if isinstance(parsed, dict) else {}
+
+
+# Prose for the generated OpenAPI page. Keyed by the same (method, path) tuples the
+# router uses, so an endpoint renamed in routes.py loses its summary loudly (the
+# parity test names it) rather than silently describing the wrong thing.
+SUMMARIES: dict[tuple[str, str], str] = {
+    ("GET", "/"): "Real-time threat dashboard",
+    ("GET", "/index.html"): "Real-time threat dashboard (alias)",
+    ("GET", "/api/health"): "Liveness probe (no model load)",
+    ("GET", "/api/stats"): "Event, index, corpus and response statistics",
+    ("GET", "/api/config"): "Effective configuration with secrets masked",
+    ("GET", "/api/events"): "Filtered event feed, newest first",
+    ("GET", "/api/events/summary"): "Aggregated event counts",
+    ("GET", "/api/search"): "Bilingual retrieval over the corpus",
+    ("POST", "/api/search"): "Bilingual retrieval (JSON body)",
+    ("POST", "/api/analyze"): "Generate a bilingual, cited alert",
+    ("POST", "/api/index"): "Index advisories and events",
+    ("GET", "/api/graph"): "Attack-path graph, with an optional blast radius from a seed",
+    ("GET", "/api/graph.dot"): "The same graph as Graphviz DOT",
+    ("GET", "/api/shadow"): "Most recent Shadow Search report, read from disk",
+    ("POST", "/api/shadow/run"): "Run a Shadow Search pass now",
+    ("GET", "/api/response/status"): "Active-response mode and guard rails",
+    ("GET", "/api/response/history"): "Audit trail of response decisions",
+    ("POST", "/api/response/block"): "Block a source address via UFW",
+    ("POST", "/api/response/unblock"): "Remove a UFW deny rule",
+}
+
+# Routes whose body is text rather than JSON. The response itself already carries
+# the router's media type; this only teaches the schema generator about it, so
+# /docs does not claim the dashboard is JSON.
+#
+# Paths, not response classes: this module has to import on a machine with no
+# FastAPI — missing_summaries() below is asserted in exactly that environment —
+# and a mapping to HTMLResponse would be evaluated at import time.
+_HTML_ROUTES = frozenset({"/", "/index.html"})
+_PLAIN_TEXT_ROUTES = frozenset({"/api/graph.dot"})
+
+
+def _response_class(path: str) -> type:
+    if path in _HTML_ROUTES:
+        return HTMLResponse
+    if path in _PLAIN_TEXT_ROUTES:
+        return PlainTextResponse
+    return JSONResponse
+
+
+def missing_summaries() -> list[tuple[str, str]]:
+    """Router routes with no /docs prose. Asserted empty by the test suite.
+
+    Exposed as a function rather than checked at import so it can be asserted
+    without FastAPI installed — which is the situation in CI, and the reason the
+    drift this module used to have went unnoticed for so long.
+    """
+    return sorted(key for key in ROUTES if key not in SUMMARIES)
+
+
+def _register(app: FastAPI, router: Router, spec: Route) -> None:
+    """Attach one router route to the FastAPI app."""
+
+    async def handler(request: FastAPIRequest):
+        body: dict[str, Any] = {}
+        if spec.method == "POST":
+            body = await _json_body(request)
+            if body.get("__invalid_json__"):
+                return JSONResponse({"error": "request body is not valid JSON"}, status_code=400)
+        return _to_fastapi_response(router.dispatch(_to_request(request, body)))
+
+    # A distinct, readable name per route. FastAPI would otherwise derive the
+    # OpenAPI operation id from the closure's name, which is the same for every
+    # route here — so they are named explicitly, and a generated client gets
+    # `get_api_shadow` rather than a numbered collision.
+    path_name = "dashboard" if spec.path == "/" else spec.path
+    name = re.sub(r"[^a-z0-9]+", "_", f"{spec.method} {path_name}".lower()).strip("_")
+    handler.__name__ = name
+
+    app.add_api_route(
+        spec.path,
+        handler,
+        methods=[spec.method],
+        summary=SUMMARIES.get((spec.method, spec.path), f"{spec.method} {spec.path}"),
+        response_class=_response_class(spec.path),
+        operation_id=name,
+    )
 
 
 def create_app(engine: SentinelEngine | None = None) -> FastAPI:
@@ -90,69 +199,9 @@ def create_app(engine: SentinelEngine | None = None) -> FastAPI:
     # FastAPI-only limiter would leave `python -m sentinel serve --stdlib`
     # completely unmetered.
 
-    async def handle(fastapi_request: FastAPIRequest, with_body: bool = False):
-        body = await _json_body(fastapi_request) if with_body else {}
-        if body.get("__invalid_json__"):
-            return JSONResponse({"error": "request body is not valid JSON"}, status_code=400)
-        return _to_fastapi_response(router.dispatch(_to_request(fastapi_request, body)))
-
-    # --- reads -------------------------------------------------------------
-    @app.get("/", response_class=HTMLResponse, summary="Real-time threat dashboard")
-    async def dashboard(request: FastAPIRequest):
-        return await handle(request)
-
-    @app.get("/api/health", summary="Liveness probe (no model load)")
-    async def health(request: FastAPIRequest):
-        return await handle(request)
-
-    @app.get("/api/stats", summary="Event, index, corpus and response statistics")
-    async def stats(request: FastAPIRequest):
-        return await handle(request)
-
-    @app.get("/api/config", summary="Effective configuration with secrets masked")
-    async def config(request: FastAPIRequest):
-        return await handle(request)
-
-    @app.get("/api/events", summary="Filtered event feed, newest first")
-    async def events(request: FastAPIRequest):
-        return await handle(request)
-
-    @app.get("/api/events/summary", summary="Aggregated event counts")
-    async def events_summary(request: FastAPIRequest):
-        return await handle(request)
-
-    @app.get("/api/search", summary="Bilingual retrieval over the corpus")
-    async def search_get(request: FastAPIRequest):
-        return await handle(request)
-
-    @app.get("/api/response/status", summary="Active-response mode and guard rails")
-    async def response_status(request: FastAPIRequest):
-        return await handle(request)
-
-    @app.get("/api/response/history", summary="Audit trail of response decisions")
-    async def response_history(request: FastAPIRequest):
-        return await handle(request)
-
-    # --- writes ------------------------------------------------------------
-    @app.post("/api/search", summary="Bilingual retrieval (JSON body)")
-    async def search_post(request: FastAPIRequest):
-        return await handle(request, with_body=True)
-
-    @app.post("/api/analyze", summary="Generate a bilingual, cited alert")
-    async def analyze(request: FastAPIRequest):
-        return await handle(request, with_body=True)
-
-    @app.post("/api/index", summary="Index advisories and events")
-    async def index(request: FastAPIRequest):
-        return await handle(request, with_body=True)
-
-    @app.post("/api/response/block", summary="Block a source address via UFW")
-    async def response_block(request: FastAPIRequest):
-        return await handle(request, with_body=True)
-
-    @app.post("/api/response/unblock", summary="Remove a UFW deny rule")
-    async def response_unblock(request: FastAPIRequest):
-        return await handle(request, with_body=True)
+    # Sorted so /docs lists endpoints in a stable order across restarts.
+    for key in sorted(ROUTES):
+        _register(app, router, ROUTES[key])
 
     app.state.engine = engine
     app.state.router = router

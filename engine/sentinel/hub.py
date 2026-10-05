@@ -40,7 +40,9 @@ class RevocationList:
     a signed CRL.
     """
 
-    def __init__(self, path: Path | None) -> None:
+    def __init__(self, path: Path | str | None) -> None:
+        # str as well as Path because Settings.hub_revocation_list is a string
+        # (it is a path the operator types, and "" means "no list").
         self.path = Path(path) if path else None
         self._fingerprints: set[str] = set()
         self._names: set[str] = set()
@@ -207,7 +209,6 @@ class FleetHub:
     def status(self) -> dict[str, Any]:
         with self._lock:
             probes = [p.to_dict() for p in self.probes.values()]
-        with self._lock:
             mismatches = dict(self._mismatches)
         return {
             "probes": sorted(probes, key=lambda p: p["name"]),
@@ -294,8 +295,13 @@ class _HubHandler(BaseHTTPRequestHandler):
             # The alternative, draining the body first, is worse here: it invites
             # a peer we have just refused to make us read an unbounded amount of
             # data. Refusing and hanging up is the correct shape.
-            self.send_header("Connection", "close")
             self.close_connection = True
+        if self.close_connection:
+            # Keyed on the decision, not on the status code: _abandon_body sets the
+            # same flag part-way through a body this handler stopped reading, and
+            # that answer is a 200. Announcing the close either way means the probe
+            # opens a new connection instead of discovering a dead one.
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
@@ -351,16 +357,37 @@ class _HubHandler(BaseHTTPRequestHandler):
                              name, accepted, rejected, "; ".join(errors))
         self._json(200, {"accepted": accepted, "rejected": rejected, "errors": errors})
 
+    def _abandon_body(self) -> None:
+        """Stop reading this request and hang up after answering it.
+
+        Every early return below leaves unread bytes in the socket — a body longer
+        than MAX_REQUEST_BYTES, an unparseable Content-Length, a malformed chunk
+        header. On a keep-alive connection the next request would then be parsed
+        starting from the middle of those bytes, and the probe would see a stream
+        of nonsense 400s with no obvious cause. That is the same failure the 4xx
+        path in _json already guards against, and it arrives here by a different
+        route: a body that is abandoned rather than refused.
+
+        Draining instead is the wrong trade for the same reason it is there: it
+        invites a peer to make us read an unbounded amount of data. The response
+        that has already been computed is still sent — the accepted lines are
+        real and the probe is told how many — and then the connection closes.
+        """
+        self.close_connection = True
+
     def _iter_lines(self):
         """Yield decoded lines from a chunked or length-delimited body."""
         if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
             yield from self._iter_chunked()
             return
         try:
-            remaining = int(self.headers.get("Content-Length") or 0)
+            declared = int(self.headers.get("Content-Length") or 0)
         except ValueError:
+            self._abandon_body()
             return
-        remaining = min(remaining, MAX_REQUEST_BYTES)
+        remaining = min(declared, MAX_REQUEST_BYTES)
+        if declared > MAX_REQUEST_BYTES:
+            self._abandon_body()
         while remaining > 0:
             line = self.rfile.readline(min(MAX_LINE_BYTES, remaining) + 1)
             if not line:
@@ -383,12 +410,14 @@ class _HubHandler(BaseHTTPRequestHandler):
             try:
                 size = int(size_line.split(b";")[0].strip(), 16)
             except ValueError:
+                self._abandon_body()
                 return
             if size == 0:
                 self.rfile.readline()  # trailing CRLF
                 return
             received += size
             if received > MAX_REQUEST_BYTES:
+                self._abandon_body()
                 return
             chunk = self.rfile.read(size)
             self.rfile.readline()  # CRLF after the chunk

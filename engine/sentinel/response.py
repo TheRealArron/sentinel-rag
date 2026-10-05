@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -89,13 +90,23 @@ class Responder:
         self.max_blocks_per_hour = max_blocks_per_hour
         self._lock = threading.Lock()
         self._recent: list[float] = []
-        self._networks = self._parse_allowlist(settings.response_allowlist)
+        self._networks, self.allowlist_errors = self._parse_allowlist(settings.response_allowlist)
 
     # -- allowlist ---------------------------------------------------------
 
     @staticmethod
-    def _parse_allowlist(entries: Sequence[str]) -> list[IPNetwork]:
+    def _parse_allowlist(entries: Sequence[str]) -> tuple[list[IPNetwork], list[str]]:
+        """Parse the allowlist, returning the networks and whatever failed.
+
+        A malformed entry is a configuration bug that *widens* what can be
+        blocked: a typo in ``192.168.0.0/16`` does not narrow the guard rail, it
+        removes it, and the operator's own LAN becomes blockable. The unparseable
+        entries are therefore returned rather than dropped, and they are reported
+        in ``status()`` and stamped on every audited decision — a guard rail that
+        quietly stopped existing is exactly what must not be silent.
+        """
         networks: list[IPNetwork] = []
+        errors: list[str] = []
         for entry in entries:
             entry = entry.strip()
             if not entry:
@@ -103,11 +114,8 @@ class Responder:
             try:
                 networks.append(ipaddress.ip_network(entry, strict=False))
             except ValueError:
-                # A malformed allowlist entry is a configuration bug. Skipping it
-                # silently would quietly widen what can be blocked, so it is
-                # surfaced in the action detail instead of being ignored.
-                continue
-        return networks
+                errors.append(entry)
+        return networks, errors
 
     def is_allowlisted(self, ip: str) -> bool:
         try:
@@ -299,17 +307,34 @@ class Responder:
             "mode": self.settings.response_mode,
             "min_score": self.settings.response_min_score,
             "allowlist": [str(n) for n in self._networks],
+            # Present even when empty: an operator reading this to confirm their
+            # LAN is protected needs to see that nothing in the list failed to
+            # parse, not merely that the entries which did parse look right.
+            "allowlist_invalid": list(self.allowlist_errors),
             "ufw_available": self._ufw_available() is not None,
             "blocks_last_hour": len([t for t in self._recent if t > cutoff]),
             "max_blocks_per_hour": self.max_blocks_per_hour,
         }
 
     def history(self, limit: int = 100) -> list[dict[str, Any]]:
-        """Most recent audit entries, newest first."""
+        """Most recent audit entries, newest first.
+
+        A bounded deque rather than a list that is sliced at the end. The audit
+        log is append-only and never rotated by this process, so on a host that
+        has been running for months it is the largest file the engine owns —
+        and ``GET /api/response/history`` is an unauthenticated read. Parsing the
+        whole file to return the last hundred rows meant the cheapest request a
+        caller could make was also the one that allocated the most memory.
+
+        The deque keeps memory proportional to ``limit`` instead of to the file.
+        The file is still read from the beginning: seeking backwards would need
+        byte-level care for a partial final line, and reading a few megabytes of
+        JSONL is not the cost worth optimising here.
+        """
         path = Path(self.settings.audit_log)
         if not path.exists():
             return []
-        rows: list[dict[str, Any]] = []
+        rows: deque[dict[str, Any]] = deque(maxlen=max(1, limit))
         with path.open("r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.strip()
@@ -319,7 +344,7 @@ class Responder:
                     rows.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-        return rows[-limit:][::-1]
+        return list(rows)[::-1]
 
     # -- audit -------------------------------------------------------------
 
@@ -329,6 +354,14 @@ class Responder:
         Refusals are recorded because 'the system decided not to act' is exactly
         the thing you need evidence of during an incident review.
         """
+        if self.allowlist_errors:
+            # Stamped on the decision itself, not only on /api/response/status, so
+            # the record of a block that was allowed while the allowlist was
+            # partly broken says so where an incident review will read it.
+            action.detail = (
+                f"{action.detail} [warning: allowlist entries that could not be parsed, "
+                f"and so protect nothing: {', '.join(self.allowlist_errors[:5])}]"
+            ).strip()
         path = Path(self.settings.audit_log)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
