@@ -12,6 +12,9 @@ PYTHON   ?= python3
 BIN      := ingestor/bin/sentinel-ingestor
 SAMPLE   := data/samples/sample_syslog.log
 EVENTS   := data/events.jsonl
+# Canaries for targets that watch a real host. config/honeytokens.json is the
+# public demo set and stays on the demo, sample and test paths only.
+HOST_HONEYTOKENS ?= config/honeytokens.local.json
 
 export PYTHONPATH := $(CURDIR)/engine
 
@@ -121,9 +124,10 @@ ingest: build ## Parse the sample syslog into data/events.jsonl
 	@echo "wrote $$(wc -l < $(EVENTS)) events to $(EVENTS)"
 
 .PHONY: ingest-host
-ingest-host: build ## Follow this host's /var/log/auth.log (Ctrl-C to stop)
+ingest-host: build honeytokens-private ## Follow this host's /var/log/auth.log (Ctrl-C to stop)
 	@mkdir -p data
-	./$(BIN) -in /var/log/auth.log -out $(EVENTS) -follow -from-start -stats
+	./$(BIN) -in /var/log/auth.log -out $(EVENTS) -follow -from-start \
+	  -honeytokens $(HOST_HONEYTOKENS) -stats
 
 .PHONY: sample
 sample: build ## Regenerate the committed sample fixture from the ingestor
@@ -167,9 +171,13 @@ ioc-check: ## Compile threat feeds without writing, and refresh the Go/Python ag
 	cd engine && $(PYTHON) -m sentinel ioc --feeds ../rules/ioc --dry-run
 	$(PYTHON) scripts/gen-ioc-vectors.py
 
+.PHONY: honeytokens-private
+honeytokens-private: ## Check the host's canaries exist and reuse none of the published demo values
+	$(PYTHON) scripts/check-private-honeytokens.py $(HOST_HONEYTOKENS)
+
 .PHONY: honeytokens-verify
-honeytokens-verify: build ## Check canaries do not collide with real accounts (run on the host)
-	./$(BIN) -honeytokens-verify /etc/passwd
+honeytokens-verify: build honeytokens-private ## Check the host's canaries are private and collide with no real account (run on the host)
+	./$(BIN) -honeytokens $(HOST_HONEYTOKENS) -honeytokens-verify /etc/passwd
 
 .PHONY: tokenizer-check
 tokenizer-check: ## Refresh the estimator/tokenizer agreement vectors (needs sentence-transformers)

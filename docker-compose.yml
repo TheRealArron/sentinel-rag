@@ -31,7 +31,11 @@ services:
       - "-min-score=${SENTINEL_MIN_SCORE:-0}"
       - "-brute-threshold=${SENTINEL_BRUTE_THRESHOLD:-5}"
       - "-brute-window=${SENTINEL_BRUTE_WINDOW:-1m}"
-      - "-honeytokens=/config/honeytokens.json"
+      # A deployment's own canaries, NOT the committed config/honeytokens.json:
+      # that file is public, so its values are known to anyone who has read the
+      # repository. Named explicitly, so a missing local file stops the ingestor
+      # rather than falling back to published canaries. See config/README.md.
+      - "-honeytokens=/config/${SENTINEL_HONEYTOKENS_FILE:-honeytokens.local.json}"
       - "-stats"
     volumes:
       # Host logs, read-only. The ingestor never needs to write here, and :ro

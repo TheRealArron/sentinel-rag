@@ -408,8 +408,15 @@ segments carry 2px gaps and counts, and the feed is a real table.
 git clone https://github.com/TheRealArron/sentinel-rag.git
 cd sentinel-rag
 cp .env.example .env      # add your Gemini key
+$EDITOR config/honeytokens.local.json   # your own canaries (see below)
+make honeytokens-verify   # private, and no collision with a real account
 docker compose up --build -d
 ```
+
+The canaries in `config/honeytokens.json` are the public demo set, and an
+attacker can read them here as easily as you can. The ingestor container loads
+your gitignored `config/honeytokens.local.json` and refuses to start without it.
+[`config/README.md`](config/README.md) covers how to choose good ones.
 
 Host logs are mapped **read-only** into the ingestor:
 

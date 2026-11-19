@@ -26,10 +26,35 @@ must not be left believing they are armed when they are not:
 ./ingestor/bin/sentinel-ingestor -honeytokens /etc/sentinel/honeytokens.json ...
 ```
 
+### Deploying: use your own canaries
+
+**The values in `honeytokens.json` are public.** This repository is on GitHub,
+so anyone, including whoever is attacking your host, can read the list and
+avoid every name on it. The file is the *demo set*: `make demo`, the sample
+fixture, the tests and CI depend on its exact values, so it stays as it is.
+
+A real host uses `config/honeytokens.local.json` instead. It is gitignored and
+holds values that have never been published. Docker Compose, `make ingest-host`
+and `make honeytokens-verify` all read it by name. If the file is missing they
+**refuse to start** rather than fall back to the public set, because silently
+arming published canaries would look armed and catch nothing.
+
+```bash
+$EDITOR config/honeytokens.local.json   # same schema as below, new values
+make honeytokens-verify                 # private, and no collision with /etc/passwd
+```
+
+`make honeytokens-private` fails if the file is missing, arms nothing, or reuses
+any published value (compared case-insensitively, as the ingestor matches), so a
+`cp honeytokens.json honeytokens.local.json` that was never edited is caught.
+To run Compose against another file under `config/`, set
+`SENTINEL_HONEYTOKENS_FILE` in `.env`.
+
 ### Verify before you trust them — run this on the host
 
 ```bash
-./ingestor/bin/sentinel-ingestor -honeytokens-verify /etc/passwd
+make honeytokens-verify
+# ok: 9 canary value(s) in honeytokens.local.json, none of them published
 # ok: none of the 9 honeytoken(s) exist in /etc/passwd
 ```
 

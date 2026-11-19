@@ -8,6 +8,10 @@
 # fleet; committing it would hand an attacker the ability to mint a trusted probe.
 pki/
 
+# A deployment's own canaries. config/honeytokens.json is the PUBLIC demo set;
+# a canary published on GitHub is one an attacker knows to avoid.
+config/honeytokens.local.json
+
 # The original project brief. Kept locally; it is working notes, not a
 # deliverable. Delete this line if you want it published.
 claude.md
